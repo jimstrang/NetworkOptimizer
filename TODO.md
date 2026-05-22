@@ -287,6 +287,16 @@ The following were implemented in the WiFi Optimizer feature:
 
 ## General
 
+### Minify Custom JS Resources
+- `lan-flow-map.js`, `latency-charts.js`, `device-health-charts.js` are served unminified
+- Add a build step (terser or esbuild) to produce `.min.js` variants and reference those in production
+- Matches the pattern used for OpenSpeedTest (`app-2.5.4.js` → `app-2.5.4.min.js`)
+
+### Extract Shared Time-Range Chart Controls
+- `latency-charts.js` and `device-health-charts.js` duplicate the same time-range control logic (presets, shift arrows, custom range popover, filter badges, poll interval scaling)
+- Extract into a shared JS module so all chart sets reuse one implementation
+- Both files have a TODO marking this
+
 ### Refactor Program.cs - Extract Business Logic and Break Up API Sets
 - **Issue:** `Program.cs` has grown into a monolith with schedule executor implementations, API endpoint registrations, and business logic all inline
 - **Goal:** Clean separation of concerns:
