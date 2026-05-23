@@ -224,93 +224,99 @@ public class MonitoringCollectionAgent : BackgroundService
         // public IP for the gateway (which never will).
         var gatewayLanIp = await ResolveGatewayLanIpAsync(ct);
 
+        using var snmpGate = new SemaphoreSlim(4);
         var deviceTasks = devices.Select(async device =>
         {
-            var mac = NormalizeMac(device.Mac);
-            if (_snmpExcluded.ContainsKey(mac))
-            {
-                // Device was previously determined to not support SNMP. Skip silently;
-                // rate data for this device will come from its parent switch port
-                // (for APs) or be absent.
-                return;
-            }
+            await snmpGate.WaitAsync(ct);
             try
             {
-                var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
-                if (!IPAddress.TryParse(pollIp, out var ip)) return;
-                var interfaces = await poller.GetInterfaceMetricsAsync(ip, device.Name);
-                var now = DateTime.UtcNow;
-                double aggregateInBps = 0;
-                double aggregateOutBps = 0;
-                bool anyRate = false;
-                // For mesh APs, the "vwiresta*" SNMP interface is the virtual
-                // wireless station - the AP acting as a client to its parent.
-                // Every byte the AP shuttles over the wireless backhaul flows
-                // through this interface, so its ifInOctets / ifOutOctets is
-                // the most direct boundary measurement we can get.
-                double? apMeshUplinkInBps = null;
-                double? apMeshUplinkOutBps = null;
-                foreach (var iface in interfaces)
+                var mac = NormalizeMac(device.Mac);
+                if (_snmpExcluded.ContainsKey(mac))
                 {
-                    var (rateIn, rateOut) = WriteInterfaceCounters(device, iface, now);
-                    if (rateIn.HasValue && rateOut.HasValue)
+                    // Device was previously determined to not support SNMP. Skip silently;
+                    // rate data for this device will come from its parent switch port
+                    // (for APs) or be absent.
+                    return;
+                }
+                try
+                {
+                    var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
+                    if (!IPAddress.TryParse(pollIp, out var ip)) return;
+                    var interfaces = await poller.GetInterfaceMetricsAsync(ip, device.Name);
+                    var now = DateTime.UtcNow;
+                    double aggregateInBps = 0;
+                    double aggregateOutBps = 0;
+                    bool anyRate = false;
+                    // For mesh APs, the "vwiresta*" SNMP interface is the virtual
+                    // wireless station - the AP acting as a client to its parent.
+                    // Every byte the AP shuttles over the wireless backhaul flows
+                    // through this interface, so its ifInOctets / ifOutOctets is
+                    // the most direct boundary measurement we can get.
+                    double? apMeshUplinkInBps = null;
+                    double? apMeshUplinkOutBps = null;
+                    foreach (var iface in interfaces)
                     {
-                        anyRate = true;
-                        if (IncludeInFabricSum(device.DeviceType, iface.Description))
+                        var (rateIn, rateOut) = WriteInterfaceCounters(device, iface, now);
+                        if (rateIn.HasValue && rateOut.HasValue)
                         {
-                            aggregateInBps += rateIn.Value;
-                            aggregateOutBps += rateOut.Value;
+                            anyRate = true;
+                            if (IncludeInFabricSum(device.DeviceType, iface.Description))
+                            {
+                                aggregateInBps += rateIn.Value;
+                                aggregateOutBps += rateOut.Value;
+                            }
+                            if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.AccessPoint
+                                && !string.IsNullOrEmpty(iface.Description)
+                                && iface.Description.StartsWith("vwiresta", StringComparison.OrdinalIgnoreCase)
+                                && !iface.Description.Contains('.'))
+                            {
+                                apMeshUplinkInBps = rateIn.Value;
+                                apMeshUplinkOutBps = rateOut.Value;
+                            }
                         }
-                        if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.AccessPoint
-                            && !string.IsNullOrEmpty(iface.Description)
-                            && iface.Description.StartsWith("vwiresta", StringComparison.OrdinalIgnoreCase)
-                            && !iface.Description.Contains('.'))
+                    }
+                    if (anyRate)
+                    {
+                        // Successful SNMP poll - reset the failure counter. APs are
+                        // the only fabric-sum holdout: their radio "interfaces"
+                        // over-count beacons / retries / MIMO duplicates so the sum
+                        // doesn't represent useful payload. Switches, gateways and
+                        // cellular modems all see sum(rx)/sum(tx) as a coherent
+                        // fabric I/O total - ShouldMonitor() already strips loopback,
+                        // tunnels and bridges, so the surviving interfaces are
+                        // physical ports.
+                        _snmpFailures.TryRemove(mac, out _);
+                        if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Switch
+                            || device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway
+                            || device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.CellularModem)
                         {
-                            apMeshUplinkInBps = rateIn.Value;
-                            apMeshUplinkOutBps = rateOut.Value;
+                            _liveStats.RecordFabricSum(device.Mac, aggregateInBps, aggregateOutBps, now);
                         }
+                        if (apMeshUplinkInBps.HasValue && apMeshUplinkOutBps.HasValue)
+                        {
+                            // vwiresta rateIn (ifInOctets) = bytes received over the mesh
+                            // backhaul = downloads. rateOut = bytes transmitted = uploads.
+                            // Our aggregate convention (per AP tooltip semantics: "Ingress"
+                            // = bytes the AP receives from its wifi clients = uploads) puts
+                            // uploads on aggregateInBps and downloads on aggregateOutBps.
+                            _liveStats.RecordInterfaceAggregate(device.Mac, apMeshUplinkOutBps.Value, apMeshUplinkInBps.Value, now);
+                        }
+                    }
+                    else
+                    {
+                        // SNMP returned no usable data. If the device is otherwise reachable
+                        // (recent fabric ping succeeded), it likely doesn't support SNMP;
+                        // count the failure and maybe exclude it.
+                        NoteSnmpFailure(mac);
                     }
                 }
-                if (anyRate)
+                catch (Exception ex)
                 {
-                    // Successful SNMP poll - reset the failure counter. APs are
-                    // the only fabric-sum holdout: their radio "interfaces"
-                    // over-count beacons / retries / MIMO duplicates so the sum
-                    // doesn't represent useful payload. Switches, gateways and
-                    // cellular modems all see sum(rx)/sum(tx) as a coherent
-                    // fabric I/O total - ShouldMonitor() already strips loopback,
-                    // tunnels and bridges, so the surviving interfaces are
-                    // physical ports.
-                    _snmpFailures.TryRemove(mac, out _);
-                    if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Switch
-                        || device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway
-                        || device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.CellularModem)
-                    {
-                        _liveStats.RecordFabricSum(device.Mac, aggregateInBps, aggregateOutBps, now);
-                    }
-                    if (apMeshUplinkInBps.HasValue && apMeshUplinkOutBps.HasValue)
-                    {
-                        // vwiresta rateIn (ifInOctets) = bytes received over the mesh
-                        // backhaul = downloads. rateOut = bytes transmitted = uploads.
-                        // Our aggregate convention (per AP tooltip semantics: "Ingress"
-                        // = bytes the AP receives from its wifi clients = uploads) puts
-                        // uploads on aggregateInBps and downloads on aggregateOutBps.
-                        _liveStats.RecordInterfaceAggregate(device.Mac, apMeshUplinkOutBps.Value, apMeshUplinkInBps.Value, now);
-                    }
-                }
-                else
-                {
-                    // SNMP returned no usable data. If the device is otherwise reachable
-                    // (recent fabric ping succeeded), it likely doesn't support SNMP;
-                    // count the failure and maybe exclude it.
+                    _logger.LogDebug(ex, "Fast-tier interface poll failed for {Device}", device.Mac);
                     NoteSnmpFailure(mac);
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Fast-tier interface poll failed for {Device}", device.Mac);
-                NoteSnmpFailure(mac);
-            }
+            finally { snmpGate.Release(); }
         });
         await Task.WhenAll(deviceTasks);
 
@@ -625,11 +631,13 @@ public class MonitoringCollectionAgent : BackgroundService
         if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
 
         var gatewayLanIp = await ResolveGatewayLanIpAsync(ct);
+        using var healthGate = new SemaphoreSlim(4);
         var deviceTasks = devices.Select(async device =>
         {
-            if (_snmpExcluded.ContainsKey(NormalizeMac(device.Mac))) return;
+            await healthGate.WaitAsync(ct);
             try
             {
+                if (_snmpExcluded.ContainsKey(NormalizeMac(device.Mac))) return;
                 var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
                 if (!IPAddress.TryParse(pollIp, out var ip)) return;
                 var metrics = await poller.GetDeviceMetricsAsync(ip, device.Name);
@@ -657,6 +665,7 @@ public class MonitoringCollectionAgent : BackgroundService
             {
                 _logger.LogDebug(ex, "Medium-tier health poll failed for {Device}", device.Mac);
             }
+            finally { healthGate.Release(); }
         });
         await Task.WhenAll(deviceTasks);
     }
