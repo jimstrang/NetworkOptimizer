@@ -53,6 +53,7 @@ public class MonitoringCollectionAgent : BackgroundService
     private readonly ConcurrentDictionary<string, int> _snmpFailures = new();
     private readonly ConcurrentDictionary<string, byte> _snmpExcluded = new();
     private const int SnmpFailureThreshold = 3;
+    private readonly SemaphoreSlim _snmpGate = new(8);
 
     public MonitoringCollectionAgent(
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
@@ -224,10 +225,9 @@ public class MonitoringCollectionAgent : BackgroundService
         // public IP for the gateway (which never will).
         var gatewayLanIp = await ResolveGatewayLanIpAsync(ct);
 
-        using var snmpGate = new SemaphoreSlim(4);
         var deviceTasks = devices.Select(async device =>
         {
-            await snmpGate.WaitAsync(ct);
+            await _snmpGate.WaitAsync(ct);
             try
             {
                 var mac = NormalizeMac(device.Mac);
@@ -316,7 +316,7 @@ public class MonitoringCollectionAgent : BackgroundService
                     NoteSnmpFailure(mac);
                 }
             }
-            finally { snmpGate.Release(); }
+            finally { _snmpGate.Release(); }
         });
         await Task.WhenAll(deviceTasks);
 
@@ -631,10 +631,9 @@ public class MonitoringCollectionAgent : BackgroundService
         if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
 
         var gatewayLanIp = await ResolveGatewayLanIpAsync(ct);
-        using var healthGate = new SemaphoreSlim(4);
         var deviceTasks = devices.Select(async device =>
         {
-            await healthGate.WaitAsync(ct);
+            await _snmpGate.WaitAsync(ct);
             try
             {
                 if (_snmpExcluded.ContainsKey(NormalizeMac(device.Mac))) return;
@@ -665,7 +664,7 @@ public class MonitoringCollectionAgent : BackgroundService
             {
                 _logger.LogDebug(ex, "Medium-tier health poll failed for {Device}", device.Mac);
             }
-            finally { healthGate.Release(); }
+            finally { _snmpGate.Release(); }
         });
         await Task.WhenAll(deviceTasks);
     }
