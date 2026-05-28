@@ -15,6 +15,22 @@
 
 Genuinely, thank you so much to everybody for taking the time to use Network Optimizer and have it find a place on your network(s). It really means a lot to receive all of the bug reports, feature requests, feedback, support, and donations from everybody. Totally a whole new experience from writing code in a dayjob, and it greatly motivates me to keep on going!
 
+## New: Self-Hosted Network Monitoring
+
+Full time-series network monitoring that runs entirely on your hardware. SNMP polling feeds InfluxDB for interface counters, device health (CPU, memory, temperature, uptime), latency probes, SFP optical levels, and WiFi client stats. Everything is stored locally with configurable retention, and a setup wizard handles InfluxDB bucket and token provisioning so you're not hand-editing config files.
+
+The Live View gives you two real-time topology maps. The 3D map is a Three.js visualization with directional particle-flow traffic, WASD camera navigation, and double-click on any client to jump to their performance dashboard. The 2D map is a hierarchical flow diagram that's easier to read at a glance, showing the same live throughput rates, device health badges, and client connections on a canvas you can pan and zoom. Both support historic playback: scrub backward through your monitoring data to see what your network looked like at any point, with full playback controls and adjustable speed.
+
+Latency and packet loss charting covers four target categories (LAN fabric, ISP access, transit, and internet services) with per-target filter badges, time range presets from 15 minutes to 30 days, and sub-15ms query performance. Device health charts track temperature, CPU, and memory per device over time. SFP/ONT optical monitoring shows live RX/TX power, temperature, voltage, and bias current for PON modules, with automatic GPON vs XGS-PON detection.
+
+Upstream Path Discovery uses automated traceroute (ICMP and UDP probes) to map your ISP's access infrastructure, transit networks, and internet service endpoints. It identifies your OLT/CMTS, ISP edge routers, and transit ASNs with full latency and loss charting per hop category. The 2D map visualizes each WAN connection as a globe node with live RTT, loss, and ISP expected speeds.
+
+For the full changelog, see the [v1.17.0 release notes](https://github.com/Ozark-Connect/NetworkOptimizer/releases/tag/v1.17.0) and subsequent patch releases.
+
+![3D LAN Flow Map](docs/images/monitoring-3d-map.png)
+
+![2D LAN Topology Flow Map](docs/images/monitoring-2d-map.png)
+
 ## New: API Key auth to console
 
 Connect to your UniFi Console using an API key instead of username and password. Generated in UniFi Network under Integrations -> Create New API Key. The key is encrypted at rest and never exposed in logs or the UI. Useful for sites where you don't necessarily want to create a Local Admin, or when you're using UniFi Fabrics which no longer lets you create Local Admin users.
@@ -47,22 +63,6 @@ Delivery channels support email (SMTP with STARTTLS), Discord, Slack, Microsoft 
 ## New: Client Performance
 
 A per-device analytics dashboard for any client on your network. Pick a device and get live signal monitoring, speed test history with download/upload trends, latency and jitter charts, network path visualization showing every hop and bottleneck link, and a connection timeline tracking AP roams and disconnects. Walk around with the page open on your phone (over HTTPS) and it builds a GPS-based signal heatmap of your actual coverage. Three tabs - Speed, Signal, and Connection - give you everything you need to troubleshoot why a device is slow or unstable.
-
-## New: Self-Hosted Network Monitoring
-
-Full time-series network monitoring that runs entirely on your hardware. SNMP polling feeds InfluxDB for interface counters, device health (CPU, memory, temperature, uptime), latency probes, SFP optical levels, and WiFi client stats. Everything is stored locally with configurable retention, and a setup wizard handles InfluxDB bucket and token provisioning so you're not hand-editing config files.
-
-The Live View gives you two real-time topology maps. The 3D map is a Three.js visualization with directional particle-flow traffic, WASD camera navigation, and double-click on any client to jump to their performance dashboard. The 2D map is a hierarchical flow diagram that's easier to read at a glance, showing the same live throughput rates, device health badges, and client connections on a canvas you can pan and zoom. Both support historic playback: scrub backward through your monitoring data to see what your network looked like at any point, with full playback controls and adjustable speed.
-
-Latency and packet loss charting covers four target categories (LAN fabric, ISP access, transit, and internet services) with per-target filter badges, time range presets from 15 minutes to 30 days, and sub-15ms query performance. Device health charts track temperature, CPU, and memory per device over time. SFP/ONT optical monitoring shows live RX/TX power, temperature, voltage, and bias current for PON modules, with automatic GPON vs XGS-PON detection.
-
-Upstream Path Discovery uses automated traceroute (ICMP and UDP probes) to map your ISP's access infrastructure, transit networks, and internet service endpoints. It identifies your OLT/CMTS, ISP edge routers, and transit ASNs with full latency and loss charting per hop category. The 2D map visualizes each WAN connection as a globe node with live RTT, loss, and ISP expected speeds.
-
-For the full changelog, see the [v1.17.0 release notes](https://github.com/Ozark-Connect/NetworkOptimizer/releases/tag/v1.17.0) and subsequent patch releases.
-
-![3D LAN Flow Map](docs/images/monitoring-3d-map.png)
-
-![2D LAN Topology Flow Map](docs/images/monitoring-2d-map.png)
 
 ---
 
