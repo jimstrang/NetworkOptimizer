@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo-network-optimizer-pride.png" alt="Network Optimizer" width="200">
+  <img src="docs/images/logo-network-optimizer-pride.png" alt="Network Optimizer - Happy Pride Month!" width="300">
 </p>
 
 # Network Optimizer for UniFi
