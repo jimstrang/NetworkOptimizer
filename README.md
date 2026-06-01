@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/app-logo-v2.png" alt="Network Optimizer" width="200">
+  <img src="docs/images/logo-network-optimizer-pride.png" alt="Network Optimizer" width="200">
 </p>
 
 # Network Optimizer for UniFi
