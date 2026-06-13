@@ -299,7 +299,7 @@ The script stops the service, clears the password, restarts, and shows you the n
 
 ## Agentic Tool and Coding Standards
 
-See [CODING_STANDARDS.md](CODING_STANDARDS.md) for how AI tooling is used in this project, code review practices, and quality standards.
+See [CODING_STANDARDS.md](CODING_STANDARDS.md) for how AI tooling is used (and not used) in this project, code review practices, and quality standards.
 
 ## Contributing
 
