@@ -297,6 +297,10 @@ irm https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/script
 
 The script stops the service, clears the password, restarts, and shows you the new temporary password.
 
+## Agentic Tool and Coding Standards
+
+See [CODING_STANDARDS.md](CODING_STANDARDS.md) for how AI tooling is used in this project, code review practices, and quality standards.
+
 ## Contributing
 
 If you find issues, report them via GitHub Issues. Include your UniFi device models and controller version. Sanitize credentials and IPs before attaching logs.
