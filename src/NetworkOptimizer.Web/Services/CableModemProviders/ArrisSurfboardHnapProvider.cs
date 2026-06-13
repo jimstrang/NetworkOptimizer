@@ -25,7 +25,7 @@ public sealed class ArrisSurfboardHnapProvider : ICableModemProvider, IDisposabl
     public string ProviderKey => "arris-surfboard-hnap";
 
     /// <inheritdoc/>
-    public string DisplayName => "ARRIS Surfboard (HNAP)";
+    public string DisplayName => "ARRIS Surfboard S33/S34 (HNAP)";
 
     private const string StatusPath = "/Cmconnectionstatus.html";
     private const string HnapPath = "/HNAP1/";
