@@ -103,4 +103,23 @@ public class ArrisSurfboardProviderTests
         stats.DownstreamChannels.Should().ContainSingle();
         stats.UpstreamChannels.Should().ContainSingle();
     }
+
+    [Fact]
+    public void ParseRawHnapResponse_IgnoresMalformedS34HeaderLine()
+    {
+        var rawResponse = "HTTP/1.1 200 OK\r\n" +
+            "   2.099998  |Content-type: text/html\r\n" +
+            "Server: lighttpd\r\n" +
+            "\r\n" +
+            "{\"GetMultipleHNAPsResponse\":{\"GetMultipleHNAPsResult\":\"OK\"}}";
+
+        using var document = ArrisSurfboardProvider.ParseRawHnapResponse(rawResponse);
+
+        document.Should().NotBeNull();
+        document!.RootElement
+            .GetProperty("GetMultipleHNAPsResponse")
+            .GetProperty("GetMultipleHNAPsResult")
+            .GetString()
+            .Should().Be("OK");
+    }
 }

@@ -507,12 +507,7 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
             // The request advertises no Accept-Encoding, so the modem returns plain text we
             // can decode directly; we never negotiate gzip/deflate on this raw path.
             var responseText = Encoding.UTF8.GetString(memory.ToArray());
-            var jsonStart = responseText.IndexOf('{');
-            var jsonEnd = responseText.LastIndexOf('}');
-            if (jsonStart < 0 || jsonEnd <= jsonStart)
-                return null;
-
-            return JsonDocument.Parse(responseText[jsonStart..(jsonEnd + 1)]);
+            return ParseRawHnapResponse(responseText);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -536,6 +531,16 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
         var content = new ByteArrayContent(Encoding.UTF8.GetBytes(json));
         content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
         return content;
+    }
+
+    internal static JsonDocument? ParseRawHnapResponse(string responseText)
+    {
+        var jsonStart = responseText.IndexOf('{');
+        var jsonEnd = responseText.LastIndexOf('}');
+        if (jsonStart < 0 || jsonEnd <= jsonStart)
+            return null;
+
+        return JsonDocument.Parse(responseText[jsonStart..(jsonEnd + 1)]);
     }
 
     /// <summary>
