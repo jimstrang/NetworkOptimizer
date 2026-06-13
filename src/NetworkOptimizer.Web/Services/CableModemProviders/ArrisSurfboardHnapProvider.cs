@@ -363,7 +363,7 @@ public sealed class ArrisSurfboardHnapProvider : ICableModemProvider, IDisposabl
             if (string.Equals(action, "GetMultipleHNAPs", StringComparison.OrdinalIgnoreCase) &&
                 ex.Message.Contains("invalid header name", StringComparison.OrdinalIgnoreCase))
             {
-                var fallback = await PostHnapRawAsync(
+                var fallback = await PostHnapRawForMalformedHeadersAsync(
                     client,
                     endpoint,
                     action,
@@ -386,7 +386,7 @@ public sealed class ArrisSurfboardHnapProvider : ICableModemProvider, IDisposabl
         }
     }
 
-    private async Task<JsonDocument?> PostHnapRawAsync(
+    private async Task<JsonDocument?> PostHnapRawForMalformedHeadersAsync(
         HttpClient client,
         string endpoint,
         string action,
@@ -453,12 +453,12 @@ public sealed class ArrisSurfboardHnapProvider : ICableModemProvider, IDisposabl
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            _logger.LogDebug("ARRIS Surfboard HNAP raw POST {Action} timed out", action);
+            _logger.LogDebug("ARRIS Surfboard HNAP malformed-header fallback POST {Action} timed out", action);
             return null;
         }
         catch (Exception ex) when (ex is IOException or SocketException or AuthenticationException or JsonException)
         {
-            _logger.LogDebug(ex, "ARRIS Surfboard HNAP raw POST {Action} failed", action);
+            _logger.LogDebug(ex, "ARRIS Surfboard HNAP malformed-header fallback POST {Action} failed", action);
             return null;
         }
     }
