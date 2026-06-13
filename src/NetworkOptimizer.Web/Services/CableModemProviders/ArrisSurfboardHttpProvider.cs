@@ -10,11 +10,11 @@ using NetworkOptimizer.Monitoring.Providers;
 namespace NetworkOptimizer.Web.Services.CableModemProviders;
 
 /// <summary>
-/// Cable modem provider for ARRIS Surfboard modems (SB8200, SB6183, T25, S33).
+/// Cable modem provider for ARRIS Surfboard modems (SB8200, SB6183, T25).
 /// Supports both SB8200 token-based auth (HTTPS) and SB6183 simple page fetch (HTTP).
 /// Auto-detects model by trying SB8200 HTTPS first, falling back to SB6183 HTTP.
 /// </summary>
-public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
+public sealed class ArrisSurfboardHttpProvider : ICableModemProvider, IDisposable
 {
     /// <inheritdoc/>
     public string ProviderKey => "arris-surfboard";
@@ -26,7 +26,7 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
     private const string Sb6183StatusPath = "/RgConnect.asp";
     private const int TimeoutSeconds = 15;
 
-    private readonly ILogger<ArrisSurfboardProvider> _logger;
+    private readonly ILogger<ArrisSurfboardHttpProvider> _logger;
 
     /// <summary>
     /// Cached auth tokens keyed by CmConfiguration.Id.
@@ -34,7 +34,7 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
     /// </summary>
     private readonly ConcurrentDictionary<int, string> _tokenCache = new();
 
-    public ArrisSurfboardProvider(ILogger<ArrisSurfboardProvider> logger)
+    public ArrisSurfboardHttpProvider(ILogger<ArrisSurfboardHttpProvider> logger)
     {
         _logger = logger;
     }
