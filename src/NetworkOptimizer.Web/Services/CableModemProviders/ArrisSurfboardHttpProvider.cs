@@ -10,7 +10,7 @@ using NetworkOptimizer.Monitoring.Providers;
 namespace NetworkOptimizer.Web.Services.CableModemProviders;
 
 /// <summary>
-/// Cable modem provider for ARRIS Surfboard modems (SB8200, SB6183, T25, S33).
+/// Cable modem provider for ARRIS Surfboard modems (SB8200, SB6183, T25).
 /// Supports both SB8200 token-based auth (HTTPS) and SB6183 simple page fetch (HTTP).
 /// Auto-detects model by trying SB8200 HTTPS first, falling back to SB6183 HTTP.
 /// </summary>
