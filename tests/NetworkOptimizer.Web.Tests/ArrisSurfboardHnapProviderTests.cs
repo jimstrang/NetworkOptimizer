@@ -7,16 +7,16 @@ using Xunit;
 
 namespace NetworkOptimizer.Web.Tests;
 
-public class ArrisSurfboardProviderTests
+public class ArrisSurfboardHnapProviderTests
 {
     [Fact]
-    public void ParseS34DownstreamRows_ParsesLiveS34RowFormat()
+    public void ParseDownstreamRows_ParsesLiveHnapRowFormat()
     {
         var stats = new CableModemStats();
         var rows = "1^Locked^256QAM^37^189000000^ 2.9^40.9^0^0^|+|" +
                    "34^Locked^OFDM PLC^159^300000000^ 2.2^43.0^1148144748^12^";
 
-        ArrisSurfboardProvider.ParseS34DownstreamRows(rows, stats);
+        ArrisSurfboardHnapProvider.ParseDownstreamRows(rows, stats);
 
         stats.DownstreamChannels.Should().HaveCount(2);
         stats.DownstreamChannels[0].Should().BeEquivalentTo(new DsChannel
@@ -36,14 +36,14 @@ public class ArrisSurfboardProviderTests
     }
 
     [Fact]
-    public void ParseS34UpstreamRows_ParsesLiveS34RowFormat()
+    public void ParseUpstreamRows_ParsesLiveHnapRowFormat()
     {
         var stats = new CableModemStats();
         var rows = "1^Locked^SC-QAM^2^6400000^24000000^34.5^|+|" +
                    "5^Not Locked^Unknown^0^0^0^-inf^|+|" +
                    "9^Locked^OFDMA^6^44000000^36800000^30.2^";
 
-        ArrisSurfboardProvider.ParseS34UpstreamRows(rows, stats);
+        ArrisSurfboardHnapProvider.ParseUpstreamRows(rows, stats);
 
         stats.UpstreamChannels.Should().HaveCount(3);
         stats.UpstreamChannels[0].Should().BeEquivalentTo(new UsChannel
@@ -61,7 +61,7 @@ public class ArrisSurfboardProviderTests
     }
 
     [Fact]
-    public void ParseS34Hnap_SetsArrisModelAndChannels()
+    public void ParseHnap_SetsArrisModelAndChannels()
     {
         using var deviceResponse = JsonDocument.Parse("""
         {
@@ -96,10 +96,46 @@ public class ArrisSurfboardProviderTests
             Host = "192.168.100.1",
         };
 
-        var stats = ArrisSurfboardProvider.ParseS34Hnap(deviceResponse, channelResponse, context);
+        var stats = ArrisSurfboardHnapProvider.ParseHnap(deviceResponse, channelResponse, context);
 
         stats.DeviceModel.Should().Be("ARRIS S34");
         stats.DeviceHost.Should().Be("192.168.100.1");
+        stats.DownstreamChannels.Should().ContainSingle();
+        stats.UpstreamChannels.Should().ContainSingle();
+    }
+
+    [Fact]
+    public void ParseHnap_UsesModelFromChannelResponseWhenDeviceProbeFails()
+    {
+        using var channelResponse = JsonDocument.Parse("""
+        {
+          "GetMultipleHNAPsResponse": {
+            "GetArrisDeviceStatusResponse": {
+              "StatusSoftwareModelName": "S33",
+              "GetArrisDeviceStatusResult": "OK"
+            },
+            "GetCustomerStatusDownstreamChannelInfoResponse": {
+              "CustomerConnDownstreamChannel": "0^Not Locked^Unknown^0^0^0.0^0.0^0^0^",
+              "GetCustomerStatusDownstreamChannelInfoResult": "OK"
+            },
+            "GetCustomerStatusUpstreamChannelInfoResponse": {
+              "CustomerConnUpstreamChannel": "0^Not Locked^Unknown^0^0^0^0.0^",
+              "GetCustomerStatusUpstreamChannelInfoResult": "OK"
+            },
+            "GetMultipleHNAPsResult": "OK"
+          }
+        }
+        """);
+        var context = new CmPollContext
+        {
+            Id = 1,
+            Name = "S33",
+            Host = "192.168.100.1",
+        };
+
+        var stats = ArrisSurfboardHnapProvider.ParseHnap(null, channelResponse, context);
+
+        stats.DeviceModel.Should().Be("ARRIS S33");
         stats.DownstreamChannels.Should().ContainSingle();
         stats.UpstreamChannels.Should().ContainSingle();
     }
@@ -113,7 +149,7 @@ public class ArrisSurfboardProviderTests
             "\r\n" +
             "{\"GetMultipleHNAPsResponse\":{\"GetMultipleHNAPsResult\":\"OK\"}}";
 
-        using var document = ArrisSurfboardProvider.ParseRawHnapResponse(rawResponse);
+        using var document = ArrisSurfboardHnapProvider.ParseRawHnapResponse(rawResponse);
 
         document.Should().NotBeNull();
         document!.RootElement
@@ -121,5 +157,13 @@ public class ArrisSurfboardProviderTests
             .GetProperty("GetMultipleHNAPsResult")
             .GetString()
             .Should().Be("OK");
+    }
+
+    [Fact]
+    public void HmacMd5Hex_ReturnsUppercaseDigestForS33Hnap()
+    {
+        var digest = ArrisSurfboardHnapProvider.HmacMd5Hex("key", "The quick brown fox jumps over the lazy dog");
+
+        digest.Should().Be("80070713463E7749B90C2DC24911E275");
     }
 }

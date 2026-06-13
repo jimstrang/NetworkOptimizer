@@ -192,7 +192,8 @@ builder.Services.AddSingleton<CellularModemService>();
 
 // Register Cable Modem providers and service
 builder.Services.AddSingleton<ICableModemProvider, NetgearCmProvider>();
-builder.Services.AddSingleton<ICableModemProvider, ArrisSurfboardProvider>();
+builder.Services.AddSingleton<ICableModemProvider, ArrisSurfboardHttpProvider>();
+builder.Services.AddSingleton<ICableModemProvider, ArrisSurfboardHnapProvider>();
 builder.Services.AddSingleton<ICableModemProvider, MotorolaHnapProvider>();
 builder.Services.AddSingleton<CableModemMonitorService>();
 
