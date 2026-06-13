@@ -24,4 +24,4 @@ This document, my posts and comments on Reddit and in GitHub Issues are 100% hum
 
 I take a lot of pride in all projects and products I code, whether it's down to the pixel-level placement of UI elements in responsive layout, or anal retentiveness about code quality standards. But like any large project, NO has some tech debt, and most of it is documented in the [TODO.md](TODO.md) in the repo or in TODO comments in the code base.
 
-Code should be clean, easy-to-read, and inclusive of useful but not superfluous comments. It should employ good design patterns where appropriate without being over-engineered, and reuse existing common code and styles wherever possible. Rule of thumb, if logic is used more than 2 places, it needs to be in a common utility.
+Code should be clean, easy-to-read, and inclusive of useful but not superfluous comments. It should employ good design patterns where appropriate without being over-engineered, and reuse existing common code and styles wherever possible. Rule of thumb, if logic is used more than 2 places, it needs to be in a common utility or otherwise abstracted.
