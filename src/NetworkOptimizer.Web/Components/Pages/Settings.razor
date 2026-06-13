@@ -1034,7 +1034,7 @@
                             <label class="form-label">Status Page Path (optional)</label>
                             <input type="text" class="form-control" @bind="_editingCm.StatusPagePath"
                                    placeholder="@GetCmStatusPathPlaceholder(_editingCm.Provider)" />
-                            <small class="form-help">Leave empty to use the provider default.@(_editingCm.Provider == "motorola-hnap" ? " Uses HNAP protocol on /HNAP1/." : "")</small>
+                            <small class="form-help">@GetCmStatusPathHelp(_editingCm.Provider)</small>
                         </div>
                         <div class="form-group" style="flex: 1;">
                             <label class="form-label">Polling Interval (sec)</label>
@@ -4187,9 +4187,16 @@
 
     private static string GetCmStatusPathPlaceholder(string provider) => provider switch
     {
-        "arris-surfboard" => "/cgi-bin/status",
+        "arris-surfboard" => "Leave empty, or /cgi-bin/status for SB6190",
         "motorola-hnap" => "N/A (uses /HNAP1/)",
         _ => "/DocsisStatus.htm",
+    };
+
+    private static string GetCmStatusPathHelp(string provider) => provider switch
+    {
+        "arris-surfboard" => "Leave empty for SB8200/SB6183 defaults. Use /cgi-bin/status for SB6190.",
+        "motorola-hnap" => "Leave empty to use the provider default. Uses HNAP protocol on /HNAP1/.",
+        _ => "Leave empty to use the provider default.",
     };
 
     // --- External ONT Monitoring ---

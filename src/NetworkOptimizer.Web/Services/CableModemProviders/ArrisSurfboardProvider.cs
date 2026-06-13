@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using HtmlAgilityPack;
 using Microsoft.Extensions.Logging;
@@ -10,9 +11,10 @@ using NetworkOptimizer.Monitoring.Providers;
 namespace NetworkOptimizer.Web.Services.CableModemProviders;
 
 /// <summary>
-/// Cable modem provider for ARRIS Surfboard modems (SB8200, SB6183, T25, S33).
-/// Supports both SB8200 token-based auth (HTTPS) and SB6183 simple page fetch (HTTP).
-/// Auto-detects model by trying SB8200 HTTPS first, falling back to SB6183 HTTP.
+/// Cable modem provider for ARRIS Surfboard modems (SB8200, SB6190, SB6183, T25).
+/// Supports SB8200 token-based auth (HTTPS), SB6190 CGI login, and SB6183 simple page fetch (HTTP).
+/// Routes /cgi-bin/status configurations to SB6190 CGI login; otherwise tries SB8200 HTTPS,
+/// falling back to SB6183 HTTP.
 /// </summary>
 public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
 {
@@ -23,6 +25,8 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
     public string DisplayName => "ARRIS Surfboard (HTTP)";
 
     private const string Sb8200StatusPath = "/cmconnectionstatus.html";
+    private const string Sb6190StatusPath = "/cgi-bin/status";
+    private const string Sb6190LoginPath = "/cgi-bin/adv_pwd_cgi";
     private const string Sb6183StatusPath = "/RgConnect.asp";
     private const int TimeoutSeconds = 15;
 
@@ -52,8 +56,19 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
 
         try
         {
+            // /cgi-bin/status is the SB6190 CGI flow; avoid probing it with SB8200 token auth first.
+            var html = await TrySb6190Async(context, cancellationToken);
+            if (html != null)
+            {
+                var stats = ParseSb6190(html, context);
+                _logger.LogDebug(
+                    "ARRIS SB6190 {Name} polled: {DsCount} DS channels, {UsCount} US channels",
+                    context.Name, stats.DownstreamChannels.Count, stats.UpstreamChannels.Count);
+                return stats;
+            }
+
             // Try SB8200 (HTTPS with token auth) first
-            var html = await TrySb8200Async(context, cancellationToken);
+            html = await TrySb8200Async(context, cancellationToken);
             if (html != null)
             {
                 var stats = ParseSb8200(html, context);
@@ -77,7 +92,7 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
                 return stats;
             }
 
-            _logger.LogWarning("ARRIS Surfboard {Name} at {Host}: both SB8200 and SB6183 fetch failed",
+            _logger.LogWarning("ARRIS Surfboard {Name} at {Host}: SB6190, SB8200, and SB6183 fetches failed",
                 context.Name, context.Host);
             return null;
         }
@@ -102,8 +117,14 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
 
         try
         {
+            var html = await TrySb6190Async(context, cancellationToken);
+            if (html != null)
+            {
+                return (true, "Connected to ARRIS SB6190 (CGI login)");
+            }
+
             // Try SB8200 first
-            var html = await TrySb8200Async(context, cancellationToken);
+            html = await TrySb8200Async(context, cancellationToken);
             if (html != null)
             {
                 await LogoutAsync(context, cancellationToken);
@@ -117,11 +138,104 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
                 return (true, "Connected to ARRIS SB6183 (HTTP)");
             }
 
-            return (false, "Could not connect via HTTPS (SB8200) or HTTP (SB6183). Check host and credentials.");
+            return (false, "Could not connect via CGI login (SB6190), HTTPS token auth (SB8200), or HTTP status page (SB6183). Check host and credentials.");
         }
         catch (Exception ex)
         {
             return (false, $"Connection failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Attempt SB6190 CGI login and authenticated status fetch.
+    /// </summary>
+    private async Task<string?> TrySb6190Async(CmPollContext context, CancellationToken cancellationToken)
+    {
+        if (!IsSb6190CgiStatusPath(context.StatusPagePath))
+            return null;
+
+        var port = context.Port > 0 ? context.Port : 80;
+        var scheme = port == 443 ? "https" : "http";
+        var portSuffix = (scheme == "https" && port == 443) || (scheme == "http" && port == 80) ? "" : $":{port}";
+        var baseUrl = $"{scheme}://{context.Host}{portSuffix}";
+
+        using var handler = new HttpClientHandler
+        {
+            CookieContainer = new CookieContainer(),
+            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+            UseCookies = true,
+        };
+        using var client = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromSeconds(TimeoutSeconds),
+        };
+
+        var nonce = GenerateSb6190Nonce();
+
+        try
+        {
+            await client.GetAsync(baseUrl + Sb6190LoginPath, cancellationToken);
+
+            var username = string.IsNullOrWhiteSpace(context.Username) ? "admin" : context.Username;
+            var form = new Dictionary<string, string>
+            {
+                ["username"] = username,
+                ["password"] = context.Password ?? "",
+                ["ar_nonce"] = nonce,
+            };
+
+            using var loginContent = new FormUrlEncodedContent(form);
+            using var loginRequest = new HttpRequestMessage(HttpMethod.Post, baseUrl + Sb6190LoginPath)
+            {
+                Content = loginContent,
+            };
+            loginRequest.Headers.Referrer = new Uri(baseUrl + Sb6190LoginPath);
+            loginRequest.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
+            loginRequest.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
+
+            using var loginResponse = await client.SendAsync(loginRequest, cancellationToken);
+            if (!loginResponse.IsSuccessStatusCode)
+                return null;
+
+            var loginResult = (await loginResponse.Content.ReadAsStringAsync(cancellationToken)).Trim();
+            if (loginResult.StartsWith("Error:", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogDebug("ARRIS SB6190 login failed for {Host}: {Result}", context.Host, loginResult);
+                return null;
+            }
+
+            var statusPath = loginResult.StartsWith("Url:", StringComparison.OrdinalIgnoreCase)
+                ? ResolveSb6190Path(loginResult[4..].Trim())
+                : Sb6190StatusPath;
+
+            var statusResponse = await client.GetAsync(baseUrl + statusPath, cancellationToken);
+            if (!statusResponse.IsSuccessStatusCode)
+                return null;
+
+            var html = await statusResponse.Content.ReadAsStringAsync(cancellationToken);
+            return IsAuthPage(html) ? null : html;
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogDebug(ex, "ARRIS SB6190 CGI request failed for {Host}", context.Host);
+            return null;
+        }
+        finally
+        {
+            await LogoutSb6190Async(client, baseUrl, nonce, CancellationToken.None);
+        }
+    }
+
+    private async Task LogoutSb6190Async(HttpClient client, string baseUrl, string nonce, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var content = new StringContent(nonce, Encoding.UTF8, "text/plain");
+            await client.PostAsync(baseUrl + "/cgi-bin/logout", content, cancellationToken);
+        }
+        catch
+        {
+            // Logout is best-effort.
         }
     }
 
@@ -370,6 +484,89 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
         return stats;
     }
 
+    internal static CableModemStats ParseSb6190(string html, CmPollContext context)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        var stats = new CableModemStats
+        {
+            Timestamp = DateTime.UtcNow,
+            DeviceHost = context.Host,
+            DeviceName = context.Name,
+            DeviceModel = "ARRIS SB6190",
+        };
+
+        var tables = doc.DocumentNode.SelectNodes("//table");
+        if (tables == null || tables.Count < 4)
+            return stats;
+
+        ParseSb6190DownstreamTable(tables[2], stats);
+        ParseSb6190UpstreamTable(tables[3], stats);
+
+        return stats;
+    }
+
+    private static void ParseSb6190DownstreamTable(HtmlNode table, CableModemStats stats)
+    {
+        var rows = table.SelectNodes(".//tr[position()>1]");
+        if (rows == null) return;
+
+        foreach (var row in rows)
+        {
+            var cells = row.SelectNodes("td");
+            if (cells == null || cells.Count < 9) continue;
+
+            var firstCell = cells[0].InnerText.Trim();
+            if (!int.TryParse(firstCell, out _))
+                continue;
+
+            var channel = new DsChannel
+            {
+                ChannelId = ParseInt(cells[3].InnerText),
+                LockStatus = cells[1].InnerText.Trim(),
+                Modulation = cells[2].InnerText.Trim(),
+                Frequency = ParseFrequency(cells[4].InnerText),
+                Power = ParseDouble(cells[5].InnerText),
+                Snr = ParseDouble(cells[6].InnerText),
+                Correctables = ParseLong(cells[7].InnerText),
+                Uncorrectables = ParseLong(cells[8].InnerText),
+            };
+
+            if (channel.ChannelId > 0 || !string.IsNullOrWhiteSpace(channel.LockStatus))
+                stats.DownstreamChannels.Add(channel);
+        }
+    }
+
+    private static void ParseSb6190UpstreamTable(HtmlNode table, CableModemStats stats)
+    {
+        var rows = table.SelectNodes(".//tr[position()>1]");
+        if (rows == null) return;
+
+        foreach (var row in rows)
+        {
+            var cells = row.SelectNodes("td");
+            if (cells == null || cells.Count < 7) continue;
+
+            var firstCell = cells[0].InnerText.Trim();
+            if (!int.TryParse(firstCell, out _))
+                continue;
+
+            var channel = new UsChannel
+            {
+                ChannelId = ParseInt(cells[3].InnerText),
+                LockStatus = cells[1].InnerText.Trim(),
+                ChannelType = cells[2].InnerText.Trim(),
+                SymbolRate = ParseLong(cells[4].InnerText),
+                Frequency = ParseFrequency(cells[5].InnerText),
+                Power = ParseDouble(cells[6].InnerText) ?? 0,
+            };
+
+            if (channel.ChannelId > 0 || !string.IsNullOrWhiteSpace(channel.LockStatus))
+                stats.UpstreamChannels.Add(channel);
+        }
+    }
+
     private void ParseDownstreamTable(HtmlNode table, CableModemStats stats)
     {
         var rows = table.SelectNodes(".//tr[position()>1]");
@@ -483,8 +680,37 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
 
     private static long ParseFrequency(string text)
     {
+        if (text.Contains("MHz", StringComparison.OrdinalIgnoreCase))
+        {
+            var mhz = StripUnits(text);
+            return double.TryParse(mhz, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var mhzValue)
+                ? (long)(mhzValue * 1_000_000)
+                : 0;
+        }
+
         var cleaned = StripUnits(text);
         return long.TryParse(cleaned, out var val) ? val : 0;
+    }
+
+    private static bool IsSb6190CgiStatusPath(string? statusPath)
+        => string.Equals(statusPath, Sb6190StatusPath, StringComparison.OrdinalIgnoreCase);
+
+    private static string ResolveSb6190Path(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return Sb6190StatusPath;
+
+        if (path.StartsWith("/", StringComparison.Ordinal))
+            return path;
+
+        return "/cgi-bin/" + path;
+    }
+
+    private static string GenerateSb6190Nonce()
+    {
+        var value = RandomNumberGenerator.GetInt32(0, 100_000_000);
+        return value.ToString("D8", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     /// <summary>
@@ -497,7 +723,7 @@ public sealed class ArrisSurfboardProvider : ICableModemProvider, IDisposable
 
         var cleaned = text.Trim();
 
-        string[] units = { "Ksym/sec", "Msym/sec", "dBmV", "dB", "Hz" };
+        string[] units = { "Ksym/sec", "kSym/s", "Msym/sec", "dBmV", "dB", "MHz", "Hz" };
         foreach (var unit in units)
         {
             var idx = cleaned.IndexOf(unit, StringComparison.OrdinalIgnoreCase);
