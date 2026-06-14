@@ -177,6 +177,11 @@ pct exec <CT_ID> -- docker logs network-optimizer 2>&1 | grep -A5 "AUTO-GENERATE
 http://<container-ip>:8042
 ```
 
+**Updating:**
+```bash
+pct exec <CT_ID> -- bash -c "cd /opt/network-optimizer && docker compose pull && docker compose up -d"
+```
+
 For advanced configuration, troubleshooting, and manual installation see the [full Proxmox guide](../scripts/proxmox/README.md).
 
 ---

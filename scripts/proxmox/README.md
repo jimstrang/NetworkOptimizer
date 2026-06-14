@@ -64,6 +64,28 @@ The script creates a privileged Debian LXC container (Debian 13 Trixie by defaul
 | Geo Location | Disabled | GPS tagging for speed tests and signal levels (auto-enabled with Traefik) |
 | Timezone | America/New_York | Container timezone |
 
+## Updating
+
+To update to the latest version, run from your **Proxmox host**:
+
+```bash
+pct exec <CT_ID> -- bash -c "cd /opt/network-optimizer && docker compose pull && docker compose up -d"
+```
+
+Or enter the container first:
+
+```bash
+pct enter <CT_ID>
+cd /opt/network-optimizer
+docker compose pull && docker compose up -d
+```
+
+If you installed Traefik, update it separately:
+
+```bash
+pct exec <CT_ID> -- bash -c "cd /opt/network-optimizer-proxy && docker compose pull && docker compose up -d"
+```
+
 ## Post-Installation
 
 ### Get Admin Password
