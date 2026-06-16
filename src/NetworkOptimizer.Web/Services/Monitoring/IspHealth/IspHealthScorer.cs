@@ -484,7 +484,7 @@ public class IspHealthScorer
             .Select(s => s.RttAvgMs!.Value)
             .ToList();
         if (rtts.Count < _options.MinLoadedSamples) return null;
-        return SeriesStats.Median(rtts)!.Value - idleBaseline;
+        return SeriesStats.Percentile(rtts, 0.80)!.Value - idleBaseline;
     }
 
     private (IspScoreFactor Factor, bool HasData) ScoreLoadedLoss(
