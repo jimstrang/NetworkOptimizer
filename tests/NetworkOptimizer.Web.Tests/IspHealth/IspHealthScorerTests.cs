@@ -117,9 +117,8 @@ public class IspHealthScorerTests
             .ToList();
 
         var nearHop = TestSeries.Flat(TestSeries.Start, Day, 2.0, 0.3);
-        var spikeStart = LoadedDownStart.AddHours(1);
         var olt = TestSeries.Flat(TestSeries.Start, Day, 2.0, 0.3)
-            .WithSegment(spikeStart, spikeStart.AddMinutes(30), 8.0, 0.3);
+            .WithSegment(LoadedDownStart, LoadedDownEnd, 8.0, 0.3);
 
         var inputs = new IspHealthInputs
         {
