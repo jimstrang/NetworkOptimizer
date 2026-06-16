@@ -484,10 +484,7 @@ public class IspHealthScorer
             .Select(s => s.RttAvgMs!.Value)
             .ToList();
         if (rtts.Count < _options.MinLoadedSamples) return null;
-        // p95 (worst-case under load), not median: brief bufferbloat/congestion spikes are
-        // exactly what loaded latency must catch, and a median over a long loaded period
-        // washes them out.
-        return SeriesStats.Percentile(rtts, 0.95)!.Value - idleBaseline;
+        return SeriesStats.Median(rtts)!.Value - idleBaseline;
     }
 
     private (IspScoreFactor Factor, bool HasData) ScoreLoadedLoss(
