@@ -410,10 +410,10 @@ public class IspHealthScorer
 
     /// <summary>
     /// <summary>
-    /// Global-min loaded-latency delta across all monitored targets (ISP access hops,
-    /// transit, and internet destinations). Each target's p95 loaded RTT minus its own
-    /// idle baseline produces a delta in ms-above-idle; the minimum credible delta is
-    /// the answer. Targets below the jitter floor are noise, not load signal.
+    /// Global loaded-latency delta across all monitored targets (ISP access hops,
+    /// transit, and internet destinations). Each target's p85 loaded RTT minus its own
+    /// idle baseline produces a delta in ms-above-idle. Targets below the jitter floor
+    /// are noise, not load signal; the p25 of the remaining deltas is the result.
     ///
     /// Why p25: any target inflated beyond the real bottleneck (ICMP deprioritization,
     /// destination degradation, peering congestion) reads HIGH. The lowest quartile
@@ -450,7 +450,7 @@ public class IspHealthScorer
     }
 
     /// <summary>
-    /// Per-target loaded deltas for a cohort: each target's p95 loaded-window RTT minus its
+    /// Per-target loaded deltas for a cohort: each target's p85 loaded-window RTT minus its
     /// own idle baseline (delta space, so targets at different distances are comparable). Each
     /// target keeps all its loaded samples; a target without a usable baseline or enough loaded
     /// samples is skipped - the window is not.
@@ -484,7 +484,7 @@ public class IspHealthScorer
             .Select(s => s.RttAvgMs!.Value)
             .ToList();
         if (rtts.Count < _options.MinLoadedSamples) return null;
-        return SeriesStats.Percentile(rtts, 0.80)!.Value - idleBaseline;
+        return SeriesStats.Percentile(rtts, 0.85)!.Value - idleBaseline;
     }
 
     private (IspScoreFactor Factor, bool HasData) ScoreLoadedLoss(
