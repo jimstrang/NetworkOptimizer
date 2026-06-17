@@ -304,6 +304,29 @@ dotnet publish src/NetworkOptimizer.Web -c Release -r linux-x64 --self-contained
 chmod +x /opt/network-optimizer/NetworkOptimizer.Web
 ```
 
+### Build Gateway Speed Test Binary (optional)
+
+The "Run Test from Gateway" WAN speed test deploys a small helper binary to your
+UniFi gateway over SSH. It is not produced by `dotnet publish`, so build it
+separately into the `tools/` directory next to the app. Requires [Go](https://go.dev/dl/).
+
+```bash
+# Gateways are always ARM64 - build for linux/arm64 regardless of your host arch
+cd src/uwnspeedtest
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w" -o /opt/network-optimizer/tools/uwnspeedtest-linux-arm64 .
+cd ../..
+
+# Optional: WAN Steering daemon (only if you use multi-WAN steering)
+cd src/wansteer
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath \
+    -ldflags "-s -w" -o /opt/network-optimizer/tools/wansteer-linux-arm64 .
+cd ../..
+```
+
+Without this, the app runs fine but the gateway WAN speed test reports
+"Gateway speed test binary not found."
+
 ### Create Startup Script
 
 ```bash
