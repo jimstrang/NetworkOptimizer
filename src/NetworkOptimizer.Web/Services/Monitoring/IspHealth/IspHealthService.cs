@@ -27,6 +27,7 @@ public class IspHealthService
     private readonly UniFiConnectionService _connectionService;
     private readonly ILogger<IspHealthService> _logger;
     private readonly IspHealthOptions _options = new();
+    private const int MaxCustomWindowHours = 720;  // 30-day cap on the date/time filter, matching the UI
     private readonly SemaphoreSlim _computeLock = new(1, 1);
 
     // Report and its chart clusters are published together as one immutable snapshot so a
@@ -145,6 +146,15 @@ public class IspHealthService
     public async Task<(IspHealthReport? Report, List<AsnSeries> ChartClusters)> ComputeForWindowAsync(
         DateTime windowStart, DateTime windowEnd, bool forceRefresh = false, CancellationToken ct = default)
     {
+        // Enforce the filter's window bounds on the real data path. The UI clamps too, but this is the
+        // single chokepoint every custom-window caller (report and chart endpoint) funnels through, so a
+        // sub-minimum (or over-max) request can't slip past into an empty result. Pin the end and expand
+        // the start back, exactly as the UI does; min ties to the scoring floor, max is the 30-day cap.
+        var minSpan = TimeSpan.FromHours(_options.MinDataHours);
+        var maxSpan = TimeSpan.FromHours(MaxCustomWindowHours);
+        if (windowEnd - windowStart < minSpan) windowStart = windowEnd - minSpan;
+        else if (windowEnd - windowStart > maxSpan) windowStart = windowEnd - maxSpan;
+
         var cached = _customCache;
         if (!forceRefresh && cached != null && cached.Start == windowStart && cached.End == windowEnd
             && DateTime.UtcNow - cached.ComputedAt < _options.CacheTtl)
@@ -316,7 +326,13 @@ public class IspHealthService
             .Select(s => s[0].Time)
             .DefaultIfEmpty(windowEnd)
             .Min();
-        if ((windowEnd - earliestSample).TotalHours < _options.MinDataHours)
+        // New-install / sparse-window guard: too little data to score. Fires only when the data is
+        // both shorter than MinDataHours AND does not reach near the window start - a fresh install (or
+        // a window predating collection) has its earliest sample well inside the window. An established
+        // site's earliest sample sits at the window edge, so a small custom window clamped to the
+        // minimum still scores instead of tripping this on the first poll gap.
+        if ((windowEnd - earliestSample).TotalHours < _options.MinDataHours
+            && earliestSample > windowStart.AddMinutes(15))
             return new ComputeOutcome(IspHealthStatus.InsufficientData, null, new List<AsnSeries>());
 
         var (firstHop, firstHopTargetId) = PickFirstCleanHop(ispTargets, ispSeries);
