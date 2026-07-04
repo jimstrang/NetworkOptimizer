@@ -729,7 +729,6 @@
         // Load WAN list, gateway status, and history in parallel
         var historyTask = LoadHistory(resetPage: true);
         Task? wanTask = null;
-        Task? gatewayTask = null;
 
         if (ConnectionService.IsConnected)
         {
@@ -751,27 +750,16 @@
                 }
                 catch { /* Non-critical */ }
             });
-
-            gatewayTask = Task.Run(async () =>
-            {
-                try
-                {
-                    var gwSettings = await GatewaySshService.GetSettingsAsync();
-                    _gatewaySshConfigured = !string.IsNullOrEmpty(gwSettings.Host) && gwSettings.HasCredentials && gwSettings.Enabled;
-                    if (!_gatewaySshConfigured)
-                        _gatewaySshUnavailableReason = "Gateway SSH not configured. Set it up in Settings, under the Connection tab.";
-                }
-                catch
-                {
-                    _gatewaySshConfigured = false;
-                    _gatewaySshUnavailableReason = "Could not check gateway status";
-                }
-            });
         }
+
+        // Gateway SSH availability is a DB read - determine it even when the console
+        // (and, on an agent-backed site, the agent) is offline, so the Gateway (Direct)
+        // option recovers on its own when the agent reconnects rather than needing a reload.
+        var gatewayTask = RefreshGatewaySshConfigAsync();
 
         await historyTask;
         if (wanTask != null) await wanTask;
-        if (gatewayTask != null) await gatewayTask;
+        await gatewayTask;
 
         await RefreshAgentAvailabilityAsync();
         StartAgentStatusPolling();
@@ -802,6 +790,28 @@
         // Subscribe to path analysis completion to refresh UI
         WanSpeedTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
         GatewayWanTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
+    }
+
+    /// <summary>
+    /// Reads gateway SSH availability from settings (a DB read, no console/agent
+    /// required) so the Gateway (Direct) option can be gated even before the console
+    /// connects, and recovers on its own once an offline agent reconnects.
+    /// </summary>
+    private async Task RefreshGatewaySshConfigAsync()
+    {
+        try
+        {
+            var gwSettings = await GatewaySshService.GetSettingsAsync();
+            _gatewaySshConfigured = !string.IsNullOrEmpty(gwSettings.Host) && gwSettings.HasCredentials && gwSettings.Enabled;
+            _gatewaySshUnavailableReason = _gatewaySshConfigured
+                ? null
+                : "Gateway SSH not configured. Set it up in Settings, under the Connection tab.";
+        }
+        catch
+        {
+            _gatewaySshConfigured = false;
+            _gatewaySshUnavailableReason = "Could not check gateway status";
+        }
     }
 
     /// <summary>
