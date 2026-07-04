@@ -1,5 +1,6 @@
 @page "/network-tools"
 @rendermode InteractiveServer
+@implements IDisposable
 @using NetworkOptimizer.Web.Services
 @using NetworkOptimizer.Web.Services.Monitoring
 @using NetworkOptimizer.Monitoring.Probes
@@ -10,6 +11,8 @@
 @inject ProbeExecutorFactory ExecutorFactory
 @inject UniFiConnectionService ConnectionService
 @inject ISqmService SqmService
+@inject SiteContextService SiteContext
+@inject SiteTunnelRouting TunnelRouting
 
 <PageTitle>Network Tools - Network Optimizer</PageTitle>
 
@@ -22,6 +25,14 @@
         whether a problem is on the server's path or on a specific link of your LAN.
     </p>
 </div>
+
+@if (_siteAgentOffline)
+{
+    <div class="alert alert-warning">
+        This site's probes run through its on-site agent, which isn't connected right now.
+        Ping and traceroute resume automatically when the agent reconnects.
+    </div>
+}
 
 <div class="card">
     <div class="card-header">
@@ -126,11 +137,12 @@
         }
 
         <div class="action-buttons" style="margin-top: 1rem;">
-            <button class="btn btn-primary" @onclick="RunPing" disabled="@(_running || !CanRun)">
+            <button class="btn btn-primary" @onclick="RunPing" disabled="@(_running || !CanPing)"
+                    data-tooltip="@(_probeMode == ProbeMode.Udp ? "Ping runs over ICMP or TCP - UDP is traceroute-only." : null)">
                 @if (_running && _runningKind == "ping") { <span class="spinner-sm"></span> <span>Pinging...</span> }
                 else { <span>Ping</span> }
             </button>
-            <button class="btn btn-secondary" @onclick="RunTraceroute" disabled="@(_running || !CanRun)">
+            <button class="btn btn-secondary" @onclick="RunTraceroute" disabled="@(_running || !CanTraceroute)">
                 @if (_running && _runningKind == "trace") { <span class="spinner-sm"></span> <span>Tracing...</span> }
                 else { <span>Traceroute</span> }
             </button>
@@ -255,6 +267,18 @@
 
     private bool CanRun => !string.IsNullOrWhiteSpace(_targetAddress) && !_sshCredentialsMissing;
 
+    // Ping supports ICMP and TCP (there is no UDP ping); traceroute supports all three
+    // modes (ICMP, UDP, TCP). Both also need the site's agent online on an agent-backed site.
+    private bool CanPing => CanRun && !_siteAgentOffline && _probeMode != ProbeMode.Udp;
+    private bool CanTraceroute => CanRun && !_siteAgentOffline;
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected. Probes run
+    // through that agent (server vantage over the tunnel, device vantages over SSH), so they
+    // can't run until it reconnects; the poll re-enables them and reloads the device list.
+    private bool _siteAgentOffline;
+    private bool _consoleDataLoaded;
+    private System.Threading.Timer? _agentStatusTimer;
+
     protected override async Task OnInitializedAsync()
     {
         var capTask = LocalProbe.GetCapabilityAsync();
@@ -262,6 +286,62 @@
         var wanTask = LoadWanInterfacesAsync();
         await Task.WhenAll(capTask, devicesTask, wanTask);
         _localCapabilities = capTask.Result.Describe();
+        _consoleDataLoaded = ConnectionService.IsConnected;
+
+        await RefreshAgentAvailabilityAsync();
+        StartAgentStatusPolling();
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline. Probes route through the
+    /// agent for an agent-backed secondary site, so an offline agent locks them out; the
+    /// poll re-enables them when it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        _siteAgentOffline = !SiteContext.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
+            && !TunnelRouting.IsAgentOnline(SiteContext.Slug);
+    }
+
+    /// <summary>
+    /// Polls the site's agent tunnel so probes re-enable on their own once the agent
+    /// reconnects, and loads the console-dependent device list the moment the console
+    /// (which follows the agent) comes back. Only agent-backed secondary sites poll.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    var before = _siteAgentOffline;
+                    await RefreshAgentAvailabilityAsync();
+                    var changed = before != _siteAgentOffline;
+
+                    if (!_consoleDataLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadDevicesAsync();
+                        await LoadWanInterfacesAsync();
+                        _consoleDataLoaded = true;
+                        changed = true;
+                    }
+
+                    if (changed)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    public void Dispose()
+    {
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
     }
 
     private async Task LoadDevicesAsync()

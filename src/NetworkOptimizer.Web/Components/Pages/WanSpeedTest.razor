@@ -595,6 +595,7 @@
     private string? _gatewayUnavailableReason;
     private bool _gatewaySshConfigured;      // gateway SSH host+creds present and enabled
     private string? _gatewaySshUnavailableReason;
+    private bool _consoleDataLoaded;         // WAN list/interfaces loaded from a connected console
 
     // Agent-backed secondary site whose on-site agent isn't currently connected.
     // Both WAN tests run through that agent, so they can't run until it reconnects.
@@ -732,24 +733,7 @@
 
         if (ConnectionService.IsConnected)
         {
-            wanTask = Task.Run(async () =>
-            {
-                try
-                {
-                    var networks = await ConnectionService.GetNetworksAsync();
-                    var wanNetworks = networks.Where(n => n.IsWan && n.Enabled).ToList();
-                    _hasMultipleWans = wanNetworks.Count > 1;
-                    _availableWans = wanNetworks
-                        .Select(n => new WanOption(
-                            n.WanNetworkgroup ?? "WAN",
-                            !string.IsNullOrEmpty(n.Name) ? n.Name : DisplayFormatters.NormalizeWanDisplay(n.WanNetworkgroup ?? "WAN")))
-                        .ToList();
-
-                    // Load WAN interfaces with physical names for gateway test
-                    _wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
-                }
-                catch { /* Non-critical */ }
-            });
+            wanTask = LoadWanDataAsync();
         }
 
         // Gateway SSH availability is a DB read - determine it even when the console
@@ -858,12 +842,50 @@
                 {
                     var before = _siteAgentOffline;
                     await RefreshAgentAvailabilityAsync();
-                    if (before != _siteAgentOffline)
+                    var changed = before != _siteAgentOffline;
+
+                    // The console comes back a moment after the agent tunnel does; once it's
+                    // connected, load the WAN data the Gateway (Direct) test needs so the
+                    // button works on the first click without a manual page refresh.
+                    if (!_consoleDataLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadWanDataAsync();
+                        BuildWanSelectorOptions();
+                        changed = true;
+                    }
+
+                    if (changed)
                         StateHasChanged();
                 });
             }
             catch { /* keep the timer alive */ }
         }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>
+    /// Loads the WAN list and per-interface details from the connected console. These
+    /// feed the Gateway (Direct) selector and are required for a gateway test to run
+    /// (<see cref="RunGatewayTest"/> no-ops with no interfaces). On an agent-backed site
+    /// the console is offline until the agent connects, so this is retried from the poll.
+    /// </summary>
+    private async Task LoadWanDataAsync()
+    {
+        try
+        {
+            var networks = await ConnectionService.GetNetworksAsync();
+            var wanNetworks = networks.Where(n => n.IsWan && n.Enabled).ToList();
+            _hasMultipleWans = wanNetworks.Count > 1;
+            _availableWans = wanNetworks
+                .Select(n => new WanOption(
+                    n.WanNetworkgroup ?? "WAN",
+                    !string.IsNullOrEmpty(n.Name) ? n.Name : DisplayFormatters.NormalizeWanDisplay(n.WanNetworkgroup ?? "WAN")))
+                .ToList();
+
+            // Load WAN interfaces with physical names for gateway test
+            _wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
+            _consoleDataLoaded = true;
+        }
+        catch { /* Non-critical */ }
     }
 
     private void BuildWanSelectorOptions()
