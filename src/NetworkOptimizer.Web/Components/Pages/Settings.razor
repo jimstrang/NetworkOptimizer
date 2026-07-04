@@ -2249,6 +2249,12 @@
                 <div class="info-row">
                     <span class="info-label">GeoLite2 Database:</span>
                     <span class="info-value" style="color: var(--text-secondary);">@threatGeoStatus</span>
+                    @* MaxMind creds + the GeoLite2 DBs are instance-wide (shared .mmdb files),
+                       unlike the per-site threat-collection settings around them. *@
+                    @if (_multiSiteEnabled)
+                    {
+                        <span class="status-badge global-badge" data-tooltip="MaxMind credentials and the GeoLite2 databases are instance-wide (shared across all sites)">Global</span>
+                    }
                 </div>
 
                 <div class="form-group" style="margin-top: 0.75rem;">
@@ -6114,18 +6120,18 @@
             else
                 threatGeoStatus = "Not found - add a MaxMind license key below to auto-download";
 
-            var mmAcct = await SystemSettings.GetAsync("maxmind.account_id");
+            var mmAcct = await SystemSettings.GetGlobalAsync("maxmind.account_id");
             hasMaxmindAccountId = !string.IsNullOrEmpty(mmAcct);
 
-            var mmKey = await SystemSettings.GetAsync("maxmind.license_key");
+            var mmKey = await SystemSettings.GetGlobalAsync("maxmind.license_key");
             hasMaxmindLicenseKey = !string.IsNullOrEmpty(mmKey);
 
-            var csEnabled = await SystemSettings.GetAsync("crowdsec.enabled");
+            var csEnabled = await SystemSettings.GetGlobalAsync("crowdsec.enabled");
             crowdsecEnabled = csEnabled == "true";
-            var csKey = await SystemSettings.GetAsync("crowdsec.api_key");
+            var csKey = await SystemSettings.GetGlobalAsync("crowdsec.api_key");
             hasCrowdsecApiKey = !string.IsNullOrEmpty(csKey);
 
-            var csQuota = await SystemSettings.GetAsync("crowdsec.daily_quota");
+            var csQuota = await SystemSettings.GetGlobalAsync("crowdsec.daily_quota");
             if (!string.IsNullOrEmpty(csQuota) && int.TryParse(csQuota, out var quota) && quota >= 1)
                 crowdsecDailyQuota = quota;
 
@@ -6154,7 +6160,7 @@
             if (!string.IsNullOrEmpty(maxmindAccountId))
             {
                 var encAcct = CredentialService.Encrypt(maxmindAccountId);
-                await SystemSettings.SetAsync("maxmind.account_id", encAcct);
+                await SystemSettings.SetGlobalAsync("maxmind.account_id", encAcct);
                 hasMaxmindAccountId = true;
                 maxmindAccountId = "";
             }
@@ -6162,7 +6168,7 @@
             if (!string.IsNullOrEmpty(maxmindLicenseKey))
             {
                 var encrypted = CredentialService.Encrypt(maxmindLicenseKey);
-                await SystemSettings.SetAsync("maxmind.license_key", encrypted);
+                await SystemSettings.SetGlobalAsync("maxmind.license_key", encrypted);
                 hasMaxmindLicenseKey = true;
                 maxmindLicenseKey = "";
             }
@@ -6193,7 +6199,7 @@
             var accountId = maxmindAccountId;
             if (string.IsNullOrEmpty(accountId))
             {
-                var encAcct = await SystemSettings.GetAsync("maxmind.account_id");
+                var encAcct = await SystemSettings.GetGlobalAsync("maxmind.account_id");
                 if (!string.IsNullOrEmpty(encAcct))
                     accountId = CredentialService.IsEncrypted(encAcct) ? CredentialService.Decrypt(encAcct) : encAcct;
             }
@@ -6201,7 +6207,7 @@
             var licenseKey = maxmindLicenseKey;
             if (string.IsNullOrEmpty(licenseKey))
             {
-                var encrypted = await SystemSettings.GetAsync("maxmind.license_key");
+                var encrypted = await SystemSettings.GetGlobalAsync("maxmind.license_key");
                 if (!string.IsNullOrEmpty(encrypted))
                     licenseKey = CredentialService.IsEncrypted(encrypted) ? CredentialService.Decrypt(encrypted) : encrypted;
             }
@@ -6217,7 +6223,7 @@
             if (!string.IsNullOrEmpty(maxmindAccountId))
             {
                 var encAcct = CredentialService.Encrypt(maxmindAccountId);
-                await SystemSettings.SetAsync("maxmind.account_id", encAcct);
+                await SystemSettings.SetGlobalAsync("maxmind.account_id", encAcct);
                 hasMaxmindAccountId = true;
                 maxmindAccountId = "";
             }
@@ -6225,7 +6231,7 @@
             if (!string.IsNullOrEmpty(maxmindLicenseKey))
             {
                 var encKey = CredentialService.Encrypt(maxmindLicenseKey);
-                await SystemSettings.SetAsync("maxmind.license_key", encKey);
+                await SystemSettings.SetGlobalAsync("maxmind.license_key", encKey);
                 hasMaxmindLicenseKey = true;
                 maxmindLicenseKey = "";
             }
@@ -6240,7 +6246,7 @@
 
             if (success)
             {
-                await SystemSettings.SetAsync("maxmind.last_download", DateTime.UtcNow.ToString("O"));
+                await SystemSettings.SetGlobalAsync("maxmind.last_download", DateTime.UtcNow.ToString("O"));
                 await LoadThreatSettings(); // Refresh geo status display
             }
         }
@@ -6272,18 +6278,18 @@
 
         try
         {
-            await SystemSettings.SetAsync("crowdsec.enabled", crowdsecEnabled ? "true" : "false");
+            await SystemSettings.SetGlobalAsync("crowdsec.enabled", crowdsecEnabled ? "true" : "false");
 
             var newKeyProvided = !string.IsNullOrEmpty(crowdsecApiKey);
             if (newKeyProvided)
             {
                 var encrypted = CredentialService.Encrypt(crowdsecApiKey);
-                await SystemSettings.SetAsync("crowdsec.api_key", encrypted);
+                await SystemSettings.SetGlobalAsync("crowdsec.api_key", encrypted);
                 hasCrowdsecApiKey = true;
                 crowdsecApiKey = "";
             }
 
-            await SystemSettings.SetAsync("crowdsec.daily_quota", crowdsecDailyQuota.ToString());
+            await SystemSettings.SetGlobalAsync("crowdsec.daily_quota", crowdsecDailyQuota.ToString());
 
             // Update the rate limiter. Reset counter when a new API key is saved
             // since the new key has its own fresh quota on CrowdSec's side.
@@ -6313,7 +6319,7 @@
 
         try
         {
-            var stored = await SystemSettings.GetAsync("crowdsec.api_key");
+            var stored = await SystemSettings.GetGlobalAsync("crowdsec.api_key");
             if (string.IsNullOrEmpty(stored))
             {
                 crowdsecMessage = "No CTI API key configured.";
@@ -6347,7 +6353,7 @@
 
     private async Task LoadMapboxToken()
     {
-        _mapboxToken = await SystemSettings.GetAsync(SystemSettingKeys.MapboxApiKey) ?? "";
+        _mapboxToken = await SystemSettings.GetGlobalAsync(SystemSettingKeys.MapboxApiKey) ?? "";
     }
 
     private async Task SaveMapboxToken()
@@ -6357,7 +6363,7 @@
         StateHasChanged();
         try
         {
-            await SystemSettings.SetAsync(SystemSettingKeys.MapboxApiKey, string.IsNullOrWhiteSpace(_mapboxToken) ? null : _mapboxToken.Trim());
+            await SystemSettings.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, string.IsNullOrWhiteSpace(_mapboxToken) ? null : _mapboxToken.Trim());
             _mapboxTokenMessage = "Mapbox token saved. Reload any open maps to apply.";
             _mapboxTokenMessageClass = "success";
         }
@@ -6380,7 +6386,7 @@
         StateHasChanged();
         try
         {
-            await SystemSettings.SetAsync(SystemSettingKeys.MapboxApiKey, null);
+            await SystemSettings.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, null);
             _mapboxToken = "";
             _mapboxTokenMessage = "Mapbox token cleared.";
             _mapboxTokenMessageClass = "success";
