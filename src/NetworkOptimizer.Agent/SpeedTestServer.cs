@@ -23,12 +23,14 @@ public sealed class SpeedTestServer : IAsyncDisposable
 
     private readonly WebApplication _app;
     private readonly HttpClient _relay;
+    private readonly string _siteSlug;
     private Task? _runTask;
 
-    private SpeedTestServer(WebApplication app, HttpClient relay)
+    private SpeedTestServer(WebApplication app, HttpClient relay, string siteSlug)
     {
         _app = app;
         _relay = relay;
+        _siteSlug = siteSlug;
     }
 
     /// <summary>Binds the results relay on loopback (<see cref="RelayPort"/>).</summary>
@@ -52,10 +54,32 @@ public sealed class SpeedTestServer : IAsyncDisposable
         // The "view results" link on the page lives on the central server.
         app.MapGet("/client-speedtest", () => Results.Redirect(serverUrl.TrimEnd('/') + "/client-speedtest"));
 
-        return new SpeedTestServer(app, relay);
+        return new SpeedTestServer(app, relay, siteSlug);
     }
 
     public void Start() => _runTask = _app.RunAsync();
+
+    /// <summary>
+    /// Relays a client-initiated iperf3 result (raw <c>-J</c> JSON captured by the local
+    /// <c>iperf3 -s</c>) to the central server, tagged with this site's slug so it lands in the
+    /// site's database - the iperf3 analog of the OpenSpeedTest result relay above. The client IP,
+    /// direction and throughput all live in the JSON, so nothing else needs to ride along.
+    /// </summary>
+    public async Task PostIperf3ResultAsync(string json, CancellationToken ct)
+    {
+        try
+        {
+            var query = string.IsNullOrEmpty(_siteSlug) ? "" : $"?site={Uri.EscapeDataString(_siteSlug)}";
+            using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            using var resp = await _relay.PostAsync("api/public/speedtest/iperf3-results" + query, content, ct);
+            if (!resp.IsSuccessStatusCode)
+                Console.Error.WriteLine($"iperf3 result relay returned {(int)resp.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to relay iperf3 result: {ex.Message}");
+        }
+    }
 
     private static async Task<IResult> RelayAsync(HttpClient relay, HttpContext context, string path, string siteSlug)
     {

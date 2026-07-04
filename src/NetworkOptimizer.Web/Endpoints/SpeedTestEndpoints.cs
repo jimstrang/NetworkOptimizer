@@ -180,7 +180,42 @@ public static class SpeedTestEndpoints
                 upload = result.UploadMbps,
                 isHighScore
             });
-        }).RequireCors("SpeedTestCors");
+        }).RequireCors("SpeedTestCors").RequireRateLimiting("PublicSpeedTest");
+
+        // Public endpoint for an agent to relay a client-initiated iperf3 test its local iperf3 -s
+        // captured (the agent parsed nothing - it forwards the raw -J JSON). The central iperf3
+        // server records default-site tests directly; this lands a secondary site's tests in its own
+        // database via the same shared recorder. Client IP, direction, and throughput all come from
+        // the iperf3 JSON, so only the raw JSON + site slug are needed. Distinct from the
+        // NO-initiated LAN test (Iperf3SpeedTestService), which the server orchestrates and stores
+        // separately.
+        app.MapPost("/api/public/speedtest/iperf3-results", async (HttpContext context,
+            SpeedTestServiceRegistry speedTestRegistry,
+            NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+            ILoggerFactory loggerFactory) =>
+        {
+            // Same optional site routing as the results endpoint: a slug-tagged relay lands in that
+            // site's database; an invalid/unprovisioned slug falls back to the default site.
+            var siteSlug = context.Request.Query["site"].ToString().Trim().ToLowerInvariant();
+            if (!string.IsNullOrEmpty(siteSlug) &&
+                (!NetworkOptimizer.Core.Helpers.StringUtilities.IsSlug(siteSlug) || !siteDbFactory.SiteDbExists(siteSlug)))
+            {
+                siteSlug = null;
+            }
+
+            using var reader = new StreamReader(context.Request.Body);
+            var json = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(json))
+                return Results.BadRequest(new { error = "Missing iperf3 JSON body" });
+
+            var clientSpeedTest = speedTestRegistry
+                .GetFor(siteSlug ?? SiteManagementService.DefaultSiteSlug)
+                .ClientSpeedTest;
+            await Iperf3ClientResultRecorder.RecordAsync(
+                clientSpeedTest, json, loggerFactory.CreateLogger("Iperf3ClientRelay"));
+
+            return Results.Ok(new { success = true });
+        }).RequireCors("SpeedTestCors").RequireRateLimiting("PublicSpeedTest");
 
         // Public endpoint for capturing topology snapshots during speed tests
         // Called by OpenSpeedTest ~3 seconds into a test to capture wireless rates mid-test
@@ -212,7 +247,7 @@ public static class SpeedTestEndpoints
             _ = snapshotService.CaptureSnapshotAsync(clientIp);
 
             return Results.Ok(new { success = true });
-        }).RequireCors("SpeedTestCors");
+        }).RequireCors("SpeedTestCors").RequireRateLimiting("PublicSpeedTest");
 
         // Authenticated endpoint for viewing client speed test results
         app.MapGet("/api/speedtest/client-results", async (ClientSpeedTestService service, string? ip = null, string? mac = null, int count = 50) =>

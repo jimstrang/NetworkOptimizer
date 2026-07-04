@@ -131,7 +131,10 @@ if (config.LanSpeedTest)
     {
         Console.Error.WriteLine($"Speed test server failed to start: {ex.Message}");
     }
-    iperf3Task = Iperf3Runner.RunAsync(cts.Token);
+    // Relay client-initiated iperf3 results (captured off iperf3 -s -J) to the central server,
+    // tagged with the site slug - the iperf3 analog of the OpenSpeedTest result relay above.
+    iperf3Task = Iperf3Runner.RunAsync(
+        speedTestServer is { } relayServer ? relayServer.PostIperf3ResultAsync : null, cts.Token);
 }
 
 // Prefer the persistent gRPC tunnel; REST heartbeats keep the agent visible as

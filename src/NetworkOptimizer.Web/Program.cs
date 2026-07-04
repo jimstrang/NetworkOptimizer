@@ -726,6 +726,23 @@ builder.Services.AddCors(options =>
     });
 });
 
+// Basic anti-flood limiter for the anonymous public speed-test result endpoints (OpenSpeedTest
+// and agent-relayed iperf3). Partitioned by remote address; a real speed test takes ~30s, so a
+// generous per-minute cap never affects legitimate use but stops a flood of forged posts.
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("PublicSpeedTest", httpContext =>
+        System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 60,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+            }));
+});
+
 var app = builder.Build();
 
 // Apply database migrations
@@ -1118,6 +1135,7 @@ app.UseStaticFiles(new StaticFileOptions
 });
 app.UseAntiforgery();
 app.UseCors(); // Required for OpenSpeedTest to POST results
+app.UseRateLimiter(); // Enforces the PublicSpeedTest policy on the anonymous result endpoints
 
 // Dynamic CORS for external speed test servers (configured via Settings UI, not env vars)
 // Adds Access-Control-Allow-Origin for the external server origin on public speed test endpoints
