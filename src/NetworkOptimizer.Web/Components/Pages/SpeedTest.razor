@@ -15,6 +15,7 @@
 @inject GatewaySpeedTestService GatewaySpeedTestService
 @inject SpeedTestServiceRegistry SpeedTestRegistry
 @inject SiteContextService SiteContext
+@inject SiteTunnelRouting TunnelRouting
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject SystemSettingsService SettingsService
@@ -70,6 +71,22 @@
     </div>
 </div>
 
+@if (_siteAgentOffline)
+{
+    <div class="alert alert-warning iperf3-missing-alert">
+        <div class="iperf3-missing-content">
+            <div class="iperf3-missing-icon">!</div>
+            <div class="iperf3-missing-text">
+                <strong>Site Agent Offline</strong>
+                <p>
+                    This site's LAN speed tests run through its on-site agent, which isn't
+                    connected right now. Tests resume automatically when the agent reconnects.
+                </p>
+            </div>
+        </div>
+    </div>
+}
+
 @if (localIperf3Status != null && !localIperf3Status.IsAvailable)
 {
     <div class="alert alert-danger iperf3-missing-alert">
@@ -106,7 +123,7 @@
     </div>
 }
 
-<div class="speedtest-container @(localIperf3Status != null && !localIperf3Status.IsAvailable ? "locked-out" : "")">
+<div class="speedtest-container @((localIperf3Status != null && !localIperf3Status.IsAvailable) || _siteAgentOffline ? "locked-out" : "")">
     <!-- Gateway Speed Test Section -->
     <div class="card" id="gateway-test">
         <div class="card-header">
@@ -1308,6 +1325,12 @@
     private LocalIperf3Status? localIperf3Status;
     private bool recheckingIperf3 = false;
 
+    // Agent-backed secondary site whose on-site agent isn't currently connected.
+    // LAN tests run through that agent (SSH to devices + throughput at the site),
+    // so they're locked out until it reconnects; the poll re-enables them.
+    private bool _siteAgentOffline;
+    private System.Threading.Timer? _agentStatusTimer;
+
     // Schedule banner
     private bool _lanScheduleBannerDismissed = true; // default hidden until loaded
 
@@ -1412,6 +1435,46 @@
         await LoadHistory();
         await LoadDiscoveredDevices();
         await LoadApMarkers();
+
+        await RefreshAgentAvailabilityAsync();
+        StartAgentStatusPolling();
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline. LAN tests run
+    /// through the agent for an agent-backed secondary site, so an offline agent
+    /// locks them out; <see cref="StartAgentStatusPolling"/> re-enables them when
+    /// it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        _siteAgentOffline = !SiteContext.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
+            && !TunnelRouting.IsAgentOnline(SiteContext.Slug);
+    }
+
+    /// <summary>
+    /// Polls the site's agent tunnel status so LAN tests re-enable on their own
+    /// once the agent reconnects. Only agent-backed secondary sites can go offline,
+    /// so the default site skips the timer entirely.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    var before = _siteAgentOffline;
+                    await RefreshAgentAvailabilityAsync();
+                    if (before != _siteAgentOffline)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
     }
 
     private async Task DismissLanScheduleBanner()
@@ -2262,6 +2325,8 @@
     public void Dispose()
     {
         progressTimer?.Dispose();
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
     }
 
     /// <summary>

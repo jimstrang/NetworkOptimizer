@@ -71,7 +71,8 @@ public class UwnSpeedTestService : WanSpeedTestServiceBase
     /// site, measuring the site's WAN rather than this server's).
     /// </summary>
     protected override async Task<bool> CanRunForSiteAsync() =>
-        IsDefaultSite || await _tunnelRouting.IsViaAgentAsync(SiteSlug);
+        IsDefaultSite ||
+        (await _tunnelRouting.IsViaAgentAsync(SiteSlug) && _tunnelRouting.IsAgentOnline(SiteSlug));
 
     /// <summary>
     /// Scope pinned to this instance's site so scoped services (SQM WAN lookup)

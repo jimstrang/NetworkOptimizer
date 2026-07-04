@@ -57,6 +57,21 @@ public class SiteTunnelRouting
     }
 
     /// <summary>
+    /// Whether an on-site agent tunnel is currently connected for this site.
+    /// Distinct from <see cref="IsViaAgentAsync"/>, which only says the site is
+    /// <em>configured</em> to route via its agent: an agent-backed site whose
+    /// agent has dropped is via-agent but not online, so agent-dependent actions
+    /// (WAN/LAN speed tests, SSH, modem/ONT) can't run until it reconnects.
+    /// </summary>
+    public bool IsAgentOnline(string slug)
+    {
+        if (string.IsNullOrEmpty(slug) || slug == SiteManagementService.DefaultSiteSlug)
+            return false;
+        var registry = _serviceProvider.GetService<AgentTunnelRegistry>();
+        return registry != null && registry.GetForSite(slug).Count > 0;
+    }
+
+    /// <summary>
     /// The endpoint a caller should dial to reach {host}:{port} inside the given
     /// site: the original pair when the site is reached directly, or a loopback
     /// tunnel-proxy endpoint when the site's devices are routed via its agent.
