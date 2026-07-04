@@ -118,7 +118,7 @@
             <label class="form-label">Probe Mode</label>
             <select class="form-control" @bind="_probeMode">
                 <option value="@ProbeMode.Icmp">ICMP</option>
-                <option value="@ProbeMode.Tcp">TCP (connect)</option>
+                <option value="@ProbeMode.Tcp">TCP</option>
                 <option value="@ProbeMode.Udp">UDP (traceroute only)</option>
             </select>
         </div>
@@ -163,7 +163,7 @@
         <div class="card-body">
             <div class="form-group">
                 <label class="form-label">From</label>
-                <div class="form-value">@_pingResult.Vantage.Id</div>
+                <div class="form-value">@VantageLabel(_pingResult.Vantage.Id)</div>
             </div>
             <div class="form-group">
                 <label class="form-label">Target</label>
@@ -201,7 +201,7 @@
         <div class="card-body">
             <div class="form-group">
                 <label class="form-label">From</label>
-                <div class="form-value">@_traceResult.Vantage.Id</div>
+                <div class="form-value">@VantageLabel(_traceResult.Vantage.Id)</div>
             </div>
             <div class="table-responsive">
             <table class="data-table">
@@ -492,6 +492,24 @@
             _runningKind = string.Empty;
             StateHasChanged();
         }
+    }
+
+    /// <summary>
+    /// Friendly label for a probe result's vantage id ("server" or "device:{mac}"):
+    /// the device's name/type when known, or the server/on-site-agent label.
+    /// </summary>
+    private string VantageLabel(string vantageId)
+    {
+        if (string.IsNullOrEmpty(vantageId)) return "Unknown";
+        if (vantageId.StartsWith("device:"))
+        {
+            var mac = vantageId.Substring("device:".Length);
+            var device = _devices.FirstOrDefault(d => d.Mac == mac);
+            return device != null ? LabelForDevice(device) : mac;
+        }
+        if (vantageId == "server")
+            return ExecutorFactory.ServerVantageIsAgent ? "On-site agent" : "Network Optimizer server";
+        return vantageId;
     }
 
     private static string LabelForDevice(DiscoveredDevice d)

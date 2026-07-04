@@ -4,6 +4,7 @@
 @inject UniFiConnectionService ConnectionService
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject SiteContextService SiteCtx
+@inject SiteTunnelRouting TunnelRouting
 @inject IGatewaySshService GatewaySshService
 @inject ILogger<WanSteering> Logger
 @inject PullToRefreshState PtrState
@@ -283,10 +284,17 @@
         <h2 class="card-title">Deploy</h2>
     </div>
     <div class="card-body">
+        @if (_siteAgentOffline)
+        {
+            <div class="alert alert-warning">
+                This site deploys through its on-site agent, which isn't connected right now.
+                Deploy actions resume automatically when the agent reconnects.
+            </div>
+        }
         <div class="ws-deploy-buttons">
             @if (_status?.IsRunning == true)
             {
-                <button class="btn btn-primary" @onclick="ReloadConfigAsync" disabled="@_isDeploying">
+                <button class="btn btn-primary" @onclick="ReloadConfigAsync" disabled="@(_isDeploying || _siteAgentOffline)">
                     @if (_isDeploying)
                     {
                         <span class="spinner spinner-sm"></span>
@@ -297,13 +305,13 @@
                         <span>Deploy Config</span>
                     }
                 </button>
-                <button class="btn btn-secondary" @onclick="DeployAsync" disabled="@_isDeploying">Redeploy</button>
-                <button class="btn btn-secondary" @onclick="StopAsync" disabled="@_isDeploying">Stop</button>
-                <button class="btn btn-danger btn-sm" @onclick="RemoveAsync" disabled="@_isDeploying" data-tooltip="Stop daemon and remove all files from gateway" data-tooltip-hover-only>Remove</button>
+                <button class="btn btn-secondary" @onclick="DeployAsync" disabled="@(_isDeploying || _siteAgentOffline)">Redeploy</button>
+                <button class="btn btn-secondary" @onclick="StopAsync" disabled="@(_isDeploying || _siteAgentOffline)">Stop</button>
+                <button class="btn btn-danger btn-sm" @onclick="RemoveAsync" disabled="@(_isDeploying || _siteAgentOffline)" data-tooltip="Stop daemon and remove all files from gateway" data-tooltip-hover-only>Remove</button>
             }
             else
             {
-                <button class="btn btn-primary" @onclick="DeployAsync" disabled="@_isDeploying">
+                <button class="btn btn-primary" @onclick="DeployAsync" disabled="@(_isDeploying || _siteAgentOffline)">
                     @if (_isDeploying)
                     {
                         <span class="spinner spinner-sm"></span>
@@ -316,7 +324,7 @@
                 </button>
                 @if (_status?.BinaryDeployed == true)
                 {
-                    <button class="btn btn-danger btn-sm" @onclick="RemoveAsync" disabled="@_isDeploying" data-tooltip="Stop daemon and remove all files from gateway" data-tooltip-hover-only>Remove</button>
+                    <button class="btn btn-danger btn-sm" @onclick="RemoveAsync" disabled="@(_isDeploying || _siteAgentOffline)" data-tooltip="Stop daemon and remove all files from gateway" data-tooltip-hover-only>Remove</button>
                 }
             }
         </div>
@@ -527,6 +535,12 @@
     private bool _isDiscovering = true;
     private bool _isInstallingUdmBoot;
     private bool _gatewayConfigured;
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected. WAN
+    // Steering deploys over gateway SSH, which routes through the agent, so deploy
+    // actions are blocked until it reconnects (the console can be reachable directly
+    // while the tunnel is down, so this is separate from ConnectionService state).
+    private bool _siteAgentOffline;
     private string? _deployMessage;
     private bool _deploySuccess;
     private List<string> _deploySteps = new();
@@ -566,6 +580,7 @@
         await LoadRulesAsync();
         await RefreshStatusAsync();
         await DiscoverWansAsync();
+        await RefreshAgentAvailabilityAsync();
 
         // Poll status every 10 seconds
         _pollTimer = new System.Threading.Timer(async _ =>
@@ -575,11 +590,25 @@
                 await InvokeAsync(async () =>
                 {
                     await RefreshStatusQuietAsync();
+                    await RefreshAgentAvailabilityAsync();
                     StateHasChanged();
                 });
             }
             catch { /* prevent timer death */ }
         }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline. WAN Steering deploys
+    /// through the agent tunnel on an agent-backed secondary site, so an offline agent
+    /// blocks the deploy actions; the poll re-enables them when it reconnects. The
+    /// default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        _siteAgentOffline = !SiteCtx.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteCtx.Slug)
+            && !TunnelRouting.IsAgentOnline(SiteCtx.Slug);
     }
 
     // --- Data Loading ---
