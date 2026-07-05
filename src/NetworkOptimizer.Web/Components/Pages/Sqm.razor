@@ -1695,11 +1695,20 @@
 
     private async void OnConnectionChanged()
     {
-        // Connection changed (reconnect after server restart, etc.) - refresh all data
-        await LoadSavedConfigsAsync();
-        await RefreshStatus(forceRefresh: true);
-        await LoadSqmMonitorDataAsync();
-        await InvokeAsync(StateHasChanged);
+        // Connection changed (reconnect after server restart, etc.) - refresh all data.
+        // Fires from a background thread, so marshal the whole reload onto the dispatcher
+        // and swallow exceptions so this async void handler can't crash the circuit.
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                await LoadSavedConfigsAsync();
+                await RefreshStatus(forceRefresh: true);
+                await LoadSqmMonitorDataAsync();
+                StateHasChanged();
+            });
+        }
+        catch { /* component may be disposed */ }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)

@@ -1883,18 +1883,25 @@ else
 
     private async void OnConnectionChanged()
     {
-        if (ConnectionService.IsConnected)
+        // Fires from a background thread (console reconnect); the reload is already
+        // marshalled onto the dispatcher, but wrap it so this async void handler can't
+        // crash the circuit if detection throws.
+        try
         {
-            await InvokeAsync(async () =>
+            if (ConnectionService.IsConnected)
             {
-                await RunDetection();
-                StateHasChanged();
-            });
+                await InvokeAsync(async () =>
+                {
+                    await RunDetection();
+                    StateHasChanged();
+                });
+            }
+            else
+            {
+                await InvokeAsync(StateHasChanged);
+            }
         }
-        else
-        {
-            await InvokeAsync(StateHasChanged);
-        }
+        catch { /* component may be disposed */ }
     }
 
     private async Task RunDetection()
