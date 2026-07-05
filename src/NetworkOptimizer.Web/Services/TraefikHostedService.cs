@@ -106,7 +106,9 @@ public class TraefikHostedService : IHostedService, IDisposable
             var config = template
                 .Replace("{{OPTIMIZER_HOSTNAME}}", GetConfigValue("TRAEFIK_OPTIMIZER_HOSTNAME", "optimizer.example.com"))
                 .Replace("{{SPEEDTEST_HOSTNAME}}", GetConfigValue("TRAEFIK_SPEEDTEST_HOSTNAME", "speedtest.example.com"))
-                .Replace("{{SPEEDTEST_PORT}}", GetConfigValue("OPENSPEEDTEST_PORT", "3005"));
+                .Replace("{{SPEEDTEST_PORT}}", GetConfigValue("OPENSPEEDTEST_PORT", "3005"))
+                // Same key the app reads to bind the agent tunnel listener (Program.cs).
+                .Replace("{{TUNNEL_PORT}}", GetConfigValue("AgentTunnel:Port", "8043"));
 
             await File.WriteAllTextAsync(Path.Combine(dynamicFolder, "config.yml"), config);
             _logger.LogInformation("Generated dynamic/config.yml");
