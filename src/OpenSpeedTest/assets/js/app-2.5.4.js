@@ -1439,20 +1439,50 @@ window.onload = function() {
         banner.className = "high-score-banner";
       }, 8000);
     };
-    // Multi-site: when this page was reached via a redirect from an on-site agent,
-    // document.referrer is the agent's origin. Post results back to that origin
-    // (same path/query as saveDataURL) so the agent can relay them to the central
-    // server with the site slug and the client's real LAN IP. Direct visits
-    // (no referrer, or same-origin referrer) keep the configured saveDataURL.
+    // Multi-site: when this page was reached via the on-site agent's /wan/
+    // interstitial (which appends pbref=1 to the page URL and redirects here),
+    // document.referrer is the agent's LAN origin. Post results back to that
+    // origin (same path/query as saveDataURL) so the agent can relay them to
+    // the central server with the site slug and the client's real LAN IP.
+    // Gated on all of: the pbref marker in the page URL, a cross-origin
+    // non-openspeedtest.com referrer, and the referrer host being a
+    // private/LAN address - so an ordinary cross-origin link (e.g. the central
+    // app opening the LAN test page, or a third-party page linking a victim to
+    // a public test server) can never redirect the results POST. Anything
+    // failing these checks keeps the configured saveDataURL.
+    var isPrivateHostname = function(host) {
+      var h = host.toLowerCase();
+      if (h.charAt(0) === "[" && h.charAt(h.length - 1) === "]") {
+        h = h.slice(1, -1);
+      }
+      if (h === "localhost" || h === "::1") {
+        return true;
+      }
+      if (h.indexOf(":") !== -1) {
+        // IPv6: ULA fc00::/7 or link-local fe80::/10
+        return /^f[cd]/.test(h) || /^fe[89ab]/.test(h);
+      }
+      var m = h.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+      if (m) {
+        var a = parseInt(m[1], 10);
+        var b = parseInt(m[2], 10);
+        return a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+      }
+      if (h.indexOf(".") === -1) {
+        // Unqualified single-label hostname
+        return true;
+      }
+      return h.slice(-6) === ".local";
+    };
     var getSaveDataTarget = function() {
       var url = saveDataURL;
       try {
         var ref = document.referrer;
-        if (ref) {
+        if (ref && /[?&]pbref(?:[=&]|$)/.test(location.search)) {
           var refUrl = new URL(ref);
           var ostHost = myname.toLowerCase() + com;
           var isOst = refUrl.hostname === ostHost || refUrl.hostname.slice(-(ostHost.length + 1)) === "." + ostHost;
-          if (!isOst && refUrl.origin !== location.origin) {
+          if (!isOst && refUrl.origin !== location.origin && isPrivateHostname(refUrl.hostname)) {
             var resolved = new URL(saveDataURL, location.href);
             url = refUrl.origin + resolved.pathname + resolved.search;
           }

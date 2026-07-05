@@ -769,7 +769,7 @@ public class MonitoringCollectionAgent : BackgroundService
                             mapping.PortNumber = portNumber;
                         }
                         else if (mapping.PortNumber is int stale
-                            && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, mapping.IfName, stale))
+                            && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, mapping.IfName, stale, iface.PortId))
                         {
                             // Heal rows written before the numeric ifIndex match was gated
                             // to entries without an ifname: the stored number (and the

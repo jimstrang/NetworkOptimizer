@@ -118,7 +118,13 @@ public sealed class SpeedTestServer : IAsyncDisposable
                     "text/plain", statusCode: StatusCodes.Status404NotFound);
         }
 
-        var targetUrl = target.Url.TrimEnd('/') + "/" + context.Request.QueryString.Value;
+        // pbref=1 marks "this visit came through the agent's /wan/ hop": the test
+        // page posts results back to the referrer origin ONLY when it sees this
+        // marker (plus a private-address referrer), so an ordinary cross-origin
+        // link to a speed test page can never divert results to its referrer.
+        var query = context.Request.QueryString.Value ?? "";
+        query = query.Length > 0 ? query + "&pbref=1" : "?pbref=1";
+        var targetUrl = target.Url.TrimEnd('/') + "/" + query;
         // JSON-encode for a safe JS string literal; HTML-encode for the noscript href.
         var jsTarget = System.Text.Json.JsonSerializer.Serialize(targetUrl);
         var htmlTarget = System.Net.WebUtility.HtmlEncode(targetUrl);

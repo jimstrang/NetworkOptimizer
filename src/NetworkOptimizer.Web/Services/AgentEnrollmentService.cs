@@ -23,13 +23,16 @@ public class AgentEnrollmentService
     private const string KeyPrefix = "noak_";
 
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _mainDbFactory;
+    private readonly AgentTunnelRegistry _tunnelRegistry;
     private readonly ILogger<AgentEnrollmentService> _logger;
 
     public AgentEnrollmentService(
         IDbContextFactory<NetworkOptimizerDbContext> mainDbFactory,
+        AgentTunnelRegistry tunnelRegistry,
         ILogger<AgentEnrollmentService> logger)
     {
         _mainDbFactory = mainDbFactory;
+        _tunnelRegistry = tunnelRegistry;
         _logger = logger;
     }
 
@@ -204,12 +207,17 @@ public class AgentEnrollmentService
         if (site == null)
             return null;
 
-        var agent = await db.SiteAgents.AsNoTracking()
+        // Filter to live agents FIRST (open tunnel is authoritative and instant,
+        // heartbeat freshness covers REST-only agents and reconnect gaps - the
+        // same IsAgentLive definition every status surface uses), then take the
+        // most recently seen, so a site with one stale and one live agent still
+        // resolves and the resolved target always matches what the UI shows.
+        var agents = await db.SiteAgents.AsNoTracking()
             .Where(a => a.SiteId == site.Id && a.Enabled && a.EnrolledAt != null && a.LanIp != null)
             .OrderByDescending(a => a.LastSeenAt)
-            .FirstOrDefaultAsync();
+            .ToListAsync();
 
-        return agent != null && IsOnline(agent.LastSeenAt) ? agent.LanIp : null;
+        return agents.FirstOrDefault(a => _tunnelRegistry.IsAgentLive(a))?.LanIp;
     }
 
     /// <summary>Enables or disables an agent. Disabled agents cannot enroll or heartbeat.</summary>

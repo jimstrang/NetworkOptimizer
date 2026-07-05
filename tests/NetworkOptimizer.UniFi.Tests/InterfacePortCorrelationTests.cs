@@ -119,5 +119,22 @@ public class InterfacePortCorrelationTests
             null, "dummy0", 2).Should().BeFalse();
     }
 
+    [Fact]
+    public void StaleClaim_AliasKeyedRow_OwnRawIfName_IsNotDetected()
+    {
+        // A row keyed by an SNMP alias whose claim came from the raw-ifname join:
+        // passing the raw name marks the owning entry as "self", so the heal never
+        // clears a legitimate alias-keyed row.
+        InterfacePortCorrelation.PortNumberBelongsToOtherInterface(
+            GatewayPortTable(), "Fiber Uplink", 2, rawIfName: "eth1").Should().BeFalse();
+    }
+
+    [Fact]
+    public void StaleClaim_AliasKeyedRow_DifferentRawIfName_IsDetected()
+    {
+        InterfacePortCorrelation.PortNumberBelongsToOtherInterface(
+            GatewayPortTable(), "Some Alias", 2, rawIfName: "dummy0").Should().BeTrue();
+    }
+
     #endregion
 }

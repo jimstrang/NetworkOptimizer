@@ -646,7 +646,10 @@ from(bucket: ""{_bucket}"")
         var rows = new List<(string DeviceMac, int Port, DateTime Time, string ClientMac, string? Ip, string? Name)>();
         await foreach (var record in QueryFluxAsync(flux, ct))
         {
-            var deviceMac = record.GetValueByKey("device_mac") as string ?? "";
+            // Normalize on read so grouping (and the caller's dictionary key) can
+            // never split one device across case variants, matching the sibling
+            // QueryPortStatsAsync's case-insensitive grouping.
+            var deviceMac = NormalizeMac(record.GetValueByKey("device_mac") as string ?? "");
             var clientMac = record.GetValueByKey("client_mac") as string ?? "";
             if (deviceMac.Length == 0 || clientMac.Length == 0) continue;
             if (!int.TryParse(record.GetValueByKey("port") as string, out var port) || port <= 0) continue;

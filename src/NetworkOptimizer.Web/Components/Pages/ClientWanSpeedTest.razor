@@ -76,22 +76,35 @@
                             Run a speed test against your own external server. This measures your internet speed (WAN) -
                             traffic goes from your device, out through your WAN, across the internet to the remote server, and back.
                         </p>
-                        <div class="test-option-actions">
-                            <a href="@ExternalRunUrl" target="_blank" rel="opener" class="btn btn-primary">
-                                Run WAN Speed Test
-                            </a>
-                            <span class="form-help">Opens in a new tab and auto-starts</span>
-                        </div>
-                        <div class="url-copy-row">
-                            <input type="text" class="url-display" value="@ExternalShareUrl" readonly />
-                            <button type="button" class="btn-icon" title="Copy URL" onclick="copyFromInput(this)">
-                                <span class="copy-icon">📋</span>
-                                <span class="copy-check" style="display:none;">✓</span>
-                            </button>
-                        </div>
-                        <p class="form-help browser-tip">
-                            <strong>Tip:</strong> Share this URL with any device on your network to test WAN speed from that device.
-                        </p>
+                        @if (AgentRequiredButOffline)
+                        {
+                            <div class="alert alert-warning">
+                                <strong>This site's agent is offline.</strong> WAN speed test results for this site
+                                are attributed through the on-site agent, which isn't connected right now. Wait for
+                                the agent to come back online (or check it under Settings &gt; Multi-Site), then
+                                reload this page. Running the test without the agent would record the result
+                                against the wrong site.
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="test-option-actions">
+                                <a href="@ExternalRunUrl" target="_blank" rel="opener" class="btn btn-primary">
+                                    Run WAN Speed Test
+                                </a>
+                                <span class="form-help">Opens in a new tab and auto-starts</span>
+                            </div>
+                            <div class="url-copy-row">
+                                <input type="text" class="url-display" value="@ExternalShareUrl" readonly />
+                                <button type="button" class="btn-icon" title="Copy URL" onclick="copyFromInput(this)">
+                                    <span class="copy-icon">📋</span>
+                                    <span class="copy-check" style="display:none;">✓</span>
+                                </button>
+                            </div>
+                            <p class="form-help browser-tip">
+                                <strong>Tip:</strong> Share this URL with any device on your network to test WAN speed from that device.
+                            </p>
+                        }
                         @if (_selectedServer?.Scheme != "https")
                         {
                             <div class="alert alert-warning" style="margin-top: 1rem;">
@@ -641,11 +654,17 @@
     private List<ExternalSpeedTestServer> _servers = new();
 
     // On an agent-backed site the test starts at the on-site agent's /wan/ router,
-    // which 302-redirects to the external server: the agent becomes the page's
-    // referrer, so results post back through it with the real client LAN IP and
-    // the site slug stamped on the trusted agent->server hop - no ?site= in any
-    // user-facing URL. Direct/default sites link the external server directly.
+    // whose interstitial forwards to the external server: the agent becomes the
+    // page's referrer, so results post back through it with the real client LAN IP
+    // and the site slug stamped on the trusted agent->server hop - no ?site= in
+    // any user-facing URL. Direct/default sites link the external server directly.
     private SiteSpeedTestTargetResolver.Result? _siteTarget;
+
+    // Site attribution for WAN results comes ONLY from the agent relay, so a
+    // non-default site with no live agent target must not offer a test link at
+    // all - the bare external URL would silently record against the default site.
+    private bool AgentRequiredButOffline =>
+        !SiteContext.IsDefault && _siteTarget is { UsesAgent: false };
 
     private string ExternalBaseUrl
     {

@@ -640,7 +640,7 @@ public class AgentProbeResultSink
                                     mapping.PortNumber = corr.PortNumber;
                                 }
                                 else if (mapping.PortNumber is int stale
-                                    && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, sample.IfName, stale))
+                                    && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, sample.IfName, stale, sample.PortId))
                                 {
                                     // Heal rows written before the numeric ifIndex match was
                                     // gated to entries without an ifname: the stored number

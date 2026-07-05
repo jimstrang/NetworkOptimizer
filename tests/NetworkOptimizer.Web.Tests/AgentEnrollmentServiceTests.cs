@@ -26,7 +26,7 @@ public class AgentEnrollmentServiceTests
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .Options;
         _factory = new TestDbFactory(options);
-        _service = new AgentEnrollmentService(_factory, new Mock<ILogger<AgentEnrollmentService>>().Object);
+        _service = new AgentEnrollmentService(_factory, new AgentTunnelRegistry(), new Mock<ILogger<AgentEnrollmentService>>().Object);
     }
 
     private async Task<int> SeedSiteAsync(string slug = "lake-house")

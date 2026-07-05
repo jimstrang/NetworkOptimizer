@@ -57,6 +57,13 @@ public static class VersionUtilities
         var dash = v.IndexOf('-');
         var core = dash >= 0 ? v[..dash] : v;
         var pre = dash >= 0 ? v[(dash + 1)..].Split('.', StringSplitOptions.RemoveEmptyEntries) : Array.Empty<string>();
-        return (Version.TryParse(core, out var parsed) ? parsed : null, pre);
+        if (!Version.TryParse(core, out var parsed))
+            return (null, pre);
+        // Normalize a 2-part core: Version treats a missing component as -1,
+        // which would rank "2.0" below "2.0.0" even though they name the same
+        // version.
+        if (parsed.Build < 0)
+            parsed = new Version(parsed.Major, parsed.Minor, 0);
+        return (parsed, pre);
     }
 }

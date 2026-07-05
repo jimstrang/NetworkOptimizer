@@ -113,15 +113,20 @@ public static class InterfacePortCorrelation
     /// written before the numeric ifIndex match was gated to entries without an
     /// ifname (a gateway's dummy0 at ifIndex 2 used to claim eth1's port_idx-2
     /// entry). Never true for switch-style entries (no ifname), so a correct
-    /// switch correlation is never cleared.
+    /// switch correlation is never cleared. Rows are keyed by the monitored name
+    /// (which can be an SNMP alias); callers that also know the raw SNMP ifname
+    /// pass it so an alias-keyed row still counts its own port_table entry as
+    /// itself rather than "another interface".
     /// </summary>
     public static bool PortNumberBelongsToOtherInterface(
-        IReadOnlyList<SwitchPort>? portTable, string? ifName, int portNumber)
+        IReadOnlyList<SwitchPort>? portTable, string? ifName, int portNumber, string? rawIfName = null)
     {
         if (portTable == null || string.IsNullOrEmpty(ifName)) return false;
         var owner = portTable.FirstOrDefault(p => p.PortIdx == portNumber);
         return owner != null
             && !string.IsNullOrEmpty(owner.IfName)
-            && !string.Equals(owner.IfName, ifName, StringComparison.OrdinalIgnoreCase);
+            && !string.Equals(owner.IfName, ifName, StringComparison.OrdinalIgnoreCase)
+            && (string.IsNullOrEmpty(rawIfName)
+                || !string.Equals(owner.IfName, rawIfName, StringComparison.OrdinalIgnoreCase));
     }
 }

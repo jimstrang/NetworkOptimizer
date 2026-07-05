@@ -194,6 +194,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         if (!_isConnected && _client == null) return;
         if (!await IsConsoleViaAgentAsync()) return;
 
+        // Re-check after the await: a fast agent bounce can reconnect (and the
+        // connected hook re-establish the console) while the DB read above was in
+        // flight - disposing the fresh client here would fabricate an up-to-60s
+        // "awaiting agent" outage on a healthy tunnel.
+        if (IsAgentOnline()) return;
+
         _logger.LogInformation(
             "Agent tunnel for site {Slug} dropped; marking its console as awaiting the agent", SiteSlug);
         _client?.Dispose();

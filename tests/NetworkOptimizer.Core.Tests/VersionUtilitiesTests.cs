@@ -23,6 +23,13 @@ public class VersionUtilitiesTests
     [InlineData("2.0.0", "2.0.1", true)]
     // Leading v prefix tolerated
     [InlineData("v2.0.0-beta.1", "2.0.0-beta.2", true)]
+    // Prerelease-length asymmetry with a matching prefix: shorter is older
+    [InlineData("2.0.0-beta.2", "2.0.0-beta.2.0", true)]
+    [InlineData("2.0.0-beta.2.0", "2.0.0-beta.2", false)]
+    // Two-part cores normalize to X.Y.0 rather than ranking below X.Y.0
+    [InlineData("2.0-beta.2", "2.0.0-beta.2", false)]
+    [InlineData("2.0", "2.0.0", false)]
+    [InlineData("2.0", "2.0.1", true)]
     public void IsOlderThan_ComparesSemVerPrecedence(string candidate, string required, bool expected)
     {
         VersionUtilities.IsOlderThan(candidate, required).Should().Be(expected);

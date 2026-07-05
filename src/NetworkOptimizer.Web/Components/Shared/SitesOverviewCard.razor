@@ -1,5 +1,6 @@
 @using NetworkOptimizer.Storage.Models
 @using NetworkOptimizer.Web.Services
+@implements IDisposable
 @inject SiteManagementService SiteManagement
 @inject AgentEnrollmentService AgentEnrollment
 @inject AgentTunnelRegistry TunnelRegistry
@@ -65,12 +66,34 @@
             NavigationManager.NavigateTo("/sites");
     }
 
+    private System.Threading.Timer? _pollTimer;
+
     protected override async Task OnInitializedAsync()
     {
         if (await SiteManagement.IsMultiSiteEnabledAsync())
         {
             _sites = await SiteManagement.GetSitesAsync();
             _agents = await AgentEnrollment.GetAllAgentsAsync();
+
+            // Same 10s refresh as the Sites and Settings pages, so the Agents
+            // Online tile can't drift from the other status surfaces.
+            _pollTimer = new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        _agents = await AgentEnrollment.GetAllAgentsAsync();
+                        StateHasChanged();
+                    });
+                }
+                catch { /* prevent timer death */ }
+            }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         }
+    }
+
+    public void Dispose()
+    {
+        _pollTimer?.Dispose();
     }
 }
