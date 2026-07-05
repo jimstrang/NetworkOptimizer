@@ -19,6 +19,10 @@ services:
       - ./data:/data
     environment:
       - TZ=${TZ:-UTC}
+      # Uncomment to serve the LAN speed test as plain http instead of the
+      # default self-signed TLS (then set the site's speed test URL override
+      # to the matching http:// address - see the agent README).
+      #- AGENT_SPEEDTEST_TLS=0
     logging:
       driver: "json-file"
       options:

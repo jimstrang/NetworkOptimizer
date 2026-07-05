@@ -660,6 +660,10 @@ public class AgentProbeResultSink
                         // number that provably belongs to another interface is a relic
                         // of the ungated numeric ifIndex match and would otherwise
                         // stick forever once its interface leaves the sample set.
+                        // No rawIfName here BY DESIGN: these rows have no current
+                        // sample to supply one, so an alias-keyed row whose interface
+                        // has left the stream can be cleared - accepted, since a
+                        // departed interface's port claim is stale anyway.
                         var streamedNames = new HashSet<string>(ifNames, StringComparer.OrdinalIgnoreCase);
                         foreach (var ((rowMac, rowIfName), row) in existingMaps)
                         {

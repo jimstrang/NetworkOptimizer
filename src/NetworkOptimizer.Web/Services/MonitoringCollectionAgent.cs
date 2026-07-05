@@ -791,7 +791,10 @@ public class MonitoringCollectionAgent : BackgroundService
                 // gone from the walk the update branch above never revisits the row -
                 // the false claim (and the name/SFP flag copied with it) would stick
                 // forever. Rows whose claim the port table doesn't contradict are
-                // never touched.
+                // never touched. No rawIfName here BY DESIGN: unwalked rows have no
+                // current sample to supply one, so an alias-keyed row whose interface
+                // has left the walk can be cleared - accepted, since a departed
+                // interface's port claim is stale anyway.
                 var walkedNames = new HashSet<string>(deviceIfNames, StringComparer.OrdinalIgnoreCase);
                 var deviceMacNorm = NormalizeMac(device.Mac);
                 foreach (var ((rowMac, rowIfName), row) in existingMaps)

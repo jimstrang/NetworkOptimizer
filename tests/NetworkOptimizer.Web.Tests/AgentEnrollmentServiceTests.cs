@@ -18,6 +18,7 @@ public class AgentEnrollmentServiceTests
     }
 
     private readonly TestDbFactory _factory;
+    private readonly AgentTunnelRegistry _tunnelRegistry = new();
     private readonly AgentEnrollmentService _service;
 
     public AgentEnrollmentServiceTests()
@@ -26,7 +27,7 @@ public class AgentEnrollmentServiceTests
             .UseInMemoryDatabase(databaseName: Guid.NewGuid().ToString())
             .Options;
         _factory = new TestDbFactory(options);
-        _service = new AgentEnrollmentService(_factory, new AgentTunnelRegistry(), new Mock<ILogger<AgentEnrollmentService>>().Object);
+        _service = new AgentEnrollmentService(_factory, _tunnelRegistry, new Mock<ILogger<AgentEnrollmentService>>().Object);
     }
 
     private async Task<int> SeedSiteAsync(string slug = "lake-house")
@@ -199,6 +200,35 @@ public class AgentEnrollmentServiceTests
         }
 
         (await _service.GetOnlineAgentLanIpAsync("branch-office")).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task GetOnlineAgentLanIp_FallsBackToTunnelLiveAgent_WhenMostRecentIsStale()
+    {
+        var siteId = await SeedSiteAsync("branch-office");
+
+        // Older-but-tunnel-connected agent: heartbeat far outside the online
+        // window, but its tunnel is registered - IsAgentLive must count it.
+        var (liveAgent, liveToken) = await _service.CreateAgentAsync(siteId, "Tunnel");
+        await _service.EnrollAsync(liveToken, "1.0.0", "192.0.2.60");
+
+        // Heartbeat-stale AND most recently seen agent: must be skipped in
+        // favor of the live one, not returned (old behavior) or null.
+        var (staleAgent, staleToken) = await _service.CreateAgentAsync(siteId, "Stale");
+        await _service.EnrollAsync(staleToken, "1.0.0", "192.0.2.70");
+
+        await using (var db = _factory.CreateDbContext())
+        {
+            var live = await db.SiteAgents.FindAsync(liveAgent.Id);
+            live!.LastSeenAt = DateTime.UtcNow - AgentEnrollmentService.OnlineWindow - TimeSpan.FromHours(2);
+            var stale = await db.SiteAgents.FindAsync(staleAgent.Id);
+            stale!.LastSeenAt = DateTime.UtcNow - AgentEnrollmentService.OnlineWindow - TimeSpan.FromMinutes(1);
+            await db.SaveChangesAsync();
+        }
+
+        _tunnelRegistry.Register(liveAgent.Id, "branch-office", "Tunnel");
+
+        (await _service.GetOnlineAgentLanIpAsync("branch-office")).Should().Be("192.0.2.60");
     }
 
     [Fact]
