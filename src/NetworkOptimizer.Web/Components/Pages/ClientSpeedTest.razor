@@ -883,9 +883,11 @@
 
         if (siteUsesAgent)
         {
-            // The agent serves OpenSpeedTest (HTTP) on port 3000 and iperf3 on 5201 on
-            // the site network. An override may be a full URL (used as-is) or a bare
-            // host/IP (default port). iperf3 always targets the host part.
+            // The agent serves OpenSpeedTest over self-signed HTTPS on port 3000 (a secure
+            // context so the browser Geolocation API works for GPS-tagged results) and iperf3
+            // on 5201 on the site network. An override may be a full URL (used as-is, so an
+            // operator can force http:// or a different host/port via the per-site speed test
+            // URL setting) or a bare host/IP (default to https on the agent port).
             if (effectiveTarget!.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
                 || effectiveTarget.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             {
@@ -894,7 +896,7 @@
             }
             else
             {
-                openSpeedTestUrl = $"http://{effectiveTarget}:{AgentOpenSpeedTestPort}";
+                openSpeedTestUrl = $"https://{effectiveTarget}:{AgentOpenSpeedTestPort}";
                 serverHost = effectiveTarget;
             }
             iperf3ServerEnabled = true;
