@@ -21,9 +21,9 @@
 # ##  ⚠️  TEMPORARY HACK — main ONLY. DO NOT SHIP TO STABLE 2.0 GA.  ⚠️      ##
 # ############################################################################
 # This script + docker/agent/docker-compose.yml live on `main` purely so the
-# 2.0.0-beta.1 agent-install one-liner (baked into the beta app image, fetched
+# 2.0.0-beta.2 agent-install one-liner (baked into the beta app image, fetched
 # from `main`) works BEFORE 2.0 GA without rebuilding the app. The compose it
-# pulls HARDCODES the preview image tag (agent:2.0.0-beta.1).
+# pulls HARDCODES the preview image tag (agent:2.0.0-beta.2).
 #
 #   >>> FIX BEFORE MERGING release/2.0-multi-site -> main <<<
 #   Restore :latest / real version handling in docker-compose.yml, and detect
