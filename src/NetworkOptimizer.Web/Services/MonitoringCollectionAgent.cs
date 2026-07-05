@@ -893,9 +893,11 @@ public class MonitoringCollectionAgent : BackgroundService
         // SwMac keys against the SNMP-relay port-stats device MACs (cause B).
         var mappable = clients.Count(c => c.IsWired && !string.IsNullOrEmpty(c.Mac)
             && !string.IsNullOrEmpty(c.SwMac) && c.SwPort is int dsp && dsp > 0);
-        _logger.LogDebug("PORTCLIENT-DIAG site={Site}: wired={Wired} mappable(SwMac+SwPort)={Map} recorded={Rec} sampleKeys=[{Keys}]",
+        var statMacs = string.Join(", ", _liveStats.GetPortStatsSnapshot(null)
+            .Select(s => s.DeviceMac).Distinct().Take(6));
+        _logger.LogDebug("PORTCLIENT-DIAG site={Site}: wired={Wired} mappable(SwMac+SwPort)={Map} recorded={Rec} clientKeys=[{Keys}] statDeviceMacs=[{StatMacs}]",
             _siteSlug, wiredCount, mappable, portClients.Count,
-            string.Join(", ", portClients.Keys.Take(4).Select(k => $"{k.DeviceMac}:{k.Port}")));
+            string.Join(", ", portClients.Keys.Take(4).Select(k => $"{k.DeviceMac}:{k.Port}")), statMacs);
 
         long tickOffset = 0; // nanosecond offset per client to avoid InfluxDB dedup
         foreach (var c in clients)
