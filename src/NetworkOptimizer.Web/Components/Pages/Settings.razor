@@ -2960,6 +2960,12 @@
                                                                         else if (AgentEnrollmentService.IsOnline(agent.LastSeenAt))
                                                                         {
                                                                             <text>Online@(TunnelRegistry.IsConnected(agent.Id) ? " (tunnel)" : "")@(agent.LastVersion != null ? $" - v{agent.LastVersion}" : "")</text>
+                                                                            @if (AgentVersionOutdated(agent))
+                                                                            {
+                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.LatestAgentVersion)) is available. Update the agent by re-running its install one-liner. During the 2.0 beta, please update agents whenever a release calls for it.">
+                                                                                    Update agent
+                                                                                </span>
+                                                                            }
                                                                         }
                                                                         else
                                                                         {
@@ -3451,6 +3457,14 @@
 
     private string? ClientSpeedTestTarget(int siteId) =>
         _clientSpeedTestTarget.TryGetValue(siteId, out var v) ? v : null;
+
+    // An online agent reporting an older version than the manually-tracked
+    // latest agent release gets an "Update agent" callout. Tracked manually
+    // (AppVersionInfo.LatestAgentVersion) rather than compared to the server
+    // build: server releases without agent changes leave agents intentionally
+    // lagging, and that must not nag.
+    private static bool AgentVersionOutdated(SiteAgent agent) =>
+        NetworkOptimizer.Core.Helpers.VersionUtilities.IsOlderThan(agent.LastVersion, AppVersionInfo.LatestAgentVersion);
 
     // Placeholder shows what a blank override resolves to - the online agent's
     // detected LAN IP on the agent's https port (same pick as

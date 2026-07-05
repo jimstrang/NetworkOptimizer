@@ -13,6 +13,16 @@ namespace NetworkOptimizer.Web.Services;
 /// </summary>
 public static class AppVersionInfo
 {
+    /// <summary>
+    /// The latest published on-site agent version, bumped MANUALLY as part of
+    /// the release procedure whenever a release actually changes the agent
+    /// (proto, runners, /wan/ router, ...). Server releases without agent
+    /// changes leave it alone, so agents that intentionally lag those releases
+    /// are not flagged. The Multi-Site agent list shows an "Update agent"
+    /// callout for enrolled agents reporting an older version than this.
+    /// </summary>
+    public const string LatestAgentVersion = "2.0.0-beta.2";
+
     /// <summary>Full informational version (e.g. "1.4.2" or "0.0.0-alpha.0.12").</summary>
     public static string Informational { get; }
 
