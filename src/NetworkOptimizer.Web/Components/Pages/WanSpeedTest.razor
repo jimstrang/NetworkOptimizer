@@ -607,6 +607,10 @@
     private const string AgentOfflineReason =
         "This site connects through its on-site agent, which isn't online. WAN speed tests resume when it reconnects.";
 
+    private const string NoAgentReason =
+        "WAN speed tests on a managed site run from its on-site agent, and this site has none online. " +
+        "Set up the site's agent under Settings > Multi-Site to enable them.";
+
     // Progress interpolation for smooth bar during long phases
     private DateTime _interpStart;
     private string _interpPhase = "";
@@ -807,17 +811,27 @@
     /// </summary>
     private async Task RefreshAgentAvailabilityAsync()
     {
+        // A managed (non-default) site's WAN tests run FROM its on-site agent -
+        // running them from this central server would measure the central
+        // network's WAN and file the result under the managed site. So both
+        // options require a live agent on non-default sites, full stop: a site
+        // that is via-agent configured but momentarily disconnected gets the
+        // "resumes when it reconnects" message, a site with no agent set up at
+        // all gets pointed at agent setup instead of a runnable-but-wrong test.
+        var agentOnline = TunnelRouting.IsAgentOnline(SiteContext.Slug);
         _siteAgentOffline = !SiteContext.IsDefault
             && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
-            && !TunnelRouting.IsAgentOnline(SiteContext.Slug);
+            && !agentOnline;
+        var agentRequired = !SiteContext.IsDefault && !agentOnline;
+        var agentReason = _siteAgentOffline ? AgentOfflineReason : NoAgentReason;
 
-        _serverAvailable = !_siteAgentOffline;
-        _serverUnavailableReason = _siteAgentOffline ? AgentOfflineReason : null;
+        _serverAvailable = !agentRequired;
+        _serverUnavailableReason = agentRequired ? agentReason : null;
 
-        if (_siteAgentOffline)
+        if (agentRequired)
         {
             _gatewayAvailable = false;
-            _gatewayUnavailableReason = AgentOfflineReason;
+            _gatewayUnavailableReason = agentReason;
         }
         else
         {
@@ -840,9 +854,12 @@
             {
                 await InvokeAsync(async () =>
                 {
-                    var before = _siteAgentOffline;
+                    // Compare on the rendered availability, not just the offline flag:
+                    // a site with no via-agent flag that gains its first agent flips
+                    // _serverAvailable without ever changing _siteAgentOffline.
+                    var before = (_siteAgentOffline, _serverAvailable, _gatewayAvailable);
                     await RefreshAgentAvailabilityAsync();
-                    var changed = before != _siteAgentOffline;
+                    var changed = before != (_siteAgentOffline, _serverAvailable, _gatewayAvailable);
 
                     // The console comes back a moment after the agent tunnel does; once it's
                     // connected, load the WAN data the Gateway (Direct) test needs so the
