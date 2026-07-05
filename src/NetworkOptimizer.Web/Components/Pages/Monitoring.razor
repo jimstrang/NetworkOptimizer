@@ -1439,9 +1439,13 @@ else
 
     private string ResolveDefaultTab()
     {
+        // Every tab except Setup is gated on _monitoringReady and renders blank when
+        // monitoring isn't configured/enabled. Resolve the guard BEFORE honoring an
+        // explicit ?tab= so a deep-link (e.g. a Device Status dashboard click ->
+        // ?tab=devices) into an unconfigured site lands on Setup, not a blank tab.
+        if (!_monitoringReady) return "setup";
         if (TabParam != null && ValidTabs.Contains(TabParam))
             return TabParam.ToLowerInvariant();
-        if (!_monitoringReady) return "setup";
         if (_influxReachable == false || _snmpState == SnmpDetectionState.PollFailing)
             return "setup";
         return "live";
@@ -1478,8 +1482,9 @@ else
     {
         if (TabParam != _lastTabParam && _lastTabParam != null)
         {
-            var newTab = TabParam != null && ValidTabs.Contains(TabParam)
-                ? TabParam.ToLowerInvariant() : ResolveDefaultTab();
+            // Route through ResolveDefaultTab so the _monitoringReady guard applies to
+            // tab changes too (a ?tab= nav into an unconfigured site falls back to Setup).
+            var newTab = ResolveDefaultTab();
             if (newTab != _activeTab)
             {
                 _activeTab = newTab;
