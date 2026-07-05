@@ -8,9 +8,14 @@ FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION} AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY . .
+# Grpc.Tools' bundled linux_arm64 protoc segfaults (exit 139) under dotnet on native
+# arm64 runners (grpc/grpc#26032, #38538); use the distro's protoc there. amd64 unchanged.
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*; \
+    fi
 RUN case "$TARGETARCH" in \
         amd64) RID=linux-x64 ;; \
-        arm64) RID=linux-arm64 ;; \
+        arm64) RID=linux-arm64; export PROTOBUF_PROTOC=/usr/bin/protoc ;; \
         *) echo "Unsupported TARGETARCH: $TARGETARCH" && exit 1 ;; \
     esac && \
     dotnet publish src/NetworkOptimizer.Agent/NetworkOptimizer.Agent.csproj \
