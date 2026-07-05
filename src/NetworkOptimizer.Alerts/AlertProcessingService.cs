@@ -27,6 +27,7 @@ public class AlertProcessingService : BackgroundService
     private readonly AlertCorrelationService _correlationService;
     private readonly IEnumerable<IAlertDeliveryChannel> _deliveryChannels;
     private readonly AlertCooldownTracker _cooldownTracker;
+    private readonly IAlertSiteNameResolver _siteNameResolver;
     private readonly string? _appBaseUrl;
 
     // In-memory rule cache (refreshed periodically)
@@ -45,6 +46,7 @@ public class AlertProcessingService : BackgroundService
         AlertCorrelationService correlationService,
         IEnumerable<IAlertDeliveryChannel> deliveryChannels,
         AlertCooldownTracker cooldownTracker,
+        IAlertSiteNameResolver siteNameResolver,
         IConfiguration configuration)
     {
         _logger = logger;
@@ -54,6 +56,7 @@ public class AlertProcessingService : BackgroundService
         _correlationService = correlationService;
         _deliveryChannels = deliveryChannels;
         _cooldownTracker = cooldownTracker;
+        _siteNameResolver = siteNameResolver;
 
         // Build base URL using same priority as canonical host redirect in Program.cs:
         // REVERSE_PROXIED_HOST_NAME (https) > HOST_NAME (http:8042) > HOST_IP (http:8042)
@@ -160,7 +163,7 @@ public class AlertProcessingService : BackgroundService
             DeviceId = alertEvent.DeviceId,
             DeviceName = alertEvent.DeviceName,
             DeviceIp = alertEvent.DeviceIp,
-            SourceUrl = ResolveSourceUrl(alertEvent.SourceUrl),
+            SourceUrl = ResolveSourceUrl(alertEvent.SourceUrl, alertEvent.SiteSlug),
             RuleId = rule.Id,
             TriggeredAt = DateTime.UtcNow,
             ContextJson = alertEvent.Context.Count > 0
@@ -186,8 +189,23 @@ public class AlertProcessingService : BackgroundService
             return;
         }
 
-        // Deliver to matching channels (use resolved absolute URL for delivery)
+        // Deliver to matching channels (use resolved absolute URL for delivery). For a
+        // non-default site, label the delivered copy with the site's name so external
+        // channels - which have no site column - name their origin. The in-app history
+        // row is already scoped to the site's own database, so only this copy is relabeled.
         var deliveryEvent = alertEvent with { SourceUrl = historyEntry.SourceUrl };
+        if (!string.IsNullOrEmpty(alertEvent.SiteSlug))
+        {
+            var siteName = await _siteNameResolver.ResolveNameAsync(alertEvent.SiteSlug, cancellationToken)
+                ?? alertEvent.SiteSlug;
+            deliveryEvent = deliveryEvent with
+            {
+                Title = $"[{siteName}] {alertEvent.Title}",
+                Context = new Dictionary<string, string> { ["Site"] = siteName }
+                    .Concat(alertEvent.Context.Where(kv => kv.Key != "Site"))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value)
+            };
+        }
         await DeliverAsync(deliveryEvent, historyEntry, repository, cancellationToken);
     }
 
@@ -284,16 +302,25 @@ public class AlertProcessingService : BackgroundService
     /// <summary>
     /// Resolves a relative SourceUrl (e.g., "/audit") to an absolute URL using the app's
     /// configured hostname. Falls back to the relative path if no hostname is configured.
+    /// For an alert from a non-default site, appends ?site=&lt;slug&gt; so the "View" link
+    /// lands on that site (the selection middleware persists it to the session cookie).
     /// </summary>
-    private string? ResolveSourceUrl(string? relativeUrl)
+    private string? ResolveSourceUrl(string? relativeUrl, string? siteSlug)
     {
         if (string.IsNullOrEmpty(relativeUrl))
             return null;
 
-        if (_appBaseUrl != null)
-            return $"{_appBaseUrl}{relativeUrl}";
+        var url = relativeUrl;
+        if (!string.IsNullOrEmpty(siteSlug))
+        {
+            var separator = url.Contains('?') ? '&' : '?';
+            url = $"{url}{separator}site={Uri.EscapeDataString(siteSlug)}";
+        }
 
-        return relativeUrl;
+        if (_appBaseUrl != null)
+            return $"{_appBaseUrl}{url}";
+
+        return url;
     }
 
     private void CleanupCooldowns()

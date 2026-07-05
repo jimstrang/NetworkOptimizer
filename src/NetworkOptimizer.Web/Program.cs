@@ -269,6 +269,8 @@ builder.Services.AddScoped<SiteContextService>();
 // The alert pipeline pins its scope to an event's originating site through this seam.
 builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertSiteScope>(sp =>
     sp.GetRequiredService<SiteContextService>());
+// Resolves a site's display name so delivered alerts name their originating site.
+builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.IAlertSiteNameResolver, AlertSiteNameResolver>();
 builder.Services.AddSingleton<AgentEnrollmentService>();
 
 // Register SSH client service (singleton - cross-platform SSH.NET wrapper)
@@ -1123,6 +1125,27 @@ app.Use(async (context, next) =>
         return;
     }
 
+    await next();
+});
+
+// Site selection via ?site=<slug>: alert "View" links carry the originating site so a
+// notification lands on the right site. Persist a valid value to the site cookie (same
+// attributes as the in-app switcher) so the whole session follows the link; validation
+// runs through the scoped site context, which checks the slug and its provisioned DB.
+app.Use(async (context, next) =>
+{
+    var siteParam = context.Request.Query[SiteContextService.SiteQueryParam].ToString();
+    if (!string.IsNullOrEmpty(siteParam)
+        && context.Request.Cookies[SiteContextService.CookieName] != siteParam
+        && context.RequestServices.GetRequiredService<SiteContextService>().IsSelectableSite(siteParam))
+    {
+        context.Response.Cookies.Append(SiteContextService.CookieName, siteParam, new CookieOptions
+        {
+            Path = "/",
+            MaxAge = TimeSpan.FromDays(365),
+            SameSite = SameSiteMode.Lax
+        });
+    }
     await next();
 });
 

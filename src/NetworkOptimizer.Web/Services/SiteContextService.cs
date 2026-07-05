@@ -16,6 +16,13 @@ public class SiteContextService : IAlertSiteScope
     /// <summary>Cookie carrying the selected site slug for this browser.</summary>
     public const string CookieName = "no-site";
 
+    /// <summary>
+    /// Query-string parameter that selects a site for a single request (used by alert
+    /// "View" links so a notification lands on its originating site). A middleware
+    /// persists it to <see cref="CookieName"/> so the whole session follows the link.
+    /// </summary>
+    public const string SiteQueryParam = "site";
+
     private readonly IHttpContextAccessor _httpContextAccessor;
     private readonly SiteDatabasePaths _dbPaths;
     private string? _slug;
@@ -49,15 +56,34 @@ public class SiteContextService : IAlertSiteScope
     /// <summary>SQLite database path for the current site.</summary>
     public string DbPath => _dbPaths.GetSiteDbPath(Slug, IsDefault);
 
+    /// <summary>
+    /// True when the slug is selectable for this instance: the default site, or a
+    /// non-default site whose database is provisioned. Validates against the slug
+    /// alphabet and the on-disk database so a stale or tampered value can never route
+    /// to an arbitrary path. Shared by cookie/query resolution and the selection
+    /// middleware.
+    /// </summary>
+    public bool IsSelectableSite(string? slug) =>
+        !string.IsNullOrEmpty(slug) &&
+        (slug == SiteManagementService.DefaultSiteSlug ||
+         (StringUtilities.IsSlug(slug) && File.Exists(_dbPaths.GetSiteDbPath(slug, isDefault: false))));
+
     private string Resolve()
     {
-        var cookie = _httpContextAccessor.HttpContext?.Request.Cookies[CookieName];
+        var request = _httpContextAccessor.HttpContext?.Request;
+
+        // A ?site= query param (an alert "View" link) wins over the cookie so the linked
+        // page renders the correct site on first paint, before the selection middleware's
+        // cookie takes effect on subsequent requests. An invalid value falls through.
+        var queryParam = request?.Query[SiteQueryParam].ToString();
+        if (!string.IsNullOrEmpty(queryParam) && IsSelectableSite(queryParam))
+            return queryParam;
+
+        var cookie = request?.Cookies[CookieName];
         if (string.IsNullOrEmpty(cookie) || cookie == SiteManagementService.DefaultSiteSlug)
             return SiteManagementService.DefaultSiteSlug;
 
-        // Validate against the slug alphabet and require a provisioned database so a
-        // stale or tampered cookie can never route to an arbitrary path.
-        if (!StringUtilities.IsSlug(cookie) || !File.Exists(_dbPaths.GetSiteDbPath(cookie, isDefault: false)))
+        if (!IsSelectableSite(cookie))
             return SiteManagementService.DefaultSiteSlug;
 
         return cookie;
