@@ -18,8 +18,7 @@
 @inject ApMapService ApMapService
 @inject PullToRefreshState PtrState
 @inject SiteContextService SiteContext
-@inject AgentEnrollmentService AgentEnrollment
-@inject ISystemSettingsService Settings
+@inject SiteSpeedTestTargetResolver SiteTarget
 
 @* Uses unified Iperf3Result model with Direction field to distinguish test sources *@
 
@@ -807,14 +806,6 @@
     private bool agentSiteOffline;
     private string targetLabel = "this server";
 
-    // Optional per-site override for the client-facing agent target (IP/host or full
-    // URL), set in Settings > Multi-Site > (site) Configuration and stored in the site's
-    // own database. Client-facing only - never affects the server-side path trace.
-    private string? targetOverride;
-
-    // Ports the on-site agent serves LAN speed tests on (OpenSpeedTest / iperf3).
-    private const int AgentOpenSpeedTestPort = 3000;
-
     // OpenSpeedTest health check cache
     private static DateTime _lastHealthCheck = DateTime.MinValue;
     private static bool _lastHealthResult = false;
@@ -863,42 +854,24 @@
         iperf3ServerEnabled = Configuration.GetValue("Iperf3Server:Enabled", false);
 
         // Multi-site: on an agent-backed site, point clients at the on-site agent
-        // (its own LAN IP) for LAN speed tests. The central server's own address is
-        // unreachable from a remote site's LAN. Falls back to the central-server
+        // (its own LAN IP) for LAN speed tests - the central server's own address is
+        // unreachable from a remote site's LAN. Shared resolution (override wins over
+        // agent LAN IP; the override never affects the server-side path trace) lives
+        // in SiteSpeedTestTargetResolver so this page, the Client Dashboard, and the
+        // WAN speed test link can't drift apart. Falls back to the central-server
         // target below when the site has no online agent reporting a LAN IP yet.
-        string? agentLanIp = null;
-        if (!SiteContext.IsDefault)
-        {
-            agentLanIp = await AgentEnrollment.GetOnlineAgentLanIpAsync(SiteContext.Slug);
-            agentSiteOffline = agentLanIp == null;
-            targetOverride = (await Settings.GetAsync(SystemSettingKeys.ClientSpeedTestTargetOverride))?.Trim();
-        }
-        // A per-site override (an IP/host or a full URL) wins over the auto-detected
-        // agent LAN IP for the CLIENT-FACING target - for agents whose reachable address
-        // isn't their detected LAN IP (e.g. behind a reverse proxy). It never touches the
-        // path trace, which always runs to the agent's real LAN IP server-side.
-        var effectiveTarget = !string.IsNullOrEmpty(targetOverride) ? targetOverride : agentLanIp;
-        siteUsesAgent = effectiveTarget != null;
+        var siteTarget = await SiteTarget.ResolveAsync();
+        agentSiteOffline = !SiteContext.IsDefault && siteTarget.AgentOffline;
+        siteUsesAgent = siteTarget.UsesAgent;
         targetLabel = siteUsesAgent ? "the on-site agent" : "this server";
 
         if (siteUsesAgent)
         {
             // The agent serves OpenSpeedTest over self-signed HTTPS on port 3000 (a secure
             // context so the browser Geolocation API works for GPS-tagged results) and iperf3
-            // on 5201 on the site network. An override may be a full URL (used as-is, so an
-            // operator can force http:// or a different host/port via the per-site speed test
-            // URL setting) or a bare host/IP (default to https on the agent port).
-            if (effectiveTarget!.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                || effectiveTarget.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            {
-                openSpeedTestUrl = effectiveTarget.TrimEnd('/');
-                serverHost = Uri.TryCreate(openSpeedTestUrl, UriKind.Absolute, out var u) ? u.Host : effectiveTarget;
-            }
-            else
-            {
-                openSpeedTestUrl = $"https://{effectiveTarget}:{AgentOpenSpeedTestPort}";
-                serverHost = effectiveTarget;
-            }
+            // on 5201 on the site network.
+            openSpeedTestUrl = siteTarget.BaseUrl!;
+            serverHost = siteTarget.Host!;
             iperf3ServerEnabled = true;
             openSpeedTestAvailable = true;
         }

@@ -74,6 +74,7 @@ public class AgentProbeResultSink
     {
         await PushProbeConfigAsync(connection, ct);
         await PushSnmpConfigAsync(connection, ct);
+        await PushWanSpeedTestConfigAsync(connection, ct);
 
         // This site's console reaches the UniFi console THROUGH this agent tunnel.
         // On startup / after an agent restart the console auto-connect can run
@@ -176,6 +177,42 @@ public class AgentProbeResultSink
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to push probe config to agent {Id} (site {Slug})",
+                connection.AgentId, connection.SiteSlug);
+        }
+    }
+
+    /// <summary>
+    /// Pushes the WAN speed-test server list (global, main database) so the
+    /// agent can serve its /wan/ redirect without the external servers needing
+    /// any per-site config: /wan/ goes to the default server, /wan/&lt;id&gt;/ to
+    /// that mapped server. Pushed on connect and by the periodic refresh so
+    /// Settings edits reach connected agents.
+    /// </summary>
+    public async Task PushWanSpeedTestConfigAsync(AgentTunnelConnection connection, CancellationToken ct)
+    {
+        try
+        {
+            await using var db = _siteDbFactory.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true);
+            var servers = await db.ExternalSpeedTestServers.AsNoTracking()
+                .OrderByDescending(s => s.IsDefault).ThenBy(s => s.Id)
+                .ToListAsync(ct);
+
+            var config = new WanSpeedTestConfig();
+            foreach (var server in servers)
+            {
+                if (!server.IsConfigured || string.IsNullOrEmpty(server.ServerId)) continue;
+                config.Servers.Add(new WanSpeedTestServer { ServerId = server.ServerId, Url = server.Url });
+                if (server.IsDefault && config.DefaultServerId.Length == 0)
+                    config.DefaultServerId = server.ServerId;
+            }
+
+            connection.TrySend(new ServerMessage { WanSpeedtestConfig = config });
+            _logger.LogDebug("Pushed {Count} WAN speed-test server(s) to agent {Id} (site {Slug})",
+                config.Servers.Count, connection.AgentId, connection.SiteSlug);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to push WAN speed-test config to agent {Id} (site {Slug})",
                 connection.AgentId, connection.SiteSlug);
         }
     }

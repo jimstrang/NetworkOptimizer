@@ -272,6 +272,9 @@ builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertSiteScope>(s
 // Resolves a site's display name so delivered alerts name their originating site.
 builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.IAlertSiteNameResolver, AlertSiteNameResolver>();
 builder.Services.AddSingleton<AgentEnrollmentService>();
+// Shared site-local speed-test target resolution (Client Dashboard, LAN Speed
+// Test page, WAN speed test link) - scoped, follows the current site context.
+builder.Services.AddScoped<SiteSpeedTestTargetResolver>();
 
 // Register SSH client service (singleton - cross-platform SSH.NET wrapper)
 builder.Services.AddSingleton<SshClientService>();

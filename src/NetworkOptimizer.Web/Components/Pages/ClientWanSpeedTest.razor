@@ -8,6 +8,7 @@
 @using NetworkOptimizer.Core.Helpers
 @inject ClientSpeedTestService ClientSpeedTestService
 @inject SiteContextService SiteContext
+@inject SiteSpeedTestTargetResolver SiteTarget
 @inject SystemSettingsService SettingsService
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
@@ -638,9 +639,31 @@
 
 @code {
     private List<ExternalSpeedTestServer> _servers = new();
-    // Non-default sites tag the external test URL so results post back to the right site's DB
-    private string ExternalRunUrl => $"{_selectedServer?.Url}?Run{(SiteContext.IsDefault ? "" : $"&site={SiteContext.Slug}")}";
-    private string ExternalShareUrl => $"{_selectedServer?.Url}{(SiteContext.IsDefault ? "" : $"?site={SiteContext.Slug}")}";
+
+    // On an agent-backed site the test starts at the on-site agent's /wan/ router,
+    // which 302-redirects to the external server: the agent becomes the page's
+    // referrer, so results post back through it with the real client LAN IP and
+    // the site slug stamped on the trusted agent->server hop - no ?site= in any
+    // user-facing URL. Direct/default sites link the external server directly.
+    private SiteSpeedTestTargetResolver.Result? _siteTarget;
+
+    private string ExternalBaseUrl
+    {
+        get
+        {
+            if (_siteTarget is { UsesAgent: true, BaseUrl: not null } target)
+            {
+                var isDefaultServer = _selectedServer == null || _selectedServer.IsDefault;
+                return isDefaultServer
+                    ? $"{target.BaseUrl}/wan/"
+                    : $"{target.BaseUrl}/wan/{_selectedServer!.ServerId}/";
+            }
+            return _selectedServer?.Url ?? "";
+        }
+    }
+
+    private string ExternalRunUrl => $"{ExternalBaseUrl}?Run";
+    private string ExternalShareUrl => ExternalBaseUrl;
 
     private ExternalSpeedTestServer? _selectedServer;
     private int _selectedServerId;
@@ -739,6 +762,7 @@
         _servers = await SettingsService.GetExternalSpeedTestServersAsync();
         _selectedServer = _servers.FirstOrDefault(s => s.IsDefault) ?? _servers.FirstOrDefault();
         _selectedServerId = _selectedServer?.Id ?? 0;
+        _siteTarget = await SiteTarget.ResolveAsync();
 
         if (_selectedServer != null)
             await LoadResults();

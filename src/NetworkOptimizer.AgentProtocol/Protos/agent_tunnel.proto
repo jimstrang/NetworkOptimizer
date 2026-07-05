@@ -41,7 +41,26 @@ message ServerMessage {
     UwnRequest uwn_request = 8;
     ProbeRequest probe_request = 9;
     SnmpOidQuery snmp_oid_query = 10;
+    WanSpeedTestConfig wan_speedtest_config = 11;
   }
+}
+
+// ---- WAN speed test routing (agent /wan/ redirect) ----
+// The agent serves /wan/ and /wan/<server-ID>/ on its speed-test listener and
+// 302-redirects the browser to the mapped external WAN test server, so the
+// result post-back returns to the agent (which sees the real client LAN IP)
+// and site identity comes from the agent relay - no ?site= in any user URL.
+// Pushed after the hello exchange and on the periodic config refresh.
+
+message WanSpeedTestConfig {
+  repeated WanSpeedTestServer servers = 1;
+  // server_id of the server /wan/ (no ID) redirects to; empty = first entry.
+  string default_server_id = 2;
+}
+
+message WanSpeedTestServer {
+  string server_id = 1;
+  string url = 2;
 }
 
 // ---- On-demand SNMP OID test (Monitoring "Test OID" button) ----

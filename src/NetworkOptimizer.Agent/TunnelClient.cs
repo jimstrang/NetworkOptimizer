@@ -25,6 +25,9 @@ public sealed class TunnelClient
     /// <summary>Invoked whenever the server pushes a new SNMP monitoring configuration.</summary>
     public Action<SnmpConfig>? OnSnmpConfig { get; set; }
 
+    /// <summary>Server pushes the WAN speed-test server list for the /wan/ redirect router.</summary>
+    public Action<WanSpeedTestConfig>? OnWanSpeedTestConfig { get; set; }
+
     /// <summary>Server asks us to GET a single OID once (the "Test OID" button).</summary>
     public Func<SnmpOidQuery, CancellationToken, Task>? OnSnmpOidQuery { get; set; }
 
@@ -127,6 +130,9 @@ public sealed class TunnelClient
                         break;
                     case ServerMessage.PayloadOneofCase.SnmpConfig:
                         OnSnmpConfig?.Invoke(message.SnmpConfig);
+                        break;
+                    case ServerMessage.PayloadOneofCase.WanSpeedtestConfig:
+                        OnWanSpeedTestConfig?.Invoke(message.WanSpeedtestConfig);
                         break;
                     case ServerMessage.PayloadOneofCase.SnmpOidQuery:
                         // Fire and forget: a single GET can take a couple seconds and

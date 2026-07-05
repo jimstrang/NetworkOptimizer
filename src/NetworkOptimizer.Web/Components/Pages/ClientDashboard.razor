@@ -15,8 +15,7 @@
 @inject UniFiConnectionService ConnectionService
 @inject IConfiguration Configuration
 @inject SiteContextService SiteContext
-@inject AgentEnrollmentService AgentEnrollment
-@inject ISystemSettingsService Settings
+@inject SiteSpeedTestTargetResolver SiteTarget
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject IHttpContextAccessor HttpContextAccessor
@@ -1996,29 +1995,19 @@
 
     // --- URL Construction ---
 
-    private const int AgentOpenSpeedTestPort = 3000;
-
     private async Task BuildOpenSpeedTestUrl()
     {
         // Per-site: this dashboard button is a shortcut to the same Client LAN Speed Test,
         // so on an agent-backed site it must target the site's on-site agent (its own LAN IP,
-        // self-signed https), not the central server. A per-site URL override (Settings) wins;
-        // otherwise the online agent's reported LAN IP. Falls through to the central-server
-        // config below only for the default site or when no agent is online. Mirrors
-        // ClientSpeedTest's resolution.
-        if (!SiteContext.IsDefault)
+        // self-signed https), not the central server. Shared resolution (per-site URL
+        // override wins over the online agent's LAN IP) lives in SiteSpeedTestTargetResolver.
+        // Falls through to the central-server config below only for the default site or
+        // when no agent is online.
+        var siteTarget = await SiteTarget.ResolveAsync();
+        if (siteTarget.UsesAgent)
         {
-            var targetOverride = (await Settings.GetAsync(SystemSettingKeys.ClientSpeedTestTargetOverride))?.Trim();
-            var agentLanIp = await AgentEnrollment.GetOnlineAgentLanIpAsync(SiteContext.Slug);
-            var effectiveTarget = !string.IsNullOrEmpty(targetOverride) ? targetOverride : agentLanIp;
-            if (!string.IsNullOrEmpty(effectiveTarget))
-            {
-                _openSpeedTestUrl = (effectiveTarget.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                        || effectiveTarget.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                    ? effectiveTarget.TrimEnd('/')
-                    : $"https://{effectiveTarget}:{AgentOpenSpeedTestPort}";
-                return;
-            }
+            _openSpeedTestUrl = siteTarget.BaseUrl;
+            return;
         }
 
         var hostName = Configuration["HOST_NAME"];

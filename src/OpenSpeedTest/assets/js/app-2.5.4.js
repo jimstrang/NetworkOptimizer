@@ -1035,11 +1035,6 @@ window.onload = function() {
             if (typeof externalServerId !== "undefined" && externalServerId && externalServerId !== "__EXTERNAL_SERVER_ID__") {
               saveTestData += "&srv=" + encodeURIComponent(externalServerId);
             }
-            // Multi-site: forward the site slug from the page URL (?site=slug) so the
-            // central server stores this result under the right site
-            if (getCommand.site) {
-              saveTestData += "&site=" + encodeURIComponent(getCommand.site);
-            }
             // Set initial results link to client speed test page (will be updated with result ID after save)
             if (typeof clientResultsUrl !== "undefined") {
               var circleSVG2 = document.getElementById("resultsData");
@@ -1444,6 +1439,27 @@ window.onload = function() {
         banner.className = "high-score-banner";
       }, 8000);
     };
+    // Multi-site: when this page was reached via a redirect from an on-site agent,
+    // document.referrer is the agent's origin. Post results back to that origin
+    // (same path/query as saveDataURL) so the agent can relay them to the central
+    // server with the site slug and the client's real LAN IP. Direct visits
+    // (no referrer, or same-origin referrer) keep the configured saveDataURL.
+    var getSaveDataTarget = function() {
+      var url = saveDataURL;
+      try {
+        var ref = document.referrer;
+        if (ref) {
+          var refUrl = new URL(ref);
+          var ostHost = myname.toLowerCase() + com;
+          var isOst = refUrl.hostname === ostHost || refUrl.hostname.slice(-(ostHost.length + 1)) === "." + ostHost;
+          if (!isOst && refUrl.origin !== location.origin) {
+            var resolved = new URL(saveDataURL, location.href);
+            url = refUrl.origin + resolved.pathname + resolved.search;
+          }
+        }
+      } catch (e) {}
+      return url;
+    };
     var ServerConnect = function(auth) {
       var Self = this;
       var xhr = new XMLHttpRequest();
@@ -1452,7 +1468,7 @@ window.onload = function() {
         url = webIP;
       }
       if (auth == 5) {
-        url = saveDataURL;
+        url = getSaveDataTarget();
       }
       if (auth == 7) {
         url = get_IP;

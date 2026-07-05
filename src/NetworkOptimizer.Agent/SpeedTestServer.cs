@@ -21,10 +21,19 @@ public sealed class SpeedTestServer : IAsyncDisposable
     /// <summary>Loopback port the relay binds; nginx proxies /api/public/speedtest/* here.</summary>
     public const int RelayPort = 3001;
 
+    /// <summary>One WAN speed-test server the /wan/ router can redirect to.</summary>
+    public sealed record WanServerEntry(string ServerId, string Url);
+
+    private sealed record WanRouting(IReadOnlyList<WanServerEntry> Servers, string DefaultServerId);
+
     private readonly WebApplication _app;
     private readonly HttpClient _relay;
     private readonly string _siteSlug;
     private Task? _runTask;
+
+    // Server-pushed WAN server list (WanSpeedTestConfig over the tunnel); swapped
+    // atomically. Empty until the first push - /wan/ answers 503 with a hint then.
+    private volatile WanRouting _wanRouting = new(Array.Empty<WanServerEntry>(), "");
 
     private SpeedTestServer(WebApplication app, HttpClient relay, string siteSlug)
     {
@@ -32,6 +41,10 @@ public sealed class SpeedTestServer : IAsyncDisposable
         _relay = relay;
         _siteSlug = siteSlug;
     }
+
+    /// <summary>Replaces the WAN speed-test server list the /wan/ router redirects to.</summary>
+    public void UpdateWanServers(IReadOnlyList<WanServerEntry> servers, string defaultServerId) =>
+        _wanRouting = new WanRouting(servers, defaultServerId);
 
     /// <summary>Binds the results relay on loopback (<see cref="RelayPort"/>).</summary>
     public static SpeedTestServer Create(string serverUrl, string siteSlug, bool ignoreSslErrors)
@@ -51,10 +64,63 @@ public sealed class SpeedTestServer : IAsyncDisposable
         app.MapPost("/api/public/speedtest/topology-snapshots",
             (Delegate)((HttpContext context) => RelayAsync(relay, context, "api/public/speedtest/topology-snapshots", siteSlug)));
 
+        // A WAN test post-back arrives cross-origin (the external server's page
+        // posting to this agent's origin via document.referrer). Same-origin LAN
+        // posts ignore these headers; the endpoints are public either way.
+        app.MapMethods("/api/public/speedtest/{*rest}", new[] { "OPTIONS" }, (HttpContext context) =>
+        {
+            AddCorsHeaders(context);
+            return Results.NoContent();
+        });
+
         // The "view results" link on the page lives on the central server.
         app.MapGet("/client-speedtest", () => Results.Redirect(serverUrl.TrimEnd('/') + "/client-speedtest"));
 
-        return new SpeedTestServer(app, relay, siteSlug);
+        var server = new SpeedTestServer(app, relay, siteSlug);
+
+        // WAN speed test router: /wan/ redirects to the default external WAN test
+        // server, /wan/<server-ID>/ to that mapped server, forwarding query params
+        // (?Run, duration, ...). The redirect makes this agent the page's referrer,
+        // so the browser posts results back to this origin and the relay above
+        // stamps the site slug + real client LAN IP - no ?site= in any user URL.
+        app.MapGet("/wan/{serverId?}", (string? serverId, HttpContext context) =>
+            server.RedirectToWanServer(serverId, context));
+
+        return server;
+    }
+
+    private IResult RedirectToWanServer(string? serverId, HttpContext context)
+    {
+        var routing = _wanRouting;
+        if (routing.Servers.Count == 0)
+            return Results.Content(
+                "No external WAN speed test server is configured on the central Network Optimizer yet " +
+                "(Settings -> External Speed Test Servers), or this agent hasn't received the list yet.",
+                "text/plain", statusCode: StatusCodes.Status503ServiceUnavailable);
+
+        WanServerEntry? target;
+        if (string.IsNullOrEmpty(serverId))
+        {
+            target = routing.Servers.FirstOrDefault(s => s.ServerId == routing.DefaultServerId)
+                ?? routing.Servers[0];
+        }
+        else
+        {
+            target = routing.Servers.FirstOrDefault(s =>
+                string.Equals(s.ServerId, serverId, StringComparison.OrdinalIgnoreCase));
+            if (target == null)
+                return Results.Content($"Unknown WAN speed test server '{serverId}'.",
+                    "text/plain", statusCode: StatusCodes.Status404NotFound);
+        }
+
+        return Results.Redirect(target.Url.TrimEnd('/') + "/" + context.Request.QueryString.Value);
+    }
+
+    private static void AddCorsHeaders(HttpContext context)
+    {
+        context.Response.Headers.AccessControlAllowOrigin = "*";
+        context.Response.Headers.AccessControlAllowMethods = "GET, POST, OPTIONS";
+        context.Response.Headers.AccessControlAllowHeaders = "Content-Type";
     }
 
     public void Start() => _runTask = _app.RunAsync();
@@ -83,6 +149,7 @@ public sealed class SpeedTestServer : IAsyncDisposable
 
     private static async Task<IResult> RelayAsync(HttpClient relay, HttpContext context, string path, string siteSlug)
     {
+        AddCorsHeaders(context);
         try
         {
             // The real client address rides as a query param (client_ip), NOT a header:

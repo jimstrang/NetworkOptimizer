@@ -157,6 +157,9 @@ while (!cts.IsCancellationRequested)
         var probeRequestRunner = new ProbeRequestRunner(tunnel);
         tunnel.OnProbeConfig = probeRunner.UpdateConfig;
         tunnel.OnSnmpConfig = snmpRunner.UpdateConfig;
+        tunnel.OnWanSpeedTestConfig = wanConfig => speedTestServer?.UpdateWanServers(
+            wanConfig.Servers.Select(s => new SpeedTestServer.WanServerEntry(s.ServerId, s.Url)).ToList(),
+            wanConfig.DefaultServerId);
         tunnel.OnSnmpOidQuery = snmpRunner.HandleOidQueryAsync;
         tunnel.OnProxyOpen = proxyHandler.HandleOpenAsync;
         tunnel.OnProxyData = proxyHandler.HandleDataAsync;
