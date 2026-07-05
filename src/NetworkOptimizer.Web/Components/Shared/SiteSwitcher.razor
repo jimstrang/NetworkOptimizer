@@ -69,13 +69,19 @@
         // scoped service resolves against the new site's database.
         await JS.InvokeVoidAsync("eval",
             $"document.cookie = '{SiteContextService.CookieName}={site.Slug}; path=/; max-age=31536000; SameSite=Lax'");
-        // Drop any #fragment first: reloading the *same* URL with its fragment is a
+        var target = NavigationManager.Uri;
+
+        // Drop any #fragment: reloading the *same* URL with its fragment is a
         // same-document navigation the browser won't actually reload, so the new site
         // cookie would never take effect. The fragment is meaningless on another site anyway.
-        var target = NavigationManager.Uri;
         var fragmentAt = target.IndexOf('#');
         if (fragmentAt >= 0)
             target = target[..fragmentAt];
+
+        // Strip the ?site= selector: an alert "View" link pins the site through this
+        // query param, which wins over the cookie, so leaving it in place would
+        // immediately override the switch we just made.
+        target = RemoveSiteQueryParam(target);
 
         // The all-sites overview isn't a per-site page, so switching sites from it
         // should land on the new site's dashboard rather than reload the overview.
@@ -84,5 +90,21 @@
             target = NavigationManager.BaseUri;
 
         NavigationManager.NavigateTo(target, forceLoad: true);
+    }
+
+    private static string RemoveSiteQueryParam(string url)
+    {
+        var queryAt = url.IndexOf('?');
+        if (queryAt < 0)
+            return url;
+
+        var kept = url[(queryAt + 1)..]
+            .Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Where(p => !p.Equals(SiteContextService.SiteQueryParam, StringComparison.OrdinalIgnoreCase)
+                     && !p.StartsWith(SiteContextService.SiteQueryParam + "=", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var basePart = url[..queryAt];
+        return kept.Count > 0 ? $"{basePart}?{string.Join('&', kept)}" : basePart;
     }
 }
