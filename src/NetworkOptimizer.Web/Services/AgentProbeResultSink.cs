@@ -512,6 +512,14 @@ public class AgentProbeResultSink
                 timestamp: timestamp);
         }
 
+        // Diagnostic (port stats parity): what interface samples the agent relays, and which
+        // of them correlate to a console device (deviceByMac) - i.e. whether switch ports are
+        // being recorded so the Port Statistics table + Client column have anything to show.
+        _logger.LogDebug("AGENTPORTSTATS site={Site}: interfaceSamples={Count} snmpDevices=[{Devs}] matchedConsole={Matched}",
+            connection.SiteSlug, batch.Interfaces.Count,
+            string.Join(",", batch.Interfaces.Select(s => s.DeviceMac).Distinct().Take(6)),
+            batch.Interfaces.Select(s => s.DeviceMac).Distinct().Count(m => deviceByMac.ContainsKey(NormalizeMac(m))));
+
         // Publish fabric sums + mesh-AP backhaul, then the topology-boundary aggregates -
         // mirroring the fast tier's post-loop passes (vwiresta + fabric recorded BEFORE
         // WriteAggregates so its mesh pass sees them via GetForDevice). Uses each console
