@@ -2921,15 +2921,15 @@
                                         </td>
                                         <td>
                                             <div class="btn-group-wrap">
+                                                <button type="button" class="btn btn-secondary btn-sm" @onclick="() => ToggleAgents(site.Id)">
+                                                    Configuration
+                                                </button>
                                                 @if (site.Slug != SiteContext.Slug)
                                                 {
                                                     <button type="button" class="btn btn-primary btn-sm" @onclick="() => SwitchToSiteAsync(site)">
                                                         Switch to Site
                                                     </button>
                                                 }
-                                                <button type="button" class="btn btn-secondary btn-sm" @onclick="() => ToggleAgents(site.Id)">
-                                                    Configuration
-                                                </button>
                                             </div>
                                         </td>
                                     </tr>
@@ -3035,7 +3035,7 @@
                                                             <div class="form-group site-config-override">
                                                                 <label class="form-label">Client speed test target override (optional)</label>
                                                                 <input type="text" class="form-control"
-                                                                       placeholder="e.g. 192.168.1.50 or https://speed.example.com"
+                                                                       placeholder="@ClientSpeedTestPlaceholder(site)"
                                                                        value="@ClientSpeedTestTarget(site.Id)"
                                                                        @onchange="e => SaveClientSpeedTestTarget(site, e.Value?.ToString())" />
                                                                 <small class="form-help">
@@ -3451,6 +3451,22 @@
 
     private string? ClientSpeedTestTarget(int siteId) =>
         _clientSpeedTestTarget.TryGetValue(siteId, out var v) ? v : null;
+
+    // Placeholder shows what a blank override resolves to - the online agent's
+    // detected LAN IP on the agent's https port (same pick as
+    // SiteSpeedTestTargetResolver) - so the operator can see the auto value
+    // they'd be overriding. Generic example when no agent has reported in.
+    private string ClientSpeedTestPlaceholder(Site site)
+    {
+        var lanIp = AgentsFor(site.Id)
+            .Where(a => a.Enabled && !string.IsNullOrEmpty(a.LanIp) && AgentEnrollmentService.IsOnline(a.LastSeenAt))
+            .OrderByDescending(a => a.LastSeenAt)
+            .Select(a => a.LanIp)
+            .FirstOrDefault();
+        return lanIp != null
+            ? $"auto: https://{lanIp}:{SiteSpeedTestTargetResolver.AgentOpenSpeedTestPort} (agent's detected LAN IP)"
+            : "e.g. 192.168.1.50 or https://speed.example.com";
+    }
 
     private async Task LoadClientSpeedTestTargetAsync(Site site)
     {
