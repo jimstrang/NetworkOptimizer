@@ -83,6 +83,28 @@ public class AgentProbeResultSink
         _ = ReconnectConsoleIfViaAgentAsync(connection);
     }
 
+    /// <summary>
+    /// Called from the tunnel teardown. Flips the site's console to the
+    /// awaiting-agent state when its last agent drops, so console calls fail
+    /// fast instead of retrying against the dead loopback proxy (which stalls
+    /// every page of the site for the duration of the retry backoff).
+    /// Fire-and-forget: teardown must never block on the console lock.
+    /// </summary>
+    public void OnAgentDisconnected(AgentTunnelConnection connection)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _siteConnections.GetFor(connection.SiteSlug).OnAgentTunnelDroppedAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Console awaiting-agent flip failed for site {Slug}", connection.SiteSlug);
+            }
+        });
+    }
+
     private async Task ReconnectConsoleIfViaAgentAsync(AgentTunnelConnection connection)
     {
         try
@@ -511,14 +533,6 @@ public class AgentProbeResultSink
                 bcastPktsOut: sample.BcastPktsOut > 0 ? sample.BcastPktsOut : null,
                 timestamp: timestamp);
         }
-
-        // Diagnostic (port stats parity): what interface samples the agent relays, and which
-        // of them correlate to a console device (deviceByMac) - i.e. whether switch ports are
-        // being recorded so the Port Statistics table + Client column have anything to show.
-        _logger.LogDebug("AGENTPORTSTATS site={Site}: interfaceSamples={Count} snmpDevices=[{Devs}] matchedConsole={Matched}",
-            connection.SiteSlug, batch.Interfaces.Count,
-            string.Join(",", batch.Interfaces.Select(s => s.DeviceMac).Distinct().Take(6)),
-            batch.Interfaces.Select(s => s.DeviceMac).Distinct().Count(m => deviceByMac.ContainsKey(NormalizeMac(m))));
 
         // Publish fabric sums + mesh-AP backhaul, then the topology-boundary aggregates -
         // mirroring the fast tier's post-loop passes (vwiresta + fabric recorded BEFORE

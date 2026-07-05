@@ -180,6 +180,31 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     }
 
     /// <summary>
+    /// Called when this site's agent tunnel drops. When the console is reached
+    /// through that tunnel, flip straight to the awaiting-agent state: the client
+    /// stays "connected" otherwise, and every console call dials the dead loopback
+    /// proxy and burns through the transient-failure retry backoff (~14 s per
+    /// call), which reads as a frozen UI on any page of this site while the agent
+    /// is down. The agent-connected hook re-establishes the console when the
+    /// tunnel returns.
+    /// </summary>
+    public async Task OnAgentTunnelDroppedAsync()
+    {
+        if (IsAgentOnline()) return; // another agent still carries the site
+        if (!_isConnected && _client == null) return;
+        if (!await IsConsoleViaAgentAsync()) return;
+
+        _logger.LogInformation(
+            "Agent tunnel for site {Slug} dropped; marking its console as awaiting the agent", SiteSlug);
+        _client?.Dispose();
+        _client = null;
+        _isConnected = false;
+        _awaitingAgent = true;
+        _lastError = AwaitingAgentMessage;
+        OnConnectionChanged?.Invoke();
+    }
+
+    /// <summary>
     /// When the site's console is reached through its agent tunnel, rewrites
     /// the controller URL to the loopback proxy endpoint that forwards over
     /// the tunnel. Callers must also force ignore-SSL for proxied connections:

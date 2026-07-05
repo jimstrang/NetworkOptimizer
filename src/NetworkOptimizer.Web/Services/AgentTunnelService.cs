@@ -157,6 +157,7 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
             _uwn.OnAgentDisconnected(connection);
             _probe.OnAgentDisconnected(connection);
             _snmpQuery.OnAgentDisconnected(connection);
+            _probeResultSink.OnAgentDisconnected(connection);
             streamCts.Cancel();
             await AwaitQuietlyAsync(pumpTask);
             await AwaitQuietlyAsync(refreshTask);
