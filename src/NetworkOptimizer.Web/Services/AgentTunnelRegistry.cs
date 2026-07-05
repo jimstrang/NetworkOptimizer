@@ -41,6 +41,16 @@ public class AgentTunnelRegistry
     /// <summary>Whether the agent currently holds an open tunnel.</summary>
     public bool IsConnected(int agentId) => _connections.ContainsKey(agentId);
 
+    /// <summary>
+    /// Whether an agent counts as online for status displays: an open tunnel is
+    /// authoritative and instant; otherwise a fresh heartbeat (REST-only agents,
+    /// or the gap while a tunnel reconnects) keeps it online. The single
+    /// definition every status surface (site dropdown, All Sites, Multi-Site
+    /// settings) shares, so they can't disagree on what "online" means.
+    /// </summary>
+    public bool IsAgentLive(NetworkOptimizer.Storage.Models.SiteAgent agent) =>
+        IsConnected(agent.Id) || AgentEnrollmentService.IsOnline(agent.LastSeenAt);
+
     /// <summary>Live connections for a site (normally zero or one per agent).</summary>
     public List<AgentTunnelConnection> GetForSite(string siteSlug) =>
         _connections.Values.Where(c => c.SiteSlug == siteSlug).ToList();

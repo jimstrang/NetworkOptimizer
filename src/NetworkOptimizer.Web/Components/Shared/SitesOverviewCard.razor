@@ -2,6 +2,7 @@
 @using NetworkOptimizer.Web.Services
 @inject SiteManagementService SiteManagement
 @inject AgentEnrollmentService AgentEnrollment
+@inject AgentTunnelRegistry TunnelRegistry
 @inject NavigationManager NavigationManager
 
 @* Reusable multi-site summary card. Renders nothing until multi-site is enabled
@@ -56,7 +57,7 @@
     private List<SiteAgent> _agents = new();
 
     private int EnrolledAgents => _agents.Count(a => a.EnrolledAt != null);
-    private int OnlineAgents => _agents.Count(a => AgentEnrollmentService.IsOnline(a.LastSeenAt));
+    private int OnlineAgents => _agents.Count(a => TunnelRegistry.IsAgentLive(a));
 
     private void HandleCardClick()
     {

@@ -1,5 +1,6 @@
 @page "/settings"
 @rendermode InteractiveServer
+@implements IDisposable
 @using NetworkOptimizer.Web.Services
 @using NetworkOptimizer.Web.Services.Ssh
 @using NetworkOptimizer.Storage.Models
@@ -2946,7 +2947,7 @@
                                                             @foreach (var agent in agents)
                                                             {
                                                                 <div class="site-agent-row">
-                                                                    <span class="status-dot @(AgentEnrollmentService.IsOnline(agent.LastSeenAt) ? "online" : "offline")"></span>
+                                                                    <span class="status-dot @(TunnelRegistry.IsAgentLive(agent) ? "online" : "offline")"></span>
                                                                     <span>@agent.Name</span>
                                                                     <span class="site-agent-status">
                                                                         @if (!agent.Enabled)
@@ -2957,7 +2958,7 @@
                                                                         {
                                                                             <text>Awaiting enrollment</text>
                                                                         }
-                                                                        else if (AgentEnrollmentService.IsOnline(agent.LastSeenAt))
+                                                                        else if (TunnelRegistry.IsAgentLive(agent))
                                                                         {
                                                                             <text>Online@(TunnelRegistry.IsConnected(agent.Id) ? " (tunnel)" : "")@(agent.LastVersion != null ? $" - v{agent.LastVersion}" : "")</text>
                                                                             @if (AgentVersionOutdated(agent))
@@ -3225,7 +3226,30 @@
         {
             _sites = await SiteManagement.GetSitesAsync();
             await LoadAgentsAsync();
+
+            // Keep the Sites table's agent status current while the page is open -
+            // without this the Status column is a page-load snapshot and disagrees
+            // with the site dropdown / All Sites page after an agent comes or goes.
+            _agentPollTimer ??= new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        await LoadAgentsAsync();
+                        StateHasChanged();
+                    });
+                }
+                catch { /* prevent timer death */ }
+            }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         }
+    }
+
+    private System.Threading.Timer? _agentPollTimer;
+
+    public void Dispose()
+    {
+        _agentPollTimer?.Dispose();
     }
 
     private async Task OnMultiSiteEnabledChanged(ChangeEventArgs e)
@@ -3363,13 +3387,16 @@
 
     private int AgentCount(int siteId) => AgentsFor(siteId).Count;
 
-    // At-a-glance agent state for a site's row in the Sites table.
+    // At-a-glance agent state for a site's row in the Sites table. Uses the
+    // shared IsAgentLive definition (tunnel-connected or heartbeat-fresh) and is
+    // kept current by the agent poll timer, so it agrees with the other status
+    // surfaces instead of freezing at whatever page load saw.
     private (string Dot, string Label, string Tooltip) SiteAgentStatus(int siteId)
     {
         var agents = AgentsFor(siteId);
         if (agents.Count == 0)
             return ("offline", "No agent", "No agent set up for this site");
-        if (agents.Any(a => a.Enabled && a.EnrolledAt != null && AgentEnrollmentService.IsOnline(a.LastSeenAt)))
+        if (agents.Any(a => a.Enabled && a.EnrolledAt != null && TunnelRegistry.IsAgentLive(a)))
             return ("online", "Online", "An agent is enrolled and connected");
         if (agents.Any(a => a.EnrolledAt != null))
             return ("offline", "Offline", "An agent is enrolled but not currently connected");
@@ -3473,7 +3500,7 @@
     private string ClientSpeedTestPlaceholder(Site site)
     {
         var lanIp = AgentsFor(site.Id)
-            .Where(a => a.Enabled && !string.IsNullOrEmpty(a.LanIp) && AgentEnrollmentService.IsOnline(a.LastSeenAt))
+            .Where(a => a.Enabled && !string.IsNullOrEmpty(a.LanIp) && TunnelRegistry.IsAgentLive(a))
             .OrderByDescending(a => a.LastSeenAt)
             .Select(a => a.LanIp)
             .FirstOrDefault();

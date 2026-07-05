@@ -1,5 +1,6 @@
 @page "/sites"
 @rendermode InteractiveServer
+@implements IDisposable
 @using Microsoft.EntityFrameworkCore
 @using NetworkOptimizer.Storage.Models
 @using NetworkOptimizer.Web.Services
@@ -7,6 +8,7 @@
 @inject SiteContextService SiteContext
 @inject SiteConnectionRegistry SiteConnections
 @inject AgentEnrollmentService AgentEnrollment
+@inject AgentTunnelRegistry TunnelRegistry
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
@@ -96,6 +98,8 @@ else
     private List<SiteAgent> _agents = new();
     private readonly Dictionary<int, string?> _consoleHosts = new();
 
+    private System.Threading.Timer? _pollTimer;
+
     protected override async Task OnInitializedAsync()
     {
         _enabled = await SiteManagement.IsMultiSiteEnabledAsync();
@@ -104,8 +108,30 @@ else
             _sites = await SiteManagement.GetSitesAsync();
             _agents = await AgentEnrollment.GetAllAgentsAsync();
             await LoadConsoleHostsAsync();
+
+            // Keep the console dots and agent counts current while the page is
+            // open - they'd otherwise freeze at whatever page load saw and drift
+            // from the site dropdown / Multi-Site settings after an agent or
+            // console comes or goes.
+            _pollTimer = new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        _agents = await AgentEnrollment.GetAllAgentsAsync();
+                        StateHasChanged();
+                    });
+                }
+                catch { /* prevent timer death */ }
+            }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         }
         _loaded = true;
+    }
+
+    public void Dispose()
+    {
+        _pollTimer?.Dispose();
     }
 
     // Each site's UniFi Console host, read from its own database, shown under the
@@ -147,7 +173,7 @@ else
     private int AgentCount(int siteId) => _agents.Count(a => a.SiteId == siteId);
 
     private int OnlineAgentCount(int siteId) =>
-        _agents.Count(a => a.SiteId == siteId && AgentEnrollmentService.IsOnline(a.LastSeenAt));
+        _agents.Count(a => a.SiteId == siteId && TunnelRegistry.IsAgentLive(a));
 
     private async Task SwitchToAsync(Site site)
     {
