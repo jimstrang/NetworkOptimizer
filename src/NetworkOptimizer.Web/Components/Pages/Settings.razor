@@ -1865,6 +1865,17 @@
                 <input type="number" class="form-control" @bind="alertRetention" min="1" max="365" />
             </div>
 
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" @bind="receivePrereleaseUpdates" @bind:after="SavePrereleaseSetting" />
+                    Receive pre-release update notifications
+                </label>
+                <p class="form-help">
+                    Shows a banner when a preview (beta) build is available so you can try new
+                    features early. Stable update notifications are unaffected either way.
+                </p>
+            </div>
+
             <div class="action-buttons">
                 <button class="btn btn-success" @onclick="SaveAppSettings">
                     Save Application Settings
@@ -2631,23 +2642,6 @@
             {
                 <div class="alert alert-@_mapboxTokenMessageClass">@_mapboxTokenMessage</div>
             }
-        </div>
-    </div>
-
-    <!-- Software Updates -->
-    <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">Software Updates</h2>
-        </div>
-        <div class="card-body">
-            <label class="checkbox-label">
-                <input type="checkbox" @bind="receivePrereleaseUpdates" @bind:after="SavePrereleaseSetting" />
-                Receive pre-release update notifications
-            </label>
-            <p class="form-help">
-                Shows a banner when a preview (beta) build is available so you can try new features
-                early. Stable update notifications are unaffected either way.
-            </p>
         </div>
     </div>
 
@@ -3674,7 +3668,7 @@
 
     // Application Settings
     private int alertRetention = 30;
-    private bool receivePrereleaseUpdates = true; // default ON; dismissing the preview banner opts out
+    private bool receivePrereleaseUpdates = true; // default ON; global (instance-wide); dismissing the preview banner opts out
 
     // Security Audit Settings
     private bool allowAppleStreamingOnMainNetwork = false;
@@ -3820,6 +3814,10 @@
         _activeTab = ResolveTab(TabParam);
         _lastTabParam = TabParam;
 
+        // Pre-release update notifications default ON (global/instance-wide); only an explicit "false" opts out.
+        var prereleaseSetting = await SystemSettings.GetGlobalAsync("updates.include_prereleases");
+        receivePrereleaseUpdates = prereleaseSetting is null || (bool.TryParse(prereleaseSetting, out var prPre) && prPre);
+
         // Load saved configuration if available
         if (ConnectionService.CurrentConfig != null)
         {
@@ -3844,11 +3842,6 @@
         }
 
         UpdateControllerStatus();
-
-        // Pre-release update notifications default ON (null); only an explicit "false" opts out.
-        var prereleaseSetting = await SystemSettings.GetAsync("updates.include_prereleases");
-        receivePrereleaseUpdates = prereleaseSetting is null || (bool.TryParse(prereleaseSetting, out var prPre) && prPre);
-
         await LoadGatewaySettings();
         await LoadSshSettings();
         await LoadModemConfigs();
@@ -5435,11 +5428,6 @@
         _editingOnt.Port = GetOntProviderDefaultPort(provider);
     }
 
-    private async Task SavePrereleaseSetting()
-    {
-        await SystemSettings.SetAsync("updates.include_prereleases", receivePrereleaseUpdates ? "true" : "false");
-    }
-
     private static int GetOntProviderDefaultPort(string provider) => provider switch
     {
         "8311" => 443,
@@ -5461,6 +5449,12 @@
     {
         // TODO: Implement save
         await Task.CompletedTask;
+    }
+
+    private async Task SavePrereleaseSetting()
+    {
+        // Instance-wide: written to the main DB so it applies across all sites.
+        await SystemSettings.SetGlobalAsync("updates.include_prereleases", receivePrereleaseUpdates ? "true" : "false");
     }
 
     // Config export state

@@ -49,7 +49,8 @@
 
             // Pre-release notifications are ON by default so everyone hears about big preview
             // releases; dismissing the banner (or the Settings toggle) writes "false" to opt out.
-            var raw = await SettingsService.GetAsync("updates.include_prereleases");
+            // Instance-wide (global) setting - the update check isn't per site.
+            var raw = await SettingsService.GetGlobalAsync("updates.include_prereleases");
             var includePrereleases = raw is null || (bool.TryParse(raw, out var pre) && pre);
 
             var result = await JS.InvokeAsync<UpdateCheckResult?>("updateChecker.checkForUpdate", currentVersion, includePrereleases);
@@ -71,8 +72,8 @@
 
     private async Task DismissPrereleases()
     {
-        // Opt out of pre-release notifications (re-enable any time in Settings).
-        await SettingsService.SetAsync("updates.include_prereleases", "false");
+        // Opt out of pre-release notifications (re-enable any time in Settings). Instance-wide.
+        await SettingsService.SetGlobalAsync("updates.include_prereleases", "false");
         updateAvailable = false;
         StateHasChanged();
     }
