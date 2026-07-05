@@ -9,6 +9,12 @@ namespace NetworkOptimizer.WiFi.Analyzers;
 /// </summary>
 public class SiteHealthScorer
 {
+    /// <summary>Roam success rate at or above which roaming is considered healthy.</summary>
+    private const double RoamHealthyRatePct = 95.0;
+
+    /// <summary>Roam success rate below which failures are treated as a serious problem.</summary>
+    private const double RoamSevereRatePct = 90.0;
+
     private readonly SiteHealthScorerOptions _options;
 
     public SiteHealthScorer(SiteHealthScorerOptions? options = null)
@@ -252,7 +258,7 @@ public class SiteHealthScorer
         // Bonus for fast roaming usage
         if (fastRoamingPct > 50) dimension.Score = Math.Min(100, dimension.Score + 5);
 
-        dimension.Status = successRate < 95
+        dimension.Status = successRate < RoamHealthyRatePct
             ? $"{100 - successRate:F1}% roam failures"
             : "Roaming is healthy";
 
@@ -260,7 +266,7 @@ public class SiteHealthScorer
         {
             Name = "Roam success rate",
             Value = $"{successRate:F1}%",
-            Impact = successRate < 90 ? -20 : successRate < 95 ? -10 : 0
+            Impact = successRate < RoamSevereRatePct ? -20 : successRate < RoamHealthyRatePct ? -10 : 0
         });
 
         dimension.Factors.Add(new ScoreFactor
@@ -514,11 +520,18 @@ public class SiteHealthScorer
             });
         }
 
-        // Roaming issues
+        // Roaming issues: flag edges whose roam success rate falls below the healthy
+        // threshold (95%, matching the dimension scorer) rather than the raw failure
+        // count. A handful of failures across thousands of roams is normal; a low
+        // success rate is what signals a real coverage or fast-roaming problem. Edges
+        // with too few attempts are skipped so a single failure can't dominate the rate.
         if (roamingData != null)
         {
+            const int minRoamAttempts = 5;
+
             var failedRoamEdges = roamingData.Edges
-                .Where(e => e.TotalRoamAttempts > e.TotalSuccessfulRoams)
+                .Where(e => e.TotalRoamAttempts >= minRoamAttempts && e.SuccessRate < RoamHealthyRatePct)
+                .OrderBy(e => e.SuccessRate)
                 .ToList();
 
             foreach (var edge in failedRoamEdges.Take(3))
@@ -529,14 +542,15 @@ public class SiteHealthScorer
 
                 score.Issues.Add(new HealthIssue
                 {
-                    Severity = failures > 5 ? HealthIssueSeverity.Critical : HealthIssueSeverity.Warning,
+                    // Below 90% success is a serious roaming problem (mirrors the dimension's -20 tier)
+                    Severity = edge.SuccessRate < RoamSevereRatePct ? HealthIssueSeverity.Critical : HealthIssueSeverity.Warning,
                     Dimensions = { HealthDimension.RoamingPerformance },
                     Title = "Roaming failures",
-                    Description = $"{failures} failed roams between these APs",
+                    Description = $"{100 - edge.SuccessRate:F0}% roam failure rate ({failures} of {edge.TotalRoamAttempts} roams) between these APs",
                     AffectedEntity = $"{ap1Name} ↔ {ap2Name}",
                     LinkUrl = $"./wifi-optimizer?tab=roaming&edge={Uri.EscapeDataString(edge.Endpoint1Mac)}_{Uri.EscapeDataString(edge.Endpoint2Mac)}#roaming-edge-details",
                     Recommendation = "Check for coverage gaps or enable fast roaming.",
-                    ScoreImpact = -5 * failures
+                    ScoreImpact = edge.SuccessRate < RoamSevereRatePct ? -10 : -5
                 });
             }
         }
