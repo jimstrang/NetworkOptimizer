@@ -885,6 +885,18 @@ public class MonitoringCollectionAgent : BackgroundService
         }
         _liveStats.RecordPortClients(portClients);
 
+        // Diagnostic for the Port Statistics "Client" column on managed sites: how many wired
+        // clients actually carry the switch-port association (SwMac+SwPort) needed to map them
+        // to a port, and what keys we recorded. If mappable=0 on an agent-backed site while the
+        // home site is fine, the switch-port association isn't surviving the console-via-agent
+        // client fetch (cause A). If mappable>0 but the column is still empty, compare these
+        // SwMac keys against the SNMP-relay port-stats device MACs (cause B).
+        var mappable = clients.Count(c => c.IsWired && !string.IsNullOrEmpty(c.Mac)
+            && !string.IsNullOrEmpty(c.SwMac) && c.SwPort is int dsp && dsp > 0);
+        _logger.LogDebug("PORTCLIENT-DIAG site={Site}: wired={Wired} mappable(SwMac+SwPort)={Map} recorded={Rec} sampleKeys=[{Keys}]",
+            _siteSlug, wiredCount, mappable, portClients.Count,
+            string.Join(", ", portClients.Keys.Take(4).Select(k => $"{k.DeviceMac}:{k.Port}")));
+
         long tickOffset = 0; // nanosecond offset per client to avoid InfluxDB dedup
         foreach (var c in clients)
         {
