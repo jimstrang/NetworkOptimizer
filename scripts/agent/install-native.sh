@@ -26,7 +26,20 @@ LAN_SPEED_TEST=false
 INSECURE=false
 INSTALL_DIR="/opt/netopt-agent"
 SERVICE_NAME="netopt-agent"
-RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/latest/download"
+# ############################################################################
+# ##  ⚠️  TEMPORARY HACK — main ONLY. DO NOT SHIP TO STABLE 2.0 GA.  ⚠️      ##
+# ############################################################################
+# This script lives on `main` purely so the 2.0.0-beta.1 agent-install one-liner
+# (which is baked into the beta app image and fetches this file from `main`)
+# works BEFORE 2.0 GA, without rebuilding the app. It HARDCODES the preview tag
+# below instead of using /releases/latest.
+#
+#   >>> FIX BEFORE MERGING release/2.0-multi-site -> main <<<
+#   Replace the hardcoded tag with real version handling (detect the server's
+#   version or accept --version; default to /releases/latest for stable).
+#   Until then, BUMP this tag on every new beta (beta.2, beta.3, ...).
+# ############################################################################
+RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/v2.0.0-beta.1"
 
 while [ $# -gt 0 ]; do
     case "$1" in

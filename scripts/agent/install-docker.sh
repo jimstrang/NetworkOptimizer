@@ -17,6 +17,19 @@
 #   --insecure       Accept a self-signed cert on the server's reverse proxy
 #   --dir PATH       Install directory (default: /opt/network-optimizer-agent)
 
+# ############################################################################
+# ##  ⚠️  TEMPORARY HACK — main ONLY. DO NOT SHIP TO STABLE 2.0 GA.  ⚠️      ##
+# ############################################################################
+# This script + docker/agent/docker-compose.yml live on `main` purely so the
+# 2.0.0-beta.1 agent-install one-liner (baked into the beta app image, fetched
+# from `main`) works BEFORE 2.0 GA without rebuilding the app. The compose it
+# pulls HARDCODES the preview image tag (agent:2.0.0-beta.1).
+#
+#   >>> FIX BEFORE MERGING release/2.0-multi-site -> main <<<
+#   Restore :latest / real version handling in docker-compose.yml, and detect
+#   the server version (or accept --version) here. BUMP the tag on every beta.
+# ############################################################################
+
 set -euo pipefail
 
 SERVER=""
