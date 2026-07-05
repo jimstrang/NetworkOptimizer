@@ -875,20 +875,6 @@ public class MonitoringCollectionAgent : BackgroundService
         }
         _liveStats.RecordPortClients(portClients);
 
-        // Diagnostic for the Port Statistics "Client" column on managed sites: how many wired
-        // clients actually carry the switch-port association (SwMac+SwPort) needed to map them
-        // to a port, and what keys we recorded. If mappable=0 on an agent-backed site while the
-        // home site is fine, the switch-port association isn't surviving the console-via-agent
-        // client fetch (cause A). If mappable>0 but the column is still empty, compare these
-        // SwMac keys against the SNMP-relay port-stats device MACs (cause B).
-        var mappable = clients.Count(c => c.IsWired && !string.IsNullOrEmpty(c.Mac)
-            && !string.IsNullOrEmpty(c.SwMac) && c.SwPort is int dsp && dsp > 0);
-        var statMacs = string.Join(", ", _liveStats.GetPortStatsSnapshot(null)
-            .Select(s => s.DeviceMac).Distinct().Take(6));
-        _logger.LogDebug("PORTCLIENT-DIAG site={Site}: wired={Wired} mappable(SwMac+SwPort)={Map} recorded={Rec} clientKeys=[{Keys}] statDeviceMacs=[{StatMacs}]",
-            _siteSlug, wiredCount, mappable, portClients.Count,
-            string.Join(", ", wiredByPort.Select(kv => $"{kv.Key.Item1}:{kv.Key.Item2}x{kv.Value.Count}")), statMacs);
-
         long tickOffset = 0; // nanosecond offset per client to avoid InfluxDB dedup
         foreach (var c in clients)
         {
@@ -1024,16 +1010,25 @@ public class MonitoringCollectionAgent : BackgroundService
                 LastUpdate = now,
             });
 
-            // Write to InfluxDB for historic playback (skip zero throughput)
+            // Write to InfluxDB for historic playback. Active clients always write;
+            // idle (zero-throughput) clients write only when they carry a switch-port
+            // association - the port-tagged presence is what lets playback show the
+            // Client column for a port even while the client is quiet.
             var swMac = NormalizeMac(c.SwMac ?? string.Empty);
-            if (!string.IsNullOrEmpty(swMac) && ((txBps ?? 0) > 0 || (rxBps ?? 0) > 0))
+            var swPort = c.SwPort is int sp && sp > 0 ? sp : (int?)null;
+            if (!string.IsNullOrEmpty(swMac) && ((txBps ?? 0) > 0 || (rxBps ?? 0) > 0 || swPort.HasValue))
             {
+                var displayName = !string.IsNullOrWhiteSpace(c.Name) ? c.Name
+                    : !string.IsNullOrWhiteSpace(c.Hostname) ? c.Hostname : c.Mac;
                 _ = _influx.WriteWiredClientAsync(
                     switchMac: swMac,
                     clientMac: clientMac,
                     txThroughputBps: txBps,
                     rxThroughputBps: rxBps,
-                    timestamp: now.AddTicks(tickOffset++));
+                    timestamp: now.AddTicks(tickOffset++),
+                    port: swPort,
+                    clientIp: c.BestIp,
+                    clientName: displayName);
             }
         }
 

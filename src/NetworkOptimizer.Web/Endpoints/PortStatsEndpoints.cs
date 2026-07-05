@@ -50,6 +50,16 @@ public static class PortStatsEndpoints
                 ? await influx.QueryPortStatsAsync(filterMacs, at.Value.ToUniversalTime(), ct)
                 : liveStats.GetPortStatsSnapshot(filterMacs);
 
+            // Historic scrub resolves the Client column from port-tagged wired_client
+            // points at the same instant; live keeps the in-memory map. Pre-2.0 history
+            // has no port tag and simply yields no client labels.
+            Dictionary<(string Mac, int Port), MonitoringInfluxClient.WiredPortClientPoint>? histClients = null;
+            if (at.HasValue)
+            {
+                histClients = (await influx.QueryWiredPortClientsAsync(filterMacs, at.Value.ToUniversalTime(), ct))
+                    .ToDictionary(p => (Norm(p.DeviceMac), p.Port));
+            }
+
             await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
 
             // Device display name + type ("ap" / "switch" / "gateway") from the fabric
@@ -116,15 +126,27 @@ public static class PortStatsEndpoints
                                 // Single wired client on this physical port (links to the
                                 // Client Dashboard). Keyed on the port's OWN number so a
                                 // VLAN sub-interface doesn't borrow the parent's client.
-                                var client = nm?.PortNumber is int pnum ? liveStats.GetPortClient(mac, pnum) : null;
+                                string? clientMac = null, clientIp = null, clientName = null;
+                                if (nm?.PortNumber is int pnum)
+                                {
+                                    if (histClients != null)
+                                    {
+                                        if (histClients.TryGetValue((mac, pnum), out var hc))
+                                            (clientMac, clientIp, clientName) = (hc.ClientMac, hc.ClientIp, hc.ClientName);
+                                    }
+                                    else if (liveStats.GetPortClient(mac, pnum) is { } lc)
+                                    {
+                                        (clientMac, clientIp, clientName) = (lc.Mac, lc.Ip, lc.Name);
+                                    }
+                                }
                                 return new
                                 {
                                     ifName = p.IfName,
                                     portId = p.PortId,
                                     portNumber,
-                                    connectedMac = client?.Mac,
-                                    connectedIp = client?.Ip,
-                                    connectedName = client?.Name,
+                                    connectedMac = clientMac,
+                                    connectedIp = clientIp,
+                                    connectedName = clientName,
                                     // Agent-resolved WAN/carrier label wins (e.g. gre1 ->
                                     // "WAN3 - AT&T Wireless"); otherwise the port_table /
                                     // sub-interface friendly name.

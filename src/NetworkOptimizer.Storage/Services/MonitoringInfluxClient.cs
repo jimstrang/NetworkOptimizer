@@ -569,7 +569,10 @@ public class MonitoringInfluxClient : IAsyncDisposable
         string clientMac,
         double? txThroughputBps,
         double? rxThroughputBps,
-        DateTime timestamp)
+        DateTime timestamp,
+        int? port = null,
+        string? clientIp = null,
+        string? clientName = null)
     {
         if (!IsConfigured) return Task.CompletedTask;
         var point = PointData.Measurement("wired_client")
@@ -577,11 +580,98 @@ public class MonitoringInfluxClient : IAsyncDisposable
             .Field("client_mac", NormalizeMac(clientMac))
             .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
 
+        // Port tag (additive, absent on pre-2.0 points): lets playback reconstruct
+        // which client sat on which port at a given instant (the Port Statistics
+        // Client column). Series growth is bounded by physical ports in use per
+        // device. client_ip / client_name are fields (no cardinality impact) so a
+        // historical scrub can label the client without consulting the live client
+        // registry, whose names may have drifted since.
+        if (port is > 0) point = point.Tag("port", port.Value.ToString());
+        if (!string.IsNullOrEmpty(clientIp)) point = point.Field("client_ip", clientIp);
+        if (!string.IsNullOrEmpty(clientName)) point = point.Field("client_name", clientName);
+
         if (txThroughputBps.HasValue) point = point.Field("tx_throughput_bps", txThroughputBps.Value);
         if (rxThroughputBps.HasValue) point = point.Field("rx_throughput_bps", rxThroughputBps.Value);
 
         Enqueue(point, longterm: false);
         return Task.CompletedTask;
+    }
+
+    /// <summary>A wired client resolved to a device port at a playback instant.</summary>
+    public class WiredPortClientPoint
+    {
+        public string DeviceMac { get; init; } = "";
+        public int Port { get; init; }
+        public string ClientMac { get; init; } = "";
+        public string? ClientIp { get; init; }
+        public string? ClientName { get; init; }
+    }
+
+    /// <summary>
+    /// The single wired client on each (device, port) around a historic instant,
+    /// from port-tagged <c>wired_client</c> points - the playback counterpart of
+    /// the live GetPortClient map. Ports that saw more than one distinct client
+    /// MAC in the window are omitted, matching the live map's rule of never
+    /// labelling an uplink/trunk with an arbitrary client. Points written before
+    /// the port tag existed (pre-2.0) carry no tag and simply yield no rows.
+    /// </summary>
+    public async Task<IReadOnlyList<WiredPortClientPoint>> QueryWiredPortClientsAsync(
+        IReadOnlyList<string>? deviceMacs,
+        DateTime at,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<WiredPortClientPoint>();
+
+        // Same snapshot window as QueryPortStatsAsync so the Client column lines up
+        // with the counters shown at the same scrub point.
+        var center = at.ToUniversalTime();
+        var rangeClause = $"range(start: {ToFluxInstant(center.AddSeconds(-90))}, stop: {ToFluxInstant(center.AddSeconds(30))})";
+
+        var macFilter = "";
+        if (deviceMacs != null && deviceMacs.Count > 0)
+        {
+            var macs = deviceMacs.Select(NormalizeMac).Distinct().ToList();
+            macFilter = "\n  |> filter(fn: (r) => " +
+                string.Join(" or ", macs.Select(m => $@"r.device_mac == ""{m}""")) + ")";
+        }
+
+        var flux = $@"
+from(bucket: ""{_bucket}"")
+  |> {rangeClause}
+  |> filter(fn: (r) => r._measurement == ""wired_client"")
+  |> filter(fn: (r) => exists r.port)
+  |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""client_ip"" or r._field == ""client_name""){macFilter}
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+";
+        var rows = new List<(string DeviceMac, int Port, DateTime Time, string ClientMac, string? Ip, string? Name)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            var deviceMac = record.GetValueByKey("device_mac") as string ?? "";
+            var clientMac = record.GetValueByKey("client_mac") as string ?? "";
+            if (deviceMac.Length == 0 || clientMac.Length == 0) continue;
+            if (!int.TryParse(record.GetValueByKey("port") as string, out var port) || port <= 0) continue;
+            rows.Add((deviceMac, port, ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
+                clientMac,
+                record.GetValueByKey("client_ip") as string,
+                record.GetValueByKey("client_name") as string));
+        }
+
+        var result = new List<WiredPortClientPoint>();
+        foreach (var group in rows.GroupBy(r => (r.DeviceMac, r.Port)))
+        {
+            if (group.Select(r => r.ClientMac).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 1)
+                continue; // multiple clients in the window - trunk/uplink, never label
+            var latest = group.OrderByDescending(r => r.Time).First();
+            result.Add(new WiredPortClientPoint
+            {
+                DeviceMac = latest.DeviceMac,
+                Port = latest.Port,
+                ClientMac = latest.ClientMac,
+                ClientIp = latest.Ip,
+                ClientName = latest.Name,
+            });
+        }
+        return result;
     }
 
     public Task WriteSfpAsync(
