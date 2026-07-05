@@ -78,11 +78,16 @@ public sealed class SpeedTestServer : IAsyncDisposable
 
         var server = new SpeedTestServer(app, relay, siteSlug);
 
-        // WAN speed test router: /wan/ redirects to the default external WAN test
+        // WAN speed test router: /wan/ goes to the default external WAN test
         // server, /wan/<server-ID>/ to that mapped server, forwarding query params
-        // (?Run, duration, ...). The redirect makes this agent the page's referrer,
-        // so the browser posts results back to this origin and the relay above
-        // stamps the site slug + real client LAN IP - no ?site= in any user URL.
+        // (?Run, duration, ...). This must be a tiny interstitial page that
+        // navigates client-side, NOT an HTTP 302: a redirect never makes the
+        // redirecting host the referrer (the Referer belongs to the document that
+        // initiated the navigation and just rides through the hop), while a
+        // document-initiated navigation from this page does. With the agent as
+        // the referrer origin, the browser posts results back to this origin and
+        // the relay above stamps the site slug + real client LAN IP - no ?site=
+        // in any user URL. The referrer meta pins the policy to origin-only.
         app.MapGet("/wan/{serverId?}", (string? serverId, HttpContext context) =>
             server.RedirectToWanServer(serverId, context));
 
@@ -113,7 +118,18 @@ public sealed class SpeedTestServer : IAsyncDisposable
                     "text/plain", statusCode: StatusCodes.Status404NotFound);
         }
 
-        return Results.Redirect(target.Url.TrimEnd('/') + "/" + context.Request.QueryString.Value);
+        var targetUrl = target.Url.TrimEnd('/') + "/" + context.Request.QueryString.Value;
+        // JSON-encode for a safe JS string literal; HTML-encode for the noscript href.
+        var jsTarget = System.Text.Json.JsonSerializer.Serialize(targetUrl);
+        var htmlTarget = System.Net.WebUtility.HtmlEncode(targetUrl);
+        return Results.Content($$"""
+            <!doctype html>
+            <html><head><meta charset="utf-8">
+            <meta name="referrer" content="strict-origin">
+            <title>Starting WAN speed test...</title></head>
+            <body><script>location.replace({{jsTarget}});</script>
+            <noscript><a href="{{htmlTarget}}">Continue to the WAN speed test</a></noscript></body></html>
+            """, "text/html");
     }
 
     private static void AddCorsHeaders(HttpContext context)
