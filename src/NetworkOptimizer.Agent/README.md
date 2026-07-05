@@ -52,6 +52,30 @@ Both scripts accept:
 - `--insecure` - accept a self-signed cert on the server's reverse proxy
 - `--dir PATH` - override the install directory
 
+### Speed test listener: TLS, plain HTTP, and reverse proxies
+
+The LAN speed test listener serves self-signed HTTPS by default (a secure
+context, so browser geolocation works for GPS-tagged results). Two supported
+deviations, and **both require updating the site's speed test URL override in
+the central app** (Settings > Multi-Site > the site's Configuration), because
+the app builds agent speed-test links as `https://<agent LAN IP>:3000` by
+default:
+
+- **Plain HTTP opt-out**: set `AGENT_SPEEDTEST_TLS=0` (an environment variable
+  on the Docker container, or in the environment when running
+  `install-native.sh`) to skip cert generation and serve HTTP on port 3000 -
+  e.g. to avoid the self-signed trust prompt or shave TLS overhead on a
+  high-throughput LAN. Then set the site's URL override to the matching
+  `http://<agent>:3000` address.
+- **Your own reverse proxy / TLS in front of the agent**: point the site's URL
+  override at the proxy's address (e.g. `https://speedtest.site.example.com`).
+  The auto-detected agent LAN IP would otherwise bypass your proxy and hit the
+  self-signed listener directly.
+
+If the two sides disagree (agent serving HTTP while the app links `https://`,
+or vice versa), the speed test page simply won't load - fix the URL override
+to match how the agent actually serves.
+
 Re-running either script updates the agent in place and preserves the enrolled
 key. To build from source instead (development, or an architecture without a
 published binary), see below.

@@ -3039,10 +3039,14 @@
                                                                        value="@ClientSpeedTestTarget(site.Id)"
                                                                        @onchange="e => SaveClientSpeedTestTarget(site, e.Value?.ToString())" />
                                                                 <small class="form-help">
-                                                                    The address browsers on this site hit for the LAN speed test, for when
-                                                                    the agent's auto-detected LAN IP isn't its client-facing address (e.g.
-                                                                    behind a reverse proxy). Leave blank to use the agent's detected
-                                                                    address. Doesn't affect the network path trace.
+                                                                    The address browsers on this site hit for the LAN and WAN speed test
+                                                                    pages. Set this whenever the agent's auto-detected https LAN IP isn't
+                                                                    how clients should reach it: a reverse proxy in front of the agent
+                                                                    (enter the proxy's https URL), or an agent serving plain http
+                                                                    (AGENT_SPEEDTEST_TLS=0 - enter the http:// URL). A bare IP or host
+                                                                    uses https on the agent port; a full URL is used exactly as entered.
+                                                                    Leave blank to use the agent's detected address. Doesn't affect the
+                                                                    network path trace.
                                                                 </small>
                                                             </div>
                                                         </div>

@@ -146,27 +146,41 @@ CFGJS
         curl -fsSL "$RAW/docker/agent/nginx.conf" -o "${INSTALL_DIR}/nginx-speedtest-server.conf"
         sed -i "s#root /usr/share/nginx/html;#root ${WEBROOT};#" "${INSTALL_DIR}/nginx-speedtest-server.conf"
 
-        # Persisted self-signed cert for the LAN speed test's TLS listener (secure context
-        # for the browser Geolocation API / GPS-tagged results, no per-site reverse proxy).
-        # SANs cover the host's LAN IPs + hostname; persisted so a client's browser trust
-        # exception survives restarts. Wire the cert paths into the server block.
-        CERTDIR="${INSTALL_DIR}/speedtest-tls"
-        mkdir -p "$CERTDIR"
-        if [ ! -f "$CERTDIR/cert.pem" ] && command -v openssl >/dev/null 2>&1; then
-            IPS=$(hostname -I 2>/dev/null || echo)
-            SAN="DNS:$(hostname),DNS:localhost"
-            for ip in $IPS; do SAN="$SAN,IP:$ip"; done
-            CN=$(echo "$IPS" | awk '{print $1}')
-            openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-                -keyout "$CERTDIR/key.pem" -out "$CERTDIR/cert.pem" \
-                -subj "/CN=${CN:-agent}" -addext "subjectAltName=$SAN" >/dev/null 2>&1 \
-                && chmod 600 "$CERTDIR/key.pem" \
-                || echo "WARNING: self-signed cert generation failed - the LAN speed test won't serve over TLS."
+        if [ "${AGENT_SPEEDTEST_TLS:-1}" = "0" ]; then
+            # Self-signed TLS opt-out (AGENT_SPEEDTEST_TLS=0 at install time): serve the
+            # speed test listener as plain http - for sites already behind their own
+            # reverse proxy / TLS, or shaving TLS overhead on high-throughput LANs. Strips
+            # ssl from the listener, drops the ssl_* directives, skips cert generation.
+            # The app side must then reach this agent via an http:// per-site speed-test
+            # URL override (the app defaults to https).
+            sed -i \
+                -e 's/^\([[:space:]]*listen[[:space:]][^;]*\) ssl\([^;]*;\)/\1\2/' \
+                -e '/^[[:space:]]*ssl_/d' \
+                "${INSTALL_DIR}/nginx-speedtest-server.conf"
+            echo "AGENT_SPEEDTEST_TLS=0 - LAN speed test will serve plain http on port 3000."
+        else
+            # Persisted self-signed cert for the LAN speed test's TLS listener (secure context
+            # for the browser Geolocation API / GPS-tagged results, no per-site reverse proxy).
+            # SANs cover the host's LAN IPs + hostname; persisted so a client's browser trust
+            # exception survives restarts. Wire the cert paths into the server block.
+            CERTDIR="${INSTALL_DIR}/speedtest-tls"
+            mkdir -p "$CERTDIR"
+            if [ ! -f "$CERTDIR/cert.pem" ] && command -v openssl >/dev/null 2>&1; then
+                IPS=$(hostname -I 2>/dev/null || echo)
+                SAN="DNS:$(hostname),DNS:localhost"
+                for ip in $IPS; do SAN="$SAN,IP:$ip"; done
+                CN=$(echo "$IPS" | awk '{print $1}')
+                openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                    -keyout "$CERTDIR/key.pem" -out "$CERTDIR/cert.pem" \
+                    -subj "/CN=${CN:-agent}" -addext "subjectAltName=$SAN" >/dev/null 2>&1 \
+                    && chmod 600 "$CERTDIR/key.pem" \
+                    || echo "WARNING: self-signed cert generation failed - the LAN speed test won't serve over TLS."
+            fi
+            sed -i \
+                -e "s#__CERTFILE__#${CERTDIR}/cert.pem#" \
+                -e "s#__KEYFILE__#${CERTDIR}/key.pem#" \
+                "${INSTALL_DIR}/nginx-speedtest-server.conf"
         fi
-        sed -i \
-            -e "s#__CERTFILE__#${CERTDIR}/cert.pem#" \
-            -e "s#__KEYFILE__#${CERTDIR}/key.pem#" \
-            "${INSTALL_DIR}/nginx-speedtest-server.conf"
 
         curl -fsSL "$RAW/docker/agent/nginx-standalone.conf" -o "${INSTALL_DIR}/nginx-speedtest.conf"
         sed -i \
