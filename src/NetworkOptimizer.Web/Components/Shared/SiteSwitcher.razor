@@ -74,6 +74,15 @@
         // cookie would never take effect. The fragment is meaningless on another site anyway.
         var target = NavigationManager.Uri;
         var fragmentAt = target.IndexOf('#');
-        NavigationManager.NavigateTo(fragmentAt >= 0 ? target[..fragmentAt] : target, forceLoad: true);
+        if (fragmentAt >= 0)
+            target = target[..fragmentAt];
+
+        // The all-sites overview isn't a per-site page, so switching sites from it
+        // should land on the new site's dashboard rather than reload the overview.
+        var relative = NavigationManager.ToBaseRelativePath(target).TrimEnd('/');
+        if (string.Equals(relative, "sites", StringComparison.OrdinalIgnoreCase))
+            target = NavigationManager.BaseUri;
+
+        NavigationManager.NavigateTo(target, forceLoad: true);
     }
 }
