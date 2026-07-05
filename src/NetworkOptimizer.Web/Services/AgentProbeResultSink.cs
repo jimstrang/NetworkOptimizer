@@ -655,6 +655,25 @@ public class AgentProbeResultSink
                                 mapping.LastUpdated = DateTime.UtcNow;
                             }
                         }
+                        // Heal rows for interfaces the agent no longer streams - same
+                        // sweep as the directly-monitored slow tier: a stored port
+                        // number that provably belongs to another interface is a relic
+                        // of the ungated numeric ifIndex match and would otherwise
+                        // stick forever once its interface leaves the sample set.
+                        var streamedNames = new HashSet<string>(ifNames, StringComparer.OrdinalIgnoreCase);
+                        foreach (var ((rowMac, rowIfName), row) in existingMaps)
+                        {
+                            if (rowMac != deviceGroup.Key || streamedNames.Contains(rowIfName)) continue;
+                            if (row.PortNumber is int staleClaim
+                                && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, rowIfName, staleClaim))
+                            {
+                                row.PortNumber = null;
+                                row.FriendlyName = null;
+                                row.IsSfp = null;
+                                row.LastUpdated = DateTime.UtcNow;
+                            }
+                        }
+
                         liveStats.RecordInterfaceLabels(deviceGroup.Key,
                             InterfaceLabelResolver.BuildLabels(device, console.Networks, ifNames));
                     }

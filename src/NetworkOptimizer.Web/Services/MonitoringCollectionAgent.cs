@@ -784,6 +784,29 @@ public class MonitoringCollectionAgent : BackgroundService
                     }
                 }
 
+                // Heal rows for interfaces this walk no longer returns (a gateway's
+                // dummy0 / ip_vti0 / bond0 era): a stored port number that provably
+                // belongs to another interface was written before the numeric ifIndex
+                // match was gated to entries without an ifname, and with the interface
+                // gone from the walk the update branch above never revisits the row -
+                // the false claim (and the name/SFP flag copied with it) would stick
+                // forever. Rows whose claim the port table doesn't contradict are
+                // never touched.
+                var walkedNames = new HashSet<string>(deviceIfNames, StringComparer.OrdinalIgnoreCase);
+                var deviceMacNorm = NormalizeMac(device.Mac);
+                foreach (var ((rowMac, rowIfName), row) in existingMaps)
+                {
+                    if (rowMac != deviceMacNorm || walkedNames.Contains(rowIfName)) continue;
+                    if (row.PortNumber is int staleClaim
+                        && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, rowIfName, staleClaim))
+                    {
+                        row.PortNumber = null;
+                        row.FriendlyName = null;
+                        row.IsSfp = null;
+                        row.LastUpdated = DateTime.UtcNow;
+                    }
+                }
+
                 // Resolve friendly interface labels (WANn - carrier, WireGuard, SQM,
                 // honeypot, ...) from the device config + networkconf and cache them for
                 // the Live View port table.
