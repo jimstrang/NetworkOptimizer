@@ -41,7 +41,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath \
 # runs the tunnel plus the loopback results relay.
 FROM mcr.microsoft.com/dotnet/runtime-deps:${DOTNET_VERSION}
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nginx iperf3 iputils-ping ca-certificates \
+    && apt-get install -y --no-install-recommends nginx iperf3 iputils-ping ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/default
 WORKDIR /app
 COPY --from=build /app/publish/NetworkOptimizer.Agent /app/NetworkOptimizer.Agent
@@ -58,11 +58,17 @@ COPY docker/agent/config.js /usr/share/nginx/html/assets/js/config.js
 # stays /usr/share/nginx/html (set in the server block).
 COPY docker/agent/nginx.conf /etc/nginx/netopt-speedtest-server.conf
 COPY docker/agent/nginx-standalone.conf /etc/nginx/netopt-speedtest.conf
+# The self-signed cert lives in the persisted /data volume so it survives restarts
+# (entrypoint.sh generates it once); wire the server block's cert paths to it.
 RUN sed -i \
         -e 's#__PIDFILE__#/run/nginx-speedtest.pid#' \
         -e 's#__ERRORLOG__#/dev/stderr#' \
         -e 's#__SERVERCONF__#/etc/nginx/netopt-speedtest-server.conf#' \
-        /etc/nginx/netopt-speedtest.conf
+        /etc/nginx/netopt-speedtest.conf \
+    && sed -i \
+        -e 's#__CERTFILE__#/data/speedtest-tls/cert.pem#' \
+        -e 's#__KEYFILE__#/data/speedtest-tls/key.pem#' \
+        /etc/nginx/netopt-speedtest-server.conf
 COPY docker/agent/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
