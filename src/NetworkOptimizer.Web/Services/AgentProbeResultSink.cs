@@ -421,7 +421,7 @@ public class AgentProbeResultSink
                 && deviceByMac.TryGetValue(NormalizeMac(sample.DeviceMac), out var aggDevice))
             {
                 var pIdx = InterfacePortCorrelation
-                    .Correlate(aggDevice.PortTable, ifIndex: 0, sample.SpeedBps, sample.PortId, sample.IfName)
+                    .Correlate(aggDevice.PortTable, sample.IfIndex, sample.SpeedBps, sample.PortId, sample.IfName)
                     .PortNumber ?? 0;
                 if (pIdx > 0)
                     fabric.SetSnmpPortRate(NormalizeMac(sample.DeviceMac), pIdx, calc.RateInBps.Value, calc.RateOutBps.Value);
@@ -566,7 +566,7 @@ public class AgentProbeResultSink
                             if (string.IsNullOrEmpty(sample.IfName)) continue;
                             ifNames.Add(sample.IfName);
                             var corr = InterfacePortCorrelation.Correlate(
-                                device.PortTable, ifIndex: 0, sample.SpeedBps, sample.PortId, sample.IfName);
+                                device.PortTable, sample.IfIndex, sample.SpeedBps, sample.PortId, sample.IfName);
                             var mapKey = (deviceGroup.Key, sample.IfName);
                             if (!existingMaps.TryGetValue(mapKey, out var mapping))
                             {
@@ -584,7 +584,21 @@ public class AgentProbeResultSink
                             else
                             {
                                 if (corr.FriendlyName != null) mapping.FriendlyName = corr.FriendlyName;
-                                if (corr.PortNumber.HasValue) mapping.PortNumber = corr.PortNumber;
+                                if (corr.PortNumber.HasValue)
+                                {
+                                    mapping.PortNumber = corr.PortNumber;
+                                }
+                                else if (mapping.PortNumber is int stale
+                                    && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, sample.IfName, stale))
+                                {
+                                    // Heal rows written before the numeric ifIndex match was
+                                    // gated to entries without an ifname: the stored number
+                                    // (and the friendly name / SFP flag copied with it)
+                                    // belongs to the interface the port_table entry names.
+                                    mapping.PortNumber = null;
+                                    mapping.FriendlyName = null;
+                                    mapping.IsSfp = null;
+                                }
                                 if (corr.LinkSpeedMbps.HasValue) mapping.SpeedMbps = corr.LinkSpeedMbps;
                                 if (corr.IsSfp.HasValue) mapping.IsSfp = corr.IsSfp;
                                 mapping.LastUpdated = DateTime.UtcNow;

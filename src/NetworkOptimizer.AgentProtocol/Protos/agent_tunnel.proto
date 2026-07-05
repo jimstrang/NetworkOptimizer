@@ -210,6 +210,9 @@ message SnmpInterfaceSample {
   // only on gateways) and mesh backhaul (vwiresta*) off this, matching the
   // directly-monitored path's iface.Description.
   string if_descr = 20;
+  // Raw SNMP ifIndex - the server correlates switch ports by PortIdx == ifIndex,
+  // matching the directly-monitored path's iface.Index. 0 when unknown (older agents).
+  int32 if_index = 21;
 }
 
 message SnmpDeviceHealthSample {

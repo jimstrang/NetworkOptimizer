@@ -720,47 +720,23 @@ public class MonitoringCollectionAgent : BackgroundService
                     deviceIfNames.Add(ifName);
                     var key = (NormalizeMac(device.Mac), ifName);
 
-                    // Map SNMP ifIndex to UniFi PortTable.PortIdx. Two strategies:
-                    //  - Switches: ifIndex == PortIdx (verified working on USW devices)
-                    //  - Gateways: ifIndex != PortIdx; PortTable.IfName joins to SNMP
-                    //    iface.Name (Linux name like "eth4"). Direct numeric match
-                    //    first, fall back to ifname match.
-                    // The matched port supplies BOTH the port number and the UniFi
-                    // friendly name, so gateways (which only resolve via the IfName
-                    // fallback) get a friendly name too, not just switches.
-                    SwitchPort? portMatch = null;
-                    if (device.PortTable != null)
-                    {
-                        if (iface.Index > 0)
-                            portMatch = device.PortTable.FirstOrDefault(p => p.PortIdx == iface.Index);
-                        if (portMatch == null && !string.IsNullOrEmpty(ifName))
-                        {
-                            portMatch = device.PortTable.FirstOrDefault(p =>
-                                !string.IsNullOrEmpty(p.IfName)
-                                && string.Equals(p.IfName, ifName, StringComparison.OrdinalIgnoreCase)
-                                && p.PortIdx > 0);
-                        }
-                    }
-                    int? portNumber = portMatch is { PortIdx: > 0 } ? portMatch.PortIdx : null;
-                    var friendlyName = string.IsNullOrEmpty(portMatch?.Name) ? null : portMatch.Name;
-                    var isSfp = portMatch?.SfpFound;
-
-                    // Link speed: "lower of the two wins". SNMP is fresh and correct on
-                    // switches, but a gateway inflates copper ports to their 10G capability
-                    // (ifHighSpeed/ifSpeed both report the max, not the negotiated rate).
-                    // Negotiated speed can never exceed SNMP's reported value, so when
-                    // UniFi's PortTable reports a lower negotiated speed we take it.
-                    int? snmpSpeedMbps = iface.HighSpeed > 0
-                        ? (int)iface.HighSpeed
-                        : (iface.Speed > 0 ? (int)(iface.Speed / 1_000_000) : (int?)null);
-                    int? unifiSpeedMbps = portMatch is { Speed: > 0 } ? portMatch.Speed : (int?)null;
-                    int? linkSpeedMbps = (snmpSpeedMbps, unifiSpeedMbps) switch
-                    {
-                        (null, null) => null,
-                        (null, var u) => u,
-                        (var s, null) => s,
-                        var (s, u) => Math.Min(s.Value, u.Value),
-                    };
+                    // Map SNMP ifIndex to UniFi PortTable.PortIdx via the shared
+                    // correlation helper (switches by ifIndex == PortIdx, gateways by
+                    // PortTable.IfName == the raw SNMP ifName; link speed is "lower of
+                    // the two wins" - see InterfacePortCorrelation). The matched port
+                    // supplies BOTH the port number and the UniFi friendly name, so
+                    // gateways (which only resolve via the IfName join) get a friendly
+                    // name too, not just switches.
+                    var corr = InterfacePortCorrelation.Correlate(
+                        device.PortTable,
+                        iface.Index,
+                        iface.HighSpeed > 0 ? iface.HighSpeed * 1_000_000 : iface.Speed,
+                        iface.PortId,
+                        ifName);
+                    int? portNumber = corr.PortNumber;
+                    var friendlyName = corr.FriendlyName;
+                    var isSfp = corr.IsSfp;
+                    int? linkSpeedMbps = corr.LinkSpeedMbps;
 
                     if (!existingMaps.TryGetValue(key, out var mapping))
                     {
@@ -788,7 +764,21 @@ public class MonitoringCollectionAgent : BackgroundService
                         mapping.IfAlias = iface.Description;
                         if (linkSpeedMbps.HasValue) mapping.SpeedMbps = linkSpeedMbps;
                         if (!string.IsNullOrEmpty(friendlyName)) mapping.FriendlyName = friendlyName;
-                        if (portNumber.HasValue) mapping.PortNumber = portNumber;
+                        if (portNumber.HasValue)
+                        {
+                            mapping.PortNumber = portNumber;
+                        }
+                        else if (mapping.PortNumber is int stale
+                            && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, mapping.IfName, stale))
+                        {
+                            // Heal rows written before the numeric ifIndex match was gated
+                            // to entries without an ifname: the stored number (and the
+                            // friendly name / SFP flag copied with it) belongs to the
+                            // interface the port_table entry names, not this one.
+                            mapping.PortNumber = null;
+                            mapping.FriendlyName = null;
+                            mapping.IsSfp = null;
+                        }
                         if (isSfp.HasValue) mapping.IsSfp = isSfp;
                         mapping.LastUpdated = DateTime.UtcNow;
                     }

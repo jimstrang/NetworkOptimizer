@@ -111,6 +111,7 @@ public sealed class SnmpRunner
                             IfName = ifName,
                             IfDescr = iface.Description ?? "",
                             PortId = iface.PortId ?? "",
+                            IfIndex = iface.Index,
                             InOctets = iface.InOctets,
                             OutOctets = iface.OutOctets,
                             SpeedBps = iface.ResolvedSpeedBps,

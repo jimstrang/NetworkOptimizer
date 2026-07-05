@@ -18,7 +18,12 @@ namespace NetworkOptimizer.UniFi;
 /// Match strategy (same "two strategies" the slow tier documents):
 ///   1. ifIndex == port_idx - verified on UniFi switches, where SNMP ifIndex equals
 ///      the port index. Skipped when ifIndex is unknown (0), e.g. an agent that
-///      streams only the Linux ifname.
+///      streams only the Linux ifname. Only entries that do NOT declare a Linux
+///      ifname participate: gateway port_table entries carry ifname (their
+///      authoritative join), and on gateways ifIndex != port_idx, so a numeric
+///      match against such an entry is a coincidental collision (e.g. a gateway's
+///      dummy0 at ifIndex 2 must not claim the port_idx-2 entry that belongs to
+///      eth1).
 ///   2. port_table.ifname == the interface's Linux ifname - the stable join UniFi
 ///      exposes for gateways (whose ifIndex != port_idx). The raw SNMP ifname is
 ///      tried first, then the monitored name, since a gateway physical port with no
@@ -86,7 +91,7 @@ public static class InterfacePortCorrelation
 
         SwitchPort? match = null;
         if (ifIndex > 0)
-            match = portTable.FirstOrDefault(p => p.PortIdx == ifIndex);
+            match = portTable.FirstOrDefault(p => string.IsNullOrEmpty(p.IfName) && p.PortIdx == ifIndex);
         match ??= MatchByIfName(portTable, rawIfName);
         match ??= MatchByIfName(portTable, monitoredIfName);
         return match;
@@ -99,5 +104,24 @@ public static class InterfacePortCorrelation
             !string.IsNullOrEmpty(p.IfName)
             && string.Equals(p.IfName, ifName, StringComparison.OrdinalIgnoreCase)
             && p.PortIdx > 0);
+    }
+
+    /// <summary>
+    /// True when a previously stored port number provably belongs to a different
+    /// interface: the port_table entry with that port_idx declares a Linux ifname
+    /// that is not this interface. Callers use this to heal InterfaceNameMap rows
+    /// written before the numeric ifIndex match was gated to entries without an
+    /// ifname (a gateway's dummy0 at ifIndex 2 used to claim eth1's port_idx-2
+    /// entry). Never true for switch-style entries (no ifname), so a correct
+    /// switch correlation is never cleared.
+    /// </summary>
+    public static bool PortNumberBelongsToOtherInterface(
+        IReadOnlyList<SwitchPort>? portTable, string? ifName, int portNumber)
+    {
+        if (portTable == null || string.IsNullOrEmpty(ifName)) return false;
+        var owner = portTable.FirstOrDefault(p => p.PortIdx == portNumber);
+        return owner != null
+            && !string.IsNullOrEmpty(owner.IfName)
+            && !string.Equals(owner.IfName, ifName, StringComparison.OrdinalIgnoreCase);
     }
 }
