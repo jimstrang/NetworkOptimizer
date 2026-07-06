@@ -88,6 +88,22 @@ public class TransitAsnCandidate
     public double? VerifiedRttMs { get; set; }
     /// <summary>For PathProxy tier: the CDN endpoint we monitor as a proxy for this ASN.</summary>
     public string? PathProxyTarget { get; set; }
+
+    /// <summary>
+    /// Which contiguous hop-number run of this ASN the hop belongs to (0 = the run
+    /// nearest the gateway). An ASN commonly appears twice in a path - ingress POP
+    /// near the access network, egress far side - and auto-selection picks the
+    /// lowest verified-RTT reachable hop per clump so both ends get monitored.
+    /// </summary>
+    public int ClumpIndex { get; set; }
+
+    /// <summary>
+    /// True when this candidate matched an existing monitoring target during
+    /// reconcile and inherited its enabled state. Post-verification auto-selection
+    /// skips ASNs with preserved members so rediscovery never overrides the user's
+    /// stored choices.
+    /// </summary>
+    public bool PreservedFromExisting { get; set; }
 }
 
 /// <summary>One CDN traceroute summary for the live progress UI.</summary>

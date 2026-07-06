@@ -1034,18 +1034,33 @@ public class UpstreamTracerService
         foreach (var group in transitGroups)
         {
             // Per-ASN selection: the parallel ICMP+UDP sweep already captured every
-            // hop that responded, so the chosen target is just the lowest-hop entry
-            // in this ASN. TCP/443 probing was considered as a fallback for ASNs with
-            // no responders but rejected: (1) we have 10k+ users and SYN-probing
-            // transit routers looks like scanning to NOCs; (2) transit routers don't
+            // hop that responded; candidates come from those responders, clumped
+            // below. TCP/443 probing was considered as a fallback for ASNs with
+            // no responders but rejected: (1) SYN-probing transit routers from
+            // every install looks like scanning to NOCs; (2) transit routers don't
             // serve 443 so a RST doesn't reflect anything real; (3) ACLs drop most
             // of them silently anyway. The path-proxy block below covers unenumerated
             // transit ASNs cleanly by monitoring the CDN destination instead.
             var asn = group.First().Asn!;
-            var hopsInOrder = group.OrderBy(h => h.HopNumber).Take(3).ToList();
 
-            foreach (var hop in hopsInOrder)
+            // An ASN often shows up as two separate runs in the path: an ingress POP
+            // near the access network and an egress run on the far side. Split the
+            // ASN's hops into contiguous hop-number clumps and carry the first two so
+            // both ends can be monitored; auto-selection is provisional here (first
+            // hop per clump) and is refined to the lowest verified-RTT reachable hop
+            // per clump after the reachability pass.
+            var hopsInOrder = group.OrderBy(h => h.HopNumber).ToList();
+            var clumpIndexes = AssignClumpIndexes(hopsInOrder.Select(h => h.HopNumber).ToList());
+            var perClumpCount = new Dictionary<int, int>();
+            for (var i = 0; i < hopsInOrder.Count; i++)
             {
+                var clump = clumpIndexes[i];
+                if (clump >= MaxClumpsPerAsn) break;
+                perClumpCount.TryGetValue(clump, out var taken);
+                if (taken >= MaxCandidatesPerClump) continue;
+                perClumpCount[clump] = taken + 1;
+
+                var hop = hopsInOrder[i];
                 candidates.Add(new TransitAsnCandidate
                 {
                     AsnNumber = asn.Asn,
@@ -1055,7 +1070,8 @@ public class UpstreamTracerService
                     HopAddress = hop.Address,
                     HopHostname = hop.Hostname,
                     RespondedTo = hop.RespondedTo,
-                    Enabled = hop == hopsInOrder.First()
+                    ClumpIndex = clump,
+                    Enabled = taken == 0
                 });
             }
         }
@@ -1135,6 +1151,7 @@ public class UpstreamTracerService
             if (existingByAddress.TryGetValue(addr, out var existing))
             {
                 c.Enabled = existing.Enabled;
+                c.PreservedFromExisting = true;
                 if (!string.IsNullOrEmpty(existing.Name))
                     c.Label = existing.Name;
             }
@@ -1156,6 +1173,57 @@ public class UpstreamTracerService
         State.CurrentActivity = candidates.Count > 0
             ? $"Discovered {transitCount} transit ASN(s) and {proxyCount} path-end target(s)."
             : "No transit ASNs or path-end targets identified.";
+    }
+
+    /// <summary>Contiguous hop-number runs kept per transit ASN (near ingress + far egress).</summary>
+    internal const int MaxClumpsPerAsn = 2;
+
+    /// <summary>Responding hops carried as candidates within each clump.</summary>
+    internal const int MaxCandidatesPerClump = 3;
+
+    /// <summary>
+    /// Assigns a clump index to each entry of an ascending hop-number list: a gap of
+    /// more than one hop starts a new clump. Equal or adjacent hop numbers (ECMP
+    /// siblings, consecutive routers) share a clump.
+    /// </summary>
+    internal static IReadOnlyList<int> AssignClumpIndexes(IReadOnlyList<int> orderedHopNumbers)
+    {
+        var indexes = new int[orderedHopNumbers.Count];
+        var clump = 0;
+        for (var i = 1; i < orderedHopNumbers.Count; i++)
+        {
+            if (orderedHopNumbers[i] - orderedHopNumbers[i - 1] > 1) clump++;
+            indexes[i] = clump;
+        }
+        return indexes;
+    }
+
+    /// <summary>
+    /// Post-verification auto-selection: per transit ASN and per clump, enables the
+    /// lowest verified-RTT hop that cleared the reachability gate and disables the
+    /// rest of the clump. ASNs with any candidate reconciled from existing targets
+    /// are left untouched so rediscovery never overrides stored user choices; clumps
+    /// with no gate-clearing hop end up with nothing enabled, which is what lets the
+    /// downstream witness/fallback injection step in for the ASN.
+    /// </summary>
+    internal static void ApplyTransitClumpSelection(IEnumerable<TransitAsnCandidate> candidates)
+    {
+        var byAsn = candidates
+            .Where(c => c.Method == DiscoveryMethod.DirectRouter)
+            .GroupBy(c => c.AsnNumber);
+        foreach (var asnGroup in byAsn)
+        {
+            if (asnGroup.Any(c => c.PreservedFromExisting)) continue;
+            foreach (var clump in asnGroup.GroupBy(c => c.ClumpIndex))
+            {
+                var winner = clump
+                    .Where(c => !c.Unreachable && c.VerifiedRttMs.HasValue)
+                    .OrderBy(c => c.VerifiedRttMs!.Value)
+                    .FirstOrDefault();
+                foreach (var c in clump)
+                    c.Enabled = c == winner;
+            }
+        }
     }
 
     // Reachability gate: a candidate must answer enough pings in a short rapid burst (200 ms
@@ -1217,6 +1285,13 @@ public class UpstreamTracerService
                     result.Received, result.Sent, t.Address, minSuccesses);
             }
         }
+
+        // With verified RTTs in hand, refine the provisional per-clump picks: enable
+        // the lowest-RTT hop that cleared the gate in each of an ASN's clumps (near
+        // ingress + far egress), instead of blindly keeping the lowest hop number.
+        // Runs before witness injection so an ASN that ends up with a selection
+        // doesn't also get a witness.
+        ApplyTransitClumpSelection(State.TransitAsns);
 
         // Item A: if Level 3 (AS3356) is on the path but no AS3356 router cleared the gate, inject
         // 4.2.2.2 as a transit witness so ISP Health still has Lumen transit data.
