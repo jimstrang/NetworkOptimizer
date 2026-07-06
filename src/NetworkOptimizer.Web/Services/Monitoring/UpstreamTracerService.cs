@@ -1043,24 +1043,16 @@ public class UpstreamTracerService
             // transit ASNs cleanly by monitoring the CDN destination instead.
             var asn = group.First().Asn!;
 
-            // An ASN often shows up as two separate runs in the path: an ingress POP
-            // near the access network and an egress run on the far side. Split the
-            // ASN's hops into contiguous hop-number clumps and carry the first two so
-            // both ends can be monitored; auto-selection is provisional here (first
-            // hop per clump) and is refined to the lowest verified-RTT reachable hop
-            // per clump after the reachability pass.
-            var hopsInOrder = group.OrderBy(h => h.HopNumber).ToList();
-            var clumpIndexes = AssignClumpIndexes(hopsInOrder.Select(h => h.HopNumber).ToList());
-            var perClumpCount = new Dictionary<int, int>();
-            for (var i = 0; i < hopsInOrder.Count; i++)
+            // An ASN's run typically spans its ingress POP near the access network
+            // and, several ms later, a distant egress POP - hop numbers stay
+            // consecutive across that geography, so the clump boundary can only be
+            // seen in RTT. Carry the nearest responders as candidates; selection is
+            // provisional here (nearest hop) and is refined after the reachability
+            // pass, which splits the run into RTT clumps and enables the lowest
+            // verified-RTT gate-clearing hop in each.
+            var hopsInOrder = group.OrderBy(h => h.HopNumber).Take(MaxTransitCandidatesPerAsn).ToList();
+            foreach (var hop in hopsInOrder)
             {
-                var clump = clumpIndexes[i];
-                if (clump >= MaxClumpsPerAsn) break;
-                perClumpCount.TryGetValue(clump, out var taken);
-                if (taken >= MaxCandidatesPerClump) continue;
-                perClumpCount[clump] = taken + 1;
-
-                var hop = hopsInOrder[i];
                 candidates.Add(new TransitAsnCandidate
                 {
                     AsnNumber = asn.Asn,
@@ -1070,8 +1062,8 @@ public class UpstreamTracerService
                     HopAddress = hop.Address,
                     HopHostname = hop.Hostname,
                     RespondedTo = hop.RespondedTo,
-                    ClumpIndex = clump,
-                    Enabled = taken == 0
+                    HopNumber = hop.HopNumber,
+                    Enabled = hop == hopsInOrder.First()
                 });
             }
         }
@@ -1175,36 +1167,29 @@ public class UpstreamTracerService
             : "No transit ASNs or path-end targets identified.";
     }
 
-    /// <summary>Contiguous hop-number runs kept per transit ASN (near ingress + far egress).</summary>
+    /// <summary>RTT clumps monitored per transit ASN (near ingress + far egress).</summary>
     internal const int MaxClumpsPerAsn = 2;
 
-    /// <summary>Responding hops carried as candidates within each clump.</summary>
-    internal const int MaxCandidatesPerClump = 3;
+    /// <summary>Responding hops carried as candidates per transit ASN.</summary>
+    internal const int MaxTransitCandidatesPerAsn = 6;
+
+    /// <summary>Minimum RTT step (ms) that starts a new clump within an ASN's run.</summary>
+    internal const double RttClumpStepFloorMs = 2.0;
+
+    /// <summary>Fractional RTT step that starts a new clump, for high-RTT paths where a few ms is noise.</summary>
+    internal const double RttClumpStepFraction = 0.15;
 
     /// <summary>
-    /// Assigns a clump index to each entry of an ascending hop-number list: a gap of
-    /// more than one hop starts a new clump. Equal or adjacent hop numbers (ECMP
-    /// siblings, consecutive routers) share a clump.
-    /// </summary>
-    internal static IReadOnlyList<int> AssignClumpIndexes(IReadOnlyList<int> orderedHopNumbers)
-    {
-        var indexes = new int[orderedHopNumbers.Count];
-        var clump = 0;
-        for (var i = 1; i < orderedHopNumbers.Count; i++)
-        {
-            if (orderedHopNumbers[i] - orderedHopNumbers[i - 1] > 1) clump++;
-            indexes[i] = clump;
-        }
-        return indexes;
-    }
-
-    /// <summary>
-    /// Post-verification auto-selection: per transit ASN and per clump, enables the
-    /// lowest verified-RTT hop that cleared the reachability gate and disables the
-    /// rest of the clump. ASNs with any candidate reconciled from existing targets
-    /// are left untouched so rediscovery never overrides stored user choices; clumps
-    /// with no gate-clearing hop end up with nothing enabled, which is what lets the
-    /// downstream witness/fallback injection step in for the ASN.
+    /// Post-verification auto-selection: orders each transit ASN's gate-clearing hops
+    /// by hop number, splits the run into clumps where the verified RTT steps up by
+    /// more than max(<see cref="RttClumpStepFloorMs"/>, <see cref="RttClumpStepFraction"/>
+    /// of the previous hop) - the signature of the long-haul link between two of the
+    /// ASN's POPs, since hop numbers stay consecutive across that geography - and
+    /// enables the lowest-RTT hop in each of the first <see cref="MaxClumpsPerAsn"/>
+    /// clumps. ASNs with any candidate reconciled from existing targets are left
+    /// untouched so rediscovery never overrides stored user choices; ASNs with no
+    /// gate-clearing hop end up with nothing enabled, which is what lets the
+    /// downstream witness/fallback injection step in.
     /// </summary>
     internal static void ApplyTransitClumpSelection(IEnumerable<TransitAsnCandidate> candidates)
     {
@@ -1214,15 +1199,36 @@ public class UpstreamTracerService
         foreach (var asnGroup in byAsn)
         {
             if (asnGroup.Any(c => c.PreservedFromExisting)) continue;
-            foreach (var clump in asnGroup.GroupBy(c => c.ClumpIndex))
+
+            var reachable = asnGroup
+                .Where(c => !c.Unreachable && c.VerifiedRttMs.HasValue)
+                .OrderBy(c => c.HopNumber)
+                .ToList();
+
+            var winners = new HashSet<TransitAsnCandidate>();
+            var clump = new List<TransitAsnCandidate>();
+            var clumpsClosed = 0;
+            foreach (var c in reachable)
             {
-                var winner = clump
-                    .Where(c => !c.Unreachable && c.VerifiedRttMs.HasValue)
-                    .OrderBy(c => c.VerifiedRttMs!.Value)
-                    .FirstOrDefault();
-                foreach (var c in clump)
-                    c.Enabled = c == winner;
+                if (clump.Count > 0)
+                {
+                    var prevRtt = clump[^1].VerifiedRttMs!.Value;
+                    var step = c.VerifiedRttMs!.Value - prevRtt;
+                    if (step > Math.Max(RttClumpStepFloorMs, prevRtt * RttClumpStepFraction))
+                    {
+                        winners.Add(clump.OrderBy(x => x.VerifiedRttMs!.Value).First());
+                        clumpsClosed++;
+                        clump.Clear();
+                        if (clumpsClosed >= MaxClumpsPerAsn) break;
+                    }
+                }
+                clump.Add(c);
             }
+            if (clump.Count > 0 && clumpsClosed < MaxClumpsPerAsn)
+                winners.Add(clump.OrderBy(x => x.VerifiedRttMs!.Value).First());
+
+            foreach (var c in asnGroup)
+                c.Enabled = winners.Contains(c);
         }
     }
 

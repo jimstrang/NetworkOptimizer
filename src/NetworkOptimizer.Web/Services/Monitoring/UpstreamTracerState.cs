@@ -90,12 +90,11 @@ public class TransitAsnCandidate
     public string? PathProxyTarget { get; set; }
 
     /// <summary>
-    /// Which contiguous hop-number run of this ASN the hop belongs to (0 = the run
-    /// nearest the gateway). An ASN commonly appears twice in a path - ingress POP
-    /// near the access network, egress far side - and auto-selection picks the
-    /// lowest verified-RTT reachable hop per clump so both ends get monitored.
+    /// Trace hop number of this candidate, used by post-verification auto-selection
+    /// to order an ASN's hops and split them into RTT clumps (an ASN's run typically
+    /// spans its ingress POP and, several ms later, a distant egress POP).
     /// </summary>
-    public int ClumpIndex { get; set; }
+    public int HopNumber { get; set; }
 
     /// <summary>
     /// True when this candidate matched an existing monitoring target during
