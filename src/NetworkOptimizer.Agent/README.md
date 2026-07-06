@@ -76,6 +76,13 @@ If the two sides disagree (agent serving HTTP while the app links `https://`,
 or vice versa), the speed test page simply won't load - fix the URL override
 to match how the agent actually serves.
 
+Note for the plain-HTTP opt-out: browsers block an https page from posting to
+an `http://` LAN address (mixed content), so an HTTP-mode agent cannot receive
+the WAN speed test post-back from an external test server - WAN results on
+that site lose their client attribution. The opt-out is intended for LAN
+speed tests (same-origin) only; keep TLS on agents whose sites run WAN tests
+through `/wan/`.
+
 Re-running either script updates the agent in place and preserves the enrolled
 key. To build from source instead (development, or an architecture without a
 published binary), see below.
