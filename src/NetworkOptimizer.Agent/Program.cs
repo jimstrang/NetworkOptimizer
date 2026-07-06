@@ -70,7 +70,14 @@ var lanIp = NetworkOptimizer.Core.Helpers.NetworkUtilities.DetectLocalIpFromInte
 var handler = new HttpClientHandler();
 if (config.IgnoreSslErrors)
     handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-using var http = new HttpClient(handler) { BaseAddress = new Uri(config.ServerUrl.TrimEnd('/') + "/") };
+// Short timeout: this client only carries enrollment and heartbeats. The
+// default 100s meant a heartbeat against a powered-off server host (SYN black
+// hole, e.g. NAS maintenance) hung for the full 100s per reconnect attempt.
+using var http = new HttpClient(handler)
+{
+    BaseAddress = new Uri(config.ServerUrl.TrimEnd('/') + "/"),
+    Timeout = TimeSpan.FromSeconds(15)
+};
 
 // Enroll once: exchange the one-time token for a persistent agent key
 if (string.IsNullOrEmpty(config.AgentKey))
@@ -188,7 +195,7 @@ while (!cts.IsCancellationRequested)
             await tunnel.RunAsync(config.TunnelUrl, config.AgentKey!, version, lanIp, config.IgnoreSslErrors, cts.Token);
             Console.Error.WriteLine("Tunnel closed by server, reconnecting...");
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
             break;
         }
@@ -212,7 +219,12 @@ while (!cts.IsCancellationRequested)
         else if (!response.IsSuccessStatusCode)
             Console.Error.WriteLine($"Heartbeat failed: {response.StatusCode}");
     }
-    catch (OperationCanceledException)
+    // The when-guard matters: HttpClient's timeout surfaces as TaskCanceledException
+    // (an OperationCanceledException), so an unguarded catch here mistook a timed-out
+    // heartbeat for shutdown and exited the reconnect loop - permanently, since the
+    // shutdown path then awaited the still-running iperf3 task. That zombied every
+    // agent whose server host was powered off long enough to black-hole a heartbeat.
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
     {
         break;
     }

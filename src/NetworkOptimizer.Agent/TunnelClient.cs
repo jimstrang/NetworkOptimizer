@@ -89,6 +89,10 @@ public sealed class TunnelClient
             // The application heartbeat (~30s, agent -> server) keeps NAT/firewall
             // state warm instead.
             EnableMultipleHttp2Connections = true,
+            // Without a cap, dialing a powered-off server host rides the OS's TCP
+            // SYN retries for ~2 minutes per attempt, stretching the reconnect
+            // cadence from ~30s to minutes while the server is coming back up.
+            ConnectTimeout = TimeSpan.FromSeconds(15),
         };
         if (ignoreSslErrors)
         {
