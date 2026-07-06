@@ -29,7 +29,7 @@ SERVICE_NAME="netopt-agent"
 # ############################################################################
 # ##  ⚠️  TEMPORARY HACK — main ONLY. DO NOT SHIP TO STABLE 2.0 GA.  ⚠️      ##
 # ############################################################################
-# This script lives on `main` purely so the 2.0.0-beta.2 agent-install one-liner
+# This script lives on `main` purely so the 2.0.0-beta.3 agent-install one-liner
 # (which is baked into the beta app image and fetches this file from `main`)
 # works BEFORE 2.0 GA, without rebuilding the app. It HARDCODES the preview tag
 # below instead of using /releases/latest.
@@ -39,7 +39,7 @@ SERVICE_NAME="netopt-agent"
 #   version or accept --version; default to /releases/latest for stable).
 #   Until then, BUMP this tag on every new beta (beta.2, beta.3, ...).
 # ############################################################################
-RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/v2.0.0-beta.2"
+RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/v2.0.0-beta.3"
 
 while [ $# -gt 0 ]; do
     case "$1" in
