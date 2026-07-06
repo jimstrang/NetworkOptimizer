@@ -91,11 +91,11 @@ function buildOpts() {
                 }
                 rows.sort((a, b) => b.v - a.v);
                 const when = ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
-                return (when ? '<div class="apexcharts-tooltip-title">' + esc(when) + '</div>' : '')
+                return (when ? '<div class="apexcharts-tooltip-title" style="font-family:Helvetica, Arial, sans-serif;font-size:12px">' + esc(when) + '</div>' : '')
                     + rows.map(r =>
                         '<div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex">'
                         + '<span class="apexcharts-tooltip-marker" style="background-color:' + r.color + ';border-radius:50%;width:12px;height:12px"></span>'
-                        + '<div class="apexcharts-tooltip-text"><div class="apexcharts-tooltip-y-group">'
+                        + '<div class="apexcharts-tooltip-text" style="font-family:Helvetica, Arial, sans-serif;font-size:12px"><div class="apexcharts-tooltip-y-group">'
                         + '<span class="apexcharts-tooltip-text-y-label">' + esc(r.name) + ': </span>'
                         + '<span class="apexcharts-tooltip-text-y-value">' + esc(fmt(r.v)) + '</span>'
                         + '</div></div></div>').join('');
