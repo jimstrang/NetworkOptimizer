@@ -134,11 +134,14 @@ function valueSortedTooltip({ series, dataPointIndex, w }) {
     }
     rows.sort((a, b) => b.v - a.v);
     const when = ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) : '';
-    return '<div class="isp-rtt-tt">'
-        + (when ? '<div class="isp-rtt-tt-x">' + esc(when) + '</div>' : '')
-        + rows.map(r => '<div class="isp-rtt-tt-row"><span class="isp-rtt-tt-dot" style="background:' + r.color + '"></span>'
-            + esc(r.name) + ': <b>' + esc(fmt(r.v)) + '</b></div>').join('')
-        + '</div>';
+    return (when ? '<div class="apexcharts-tooltip-title">' + esc(when) + '</div>' : '')
+        + rows.map(r =>
+            '<div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex">'
+            + '<span class="apexcharts-tooltip-marker" style="background-color:' + r.color + ';border-radius:50%;width:12px;height:12px"></span>'
+            + '<div class="apexcharts-tooltip-text"><div class="apexcharts-tooltip-y-group">'
+            + '<span class="apexcharts-tooltip-text-y-label">' + esc(r.name) + ': </span>'
+            + '<span class="apexcharts-tooltip-text-y-value">' + esc(fmt(r.v)) + '</span>'
+            + '</div></div></div>').join('');
 }
 
 function buildRttOpts() {

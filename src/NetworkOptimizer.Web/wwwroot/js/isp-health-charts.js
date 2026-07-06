@@ -80,6 +80,7 @@ function buildOpts() {
             // chart lines at the hovered instant (highest line = first row).
             custom({ series, dataPointIndex, w }) {
                 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+                const fmt = v => v.toFixed(1) + ' ms';
                 const rows = [];
                 let ts = null;
                 for (let i = 0; i < series.length; i++) {
@@ -90,11 +91,14 @@ function buildOpts() {
                 }
                 rows.sort((a, b) => b.v - a.v);
                 const when = ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
-                return '<div class="isp-rtt-tt">'
-                    + (when ? '<div class="isp-rtt-tt-x">' + esc(when) + '</div>' : '')
-                    + rows.map(r => '<div class="isp-rtt-tt-row"><span class="isp-rtt-tt-dot" style="background:' + r.color + '"></span>'
-                        + esc(r.name) + ': <b>' + r.v.toFixed(1) + ' ms</b></div>').join('')
-                    + '</div>';
+                return (when ? '<div class="apexcharts-tooltip-title">' + esc(when) + '</div>' : '')
+                    + rows.map(r =>
+                        '<div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex">'
+                        + '<span class="apexcharts-tooltip-marker" style="background-color:' + r.color + ';border-radius:50%;width:12px;height:12px"></span>'
+                        + '<div class="apexcharts-tooltip-text"><div class="apexcharts-tooltip-y-group">'
+                        + '<span class="apexcharts-tooltip-text-y-label">' + esc(r.name) + ': </span>'
+                        + '<span class="apexcharts-tooltip-text-y-value">' + esc(fmt(r.v)) + '</span>'
+                        + '</div></div></div>').join('');
             },
         },
         noData: { text: 'No path data in the last 24 hours', style: { color: '#64748b' } },
