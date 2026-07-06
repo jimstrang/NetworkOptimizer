@@ -2973,6 +2973,38 @@ else
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
+        // The chart containers only exist while the console is connected - the whole
+        // tab region renders behind the connection banner. Without this guard, a page
+        // opened during a console outage (agent-backed site waiting for its tunnel,
+        // app restart) "mounts" its charts against a container that isn't in the DOM,
+        // the mounted flag sticks, and when the console connects the fresh empty
+        // containers never get their JS - blank charts until a tab switch happens to
+        // reset the flags. Reset them here so the connected render remounts cleanly;
+        // the same path also tears the modules down when the console drops mid-session
+        // (Blazor destroyed their DOM with the region swap).
+        if (!ConnectionService.IsConnected)
+        {
+            if (_mapMounted || _map2dMounted || _wanLiveChartMounted || _portStatsMounted
+                || _latencyChartsMounted || _healthChartsMounted || _sfpChartsMounted
+                || _cellularChartsMounted || _cmChartsMounted || _ontChartsMounted)
+            {
+                _mapMounted = _map2dMounted = _wanLiveChartMounted = _portStatsMounted = false;
+                _latencyChartsMounted = _healthChartsMounted = _sfpChartsMounted = false;
+                _cellularChartsMounted = _cmChartsMounted = _ontChartsMounted = false;
+                try
+                {
+                    await JS.InvokeVoidAsync("eval",
+                        "window.__lanFlowMap?.unmount(); window.__lanFlowMap2d?.unmount();" +
+                        "window.__wanLiveChart?.unmount(); window.__portStatsTable?.unmount();" +
+                        "window.__latencyCharts?.unmount(); window.__healthCharts?.unmount();" +
+                        "window.__sfpCharts?.unmount(); window.__cellularCharts?.unmount();" +
+                        "window.__cmCharts?.unmount(); window.__ontCharts?.unmount();");
+                }
+                catch { }
+            }
+            return;
+        }
+
         // Auto-expand the SNMP Devices table after the Live-tab banner jumps here.
         if (_pendingExpandSnmpCard && _activeTab == "setup" && _snmpDeviceCard != null)
         {

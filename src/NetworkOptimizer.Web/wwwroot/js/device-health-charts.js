@@ -73,10 +73,33 @@ function baseOpts(height, yTitle, yFormatter, extra) {
         },
         grid: { borderColor: '#374151', strokeDashArray: 3 },
         legend: { show: false },
-        tooltip: { theme: 'dark', shared: true, x: { format: 'MMM dd, HH:mm:ss' } },
+        tooltip: { theme: 'dark', shared: true, x: { format: 'MMM dd, HH:mm:ss' }, custom: valueSortedTooltip },
         noData: { text: 'No data in this time range', style: { color: '#64748b' } },
         ...extra,
     };
+}
+
+// Shared tooltip renderer: rows ordered by value desc so the tooltip matches the
+// vertical order of the lines at the hovered instant. Values format through the
+// chart's own y-axis formatter, so units stay correct per chart.
+function valueSortedTooltip({ series, dataPointIndex, w }) {
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const fmt = w.config.yaxis?.[0]?.labels?.formatter ?? (v => v);
+    const rows = [];
+    let ts = null;
+    for (let i = 0; i < series.length; i++) {
+        const v = series[i]?.[dataPointIndex];
+        if (v == null) continue;
+        ts ??= w.globals.seriesX[i]?.[dataPointIndex];
+        rows.push({ name: w.globals.seriesNames[i], color: w.globals.colors[i % w.globals.colors.length], v });
+    }
+    rows.sort((a, b) => b.v - a.v);
+    const when = ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }) : '';
+    return '<div class="isp-rtt-tt">'
+        + (when ? '<div class="isp-rtt-tt-x">' + esc(when) + '</div>' : '')
+        + rows.map(r => '<div class="isp-rtt-tt-row"><span class="isp-rtt-tt-dot" style="background:' + r.color + '"></span>'
+            + esc(r.name) + ': <b>' + esc(fmt(r.v)) + '</b></div>').join('')
+        + '</div>';
 }
 
 function buildQueryParams() {
