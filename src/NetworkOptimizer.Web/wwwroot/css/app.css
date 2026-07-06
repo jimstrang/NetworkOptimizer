@@ -15735,19 +15735,6 @@ tr.stats-row-filtered {
     }
 }
 
-.lan-flow-map-fullscreen {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 9999;
-    height: 100% !important;
-    max-height: none !important;
-    background: var(--bg-primary);
-    border-radius: 0;
-}
-
 .lan-flow-map-labels {
     position: absolute;
     inset: 0;
@@ -15982,6 +15969,19 @@ tr.stats-row-filtered {
     width: 100%;
     height: clamp(520px, 70vh, 820px);
 }
+
+.lan-flow-map-fullscreen {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 9999;
+    height: 100% !important;
+    max-height: none !important;
+    background: var(--bg-primary);
+    border-radius: 0;
+}
+
 .lfm2d-canvas {
     display: block;
     width: 100%;
