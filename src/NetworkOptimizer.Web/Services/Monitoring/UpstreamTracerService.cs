@@ -1043,13 +1043,13 @@ public class UpstreamTracerService
             // transit ASNs cleanly by monitoring the CDN destination instead.
             var asn = group.First().Asn!;
 
-            // An ASN's run typically spans its ingress POP near the access network
-            // and, several ms later, a distant egress POP - hop numbers stay
-            // consecutive across that geography, so the clump boundary can only be
-            // seen in RTT. Carry the nearest responders as candidates; selection is
+            // An ASN typically spans its ingress POP near the access network and,
+            // several ms later, a distant egress POP - and across the merged pool
+            // of heterogeneous traces only RTT separates those POPs, never hop
+            // numbers. Carry the nearest responders as candidates; selection is
             // provisional here (nearest hop) and is refined after the reachability
-            // pass, which splits the run into RTT clumps and enables the lowest
-            // verified-RTT gate-clearing hop in each.
+            // pass, which clusters the ASN's hops by verified RTT and enables the
+            // lowest-RTT gate-clearing hop in each cluster.
             var hopsInOrder = group.OrderBy(h => h.HopNumber).Take(MaxTransitCandidatesPerAsn).ToList();
             foreach (var hop in hopsInOrder)
             {
@@ -1180,16 +1180,21 @@ public class UpstreamTracerService
     internal const double RttClumpStepFraction = 0.15;
 
     /// <summary>
-    /// Post-verification auto-selection: orders each transit ASN's gate-clearing hops
-    /// by hop number, splits the run into clumps where the verified RTT steps up by
-    /// more than max(<see cref="RttClumpStepFloorMs"/>, <see cref="RttClumpStepFraction"/>
-    /// of the previous hop) - the signature of the long-haul link between two of the
-    /// ASN's POPs, since hop numbers stay consecutive across that geography - and
-    /// enables the lowest-RTT hop in each of the first <see cref="MaxClumpsPerAsn"/>
-    /// clumps. ASNs with any candidate reconciled from existing targets are left
-    /// untouched so rediscovery never overrides stored user choices; ASNs with no
-    /// gate-clearing hop end up with nothing enabled, which is what lets the
-    /// downstream witness/fallback injection step in.
+    /// Post-verification auto-selection: sorts each transit ASN's gate-clearing hops
+    /// by verified RTT and clusters them where the RTT steps up by more than
+    /// max(<see cref="RttClumpStepFloorMs"/>, <see cref="RttClumpStepFraction"/> of the
+    /// previous hop) - the signature of the long-haul link between two of the ASN's
+    /// POPs. Hop numbers are deliberately NOT used for ordering: the candidates come
+    /// from the merged pool of heterogeneous traces, whose hop numbers interleave
+    /// meaninglessly across paths (the same warning the near-transit window handles
+    /// per trace above); RTT is the physical quantity that actually separates POPs.
+    /// The lowest-RTT NET-NEW hop in each of the first <see cref="MaxClumpsPerAsn"/>
+    /// clusters is enabled. Candidates reconciled from existing targets are never
+    /// flipped in either direction: an existing enabled row keeps covering its
+    /// cluster (no second pick is added beside it), and an existing disabled row is
+    /// never re-enabled - a disabled row can be a flaky-target verdict, not just an
+    /// old default. ASNs with no gate-clearing hop end up with nothing enabled, which
+    /// is what lets the downstream witness/fallback injection step in.
     /// </summary>
     internal static void ApplyTransitClumpSelection(IEnumerable<TransitAsnCandidate> candidates)
     {
@@ -1198,37 +1203,41 @@ public class UpstreamTracerService
             .GroupBy(c => c.AsnNumber);
         foreach (var asnGroup in byAsn)
         {
-            if (asnGroup.Any(c => c.PreservedFromExisting)) continue;
-
-            var reachable = asnGroup
+            var byRtt = asnGroup
                 .Where(c => !c.Unreachable && c.VerifiedRttMs.HasValue)
-                .OrderBy(c => c.HopNumber)
+                .OrderBy(c => c.VerifiedRttMs!.Value)
+                .ThenBy(c => c.HopNumber)
                 .ToList();
 
-            var winners = new HashSet<TransitAsnCandidate>();
-            var clump = new List<TransitAsnCandidate>();
-            var clumpsClosed = 0;
-            foreach (var c in reachable)
+            var clumps = new List<List<TransitAsnCandidate>>();
+            foreach (var c in byRtt)
             {
-                if (clump.Count > 0)
+                if (clumps.Count > 0)
                 {
-                    var prevRtt = clump[^1].VerifiedRttMs!.Value;
-                    var step = c.VerifiedRttMs!.Value - prevRtt;
-                    if (step > Math.Max(RttClumpStepFloorMs, prevRtt * RttClumpStepFraction))
-                    {
-                        winners.Add(clump.OrderBy(x => x.VerifiedRttMs!.Value).First());
-                        clumpsClosed++;
-                        clump.Clear();
-                        if (clumpsClosed >= MaxClumpsPerAsn) break;
-                    }
+                    var prevRtt = clumps[^1][^1].VerifiedRttMs!.Value;
+                    if (c.VerifiedRttMs!.Value - prevRtt > Math.Max(RttClumpStepFloorMs, prevRtt * RttClumpStepFraction))
+                        clumps.Add(new List<TransitAsnCandidate>());
                 }
-                clump.Add(c);
+                else
+                {
+                    clumps.Add(new List<TransitAsnCandidate>());
+                }
+                clumps[^1].Add(c);
             }
-            if (clump.Count > 0 && clumpsClosed < MaxClumpsPerAsn)
-                winners.Add(clump.OrderBy(x => x.VerifiedRttMs!.Value).First());
+
+            var winners = new HashSet<TransitAsnCandidate>();
+            foreach (var clump in clumps.Take(MaxClumpsPerAsn))
+            {
+                if (clump.Any(c => c.PreservedFromExisting && c.Enabled)) continue;
+                var winner = clump.FirstOrDefault(c => !c.PreservedFromExisting);
+                if (winner != null) winners.Add(winner);
+            }
 
             foreach (var c in asnGroup)
+            {
+                if (c.PreservedFromExisting) continue;
                 c.Enabled = winners.Contains(c);
+            }
         }
     }
 

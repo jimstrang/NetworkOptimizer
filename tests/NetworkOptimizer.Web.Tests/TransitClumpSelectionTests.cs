@@ -24,37 +24,61 @@ public class ApplyTransitClumpSelectionTests
     };
 
     [Fact]
-    public void Rtt_step_splits_consecutive_hops_into_two_clumps()
+    public void Rtt_step_splits_hops_into_two_clusters()
     {
-        // Regression from a real trace: same-city ingress hops at 11.3/12.4 ms, then
-        // the long-haul to a distant POP at 17.1 ms - hop numbers are consecutive, so
-        // only the RTT step can reveal the second clump.
+        // Real-trace regression: same-city ingress hops at 11.3/12.4 ms, then the
+        // long-haul to a distant POP at 17.1 ms - only RTT reveals the far cluster.
         var near1 = Candidate(7029, 5, 11.3, enabled: true);
         var near2 = Candidate(7029, 6, 12.4);
         var far = Candidate(7029, 7, 17.1);
 
         UpstreamTracerService.ApplyTransitClumpSelection(new[] { near1, near2, far });
 
-        near1.Enabled.Should().BeTrue("lowest RTT of the near clump");
-        near2.Enabled.Should().BeFalse("same clump as the 11.3 ms hop (step 1.1 ms)");
-        far.Enabled.Should().BeTrue("the 4.7 ms step starts the far clump");
+        near1.Enabled.Should().BeTrue("lowest RTT of the near cluster");
+        near2.Enabled.Should().BeFalse("same cluster as the 11.3 ms hop (step 1.1 ms)");
+        far.Enabled.Should().BeTrue("the 4.7 ms step starts the far cluster");
     }
 
     [Fact]
-    public void Two_hop_run_with_material_step_selects_both()
+    public void Interleaved_trace_hop_numbers_dont_corrupt_clusters()
     {
-        // Real-trace regression: 13.7 -> 16.9 ms (step 3.2 > max(2, 15%)) is two POPs.
-        var near = Candidate(22773, 8, 13.7, enabled: true);
-        var far = Candidate(22773, 9, 16.9);
+        // Real-trace regression: the merged pool interleaves hops from different
+        // traces, so hop-number order alternates near/far (11.3, 17.0, 11.3,
+        // 17.5, 17.5). Hop-ordered walking put a near hop in the far cluster and
+        // selected two near hops; RTT-sorted clustering must not.
+        var nearA = Candidate(7029, 5, 11.3, enabled: true);
+        var farA = Candidate(7029, 5, 17.0);
+        var nearB = Candidate(7029, 6, 11.3);
+        var farB = Candidate(7029, 6, 17.5);
+        var farC = Candidate(7029, 7, 17.5);
 
-        UpstreamTracerService.ApplyTransitClumpSelection(new[] { near, far });
+        UpstreamTracerService.ApplyTransitClumpSelection(new[] { nearA, farA, nearB, farB, farC });
+
+        nearA.Enabled.Should().BeTrue("lowest RTT, lowest hop of the near cluster");
+        nearB.Enabled.Should().BeFalse("one pick per cluster");
+        farA.Enabled.Should().BeTrue("lowest RTT of the far cluster");
+        farB.Enabled.Should().BeFalse();
+        farC.Enabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Hop_from_a_different_path_with_lower_hop_number_still_forms_far_cluster()
+    {
+        // Real-trace regression: the far hop sits on a different trace whose hop
+        // number sorts BEFORE the near hop (16.9 at hop 7 vs 13.5 at hop 8).
+        // Hop-ordered walking merged them (negative RTT step); RTT-sorted
+        // clustering selects both.
+        var far = Candidate(22773, 7, 16.9);
+        var near = Candidate(22773, 8, 13.5, enabled: true);
+
+        UpstreamTracerService.ApplyTransitClumpSelection(new[] { far, near });
 
         near.Enabled.Should().BeTrue();
-        far.Enabled.Should().BeTrue();
+        far.Enabled.Should().BeTrue("step 3.4 ms above the near cluster");
     }
 
     [Fact]
-    public void Small_step_stays_one_clump_with_one_winner()
+    public void Small_step_stays_one_cluster_with_one_winner()
     {
         var a = Candidate(100, 5, 11.3);
         var b = Candidate(100, 6, 12.4, enabled: true);
@@ -79,7 +103,7 @@ public class ApplyTransitClumpSelectionTests
     }
 
     [Fact]
-    public void At_most_two_clumps_are_selected()
+    public void At_most_two_clusters_are_selected()
     {
         var first = Candidate(100, 5, 10);
         var second = Candidate(100, 6, 20);
@@ -89,23 +113,11 @@ public class ApplyTransitClumpSelectionTests
 
         first.Enabled.Should().BeTrue();
         second.Enabled.Should().BeTrue();
-        third.Enabled.Should().BeFalse("third clump exceeds MaxClumpsPerAsn");
+        third.Enabled.Should().BeFalse("third cluster exceeds MaxClumpsPerAsn");
     }
 
     [Fact]
-    public void Lowest_rtt_in_clump_wins_regardless_of_hop_order()
-    {
-        var earlier = Candidate(100, 5, 12.4, enabled: true);
-        var later = Candidate(100, 6, 11.3);
-
-        UpstreamTracerService.ApplyTransitClumpSelection(new[] { earlier, later });
-
-        earlier.Enabled.Should().BeFalse();
-        later.Enabled.Should().BeTrue();
-    }
-
-    [Fact]
-    public void Unreachable_hops_never_win_and_dont_split_clumps()
+    public void Unreachable_hops_never_win()
     {
         var dead = Candidate(100, 5, null, unreachable: true, enabled: true);
         var alive1 = Candidate(100, 6, 20);
@@ -131,17 +143,33 @@ public class ApplyTransitClumpSelectionTests
     }
 
     [Fact]
-    public void Preserved_asn_is_left_untouched()
+    public void Preserved_enabled_row_covers_its_cluster()
     {
-        // Rediscovery matched one hop to an existing target the user had disabled;
-        // the whole ASN keeps its reconciled state instead of being re-selected.
-        var kept = Candidate(100, 5, 25, enabled: false, preserved: true);
-        var other = Candidate(100, 6, 10, enabled: true);
+        // The user already monitors a hop in the near cluster: no second near pick
+        // is added, but the net-new far cluster still gets its winner.
+        var monitored = Candidate(22773, 8, 13.5, enabled: true, preserved: true);
+        var nearAlternate = Candidate(22773, 9, 14.0);
+        var far = Candidate(22773, 7, 16.9);
 
-        UpstreamTracerService.ApplyTransitClumpSelection(new[] { kept, other });
+        UpstreamTracerService.ApplyTransitClumpSelection(new[] { monitored, nearAlternate, far });
 
-        kept.Enabled.Should().BeFalse();
-        other.Enabled.Should().BeTrue("preserved ASNs keep their build-time state");
+        monitored.Enabled.Should().BeTrue("existing rows are never flipped");
+        nearAlternate.Enabled.Should().BeFalse("cluster already covered by an existing target");
+        far.Enabled.Should().BeTrue("net-new far cluster still gets selected");
+    }
+
+    [Fact]
+    public void Preserved_disabled_row_is_never_reenabled_but_doesnt_block_netnew()
+    {
+        // A disabled row can be a flaky-target verdict: it must stay off even as
+        // the cluster's lowest RTT, and a net-new hop in the same cluster wins.
+        var flaky = Candidate(100, 5, 10, enabled: false, preserved: true);
+        var fresh = Candidate(100, 6, 11);
+
+        UpstreamTracerService.ApplyTransitClumpSelection(new[] { flaky, fresh });
+
+        flaky.Enabled.Should().BeFalse("flaky-target verdicts are permanent until the user says otherwise");
+        fresh.Enabled.Should().BeTrue();
     }
 
     [Fact]
