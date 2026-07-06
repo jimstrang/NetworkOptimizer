@@ -14691,8 +14691,14 @@ a.affected-client:hover {
     padding: 0.4rem 0.875rem;
 }
 
-#history-table {
+.wan-history-table {
     padding-top: 0.5rem;
+}
+
+@media (max-width: 768px) {
+    .wan-history-table {
+        padding-top: 0.25rem;
+    }
 }
 
 .wan-filter-badge.active {
