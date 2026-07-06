@@ -14680,6 +14680,21 @@ a.affected-client:hover {
     border-color: #fff;
 }
 
+#latency-charts-container .wan-filter-badge,
+#device-health-charts-container .wan-filter-badge,
+#sfp-charts-container .wan-filter-badge,
+#cellular-charts-container .wan-filter-badge,
+#cm-charts-container .wan-filter-badge,
+#ont-charts-container .wan-filter-badge,
+#port-stats-card .wan-filter-badge {
+    font-size: 0.8rem;
+    padding: 0.4rem 0.875rem;
+}
+
+#history-table {
+    padding-top: 0.5rem;
+}
+
 .wan-filter-badge.active {
     color: var(--text-primary);
     border-color: rgba(255, 255, 255, 0.5);
