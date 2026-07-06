@@ -16985,7 +16985,9 @@ a.isp-health-hero-speed:hover {
     position: relative;
 }
 
-.isp-health-chart-card {
+.isp-health-chart-card,
+#latency-charts-container,
+#device-health-charts-container {
     overflow: visible;
 }
 
