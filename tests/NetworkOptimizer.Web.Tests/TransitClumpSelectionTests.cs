@@ -78,6 +78,20 @@ public class ApplyTransitClumpSelectionTests
     }
 
     [Fact]
+    public void Two_ms_floor_governs_metro_rtts()
+    {
+        // At metro RTTs anything over 2 ms is the next POP: 14.7 -> 16.8 must split
+        // (the earlier 15% fraction allowed 2.2 ms of slack here and merged them).
+        var near = Candidate(7029, 6, 14.7);
+        var far = Candidate(7029, 7, 16.8);
+
+        UpstreamTracerService.ApplyTransitClumpSelection(new[] { near, far });
+
+        near.Enabled.Should().BeTrue();
+        far.Enabled.Should().BeTrue("step 2.1 ms exceeds the 2 ms floor");
+    }
+
+    [Fact]
     public void Small_step_stays_one_cluster_with_one_winner()
     {
         var a = Candidate(100, 5, 11.3);

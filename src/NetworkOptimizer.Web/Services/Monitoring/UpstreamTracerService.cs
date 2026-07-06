@@ -1176,8 +1176,12 @@ public class UpstreamTracerService
     /// <summary>Minimum RTT step (ms) that starts a new clump within an ASN's run.</summary>
     internal const double RttClumpStepFloorMs = 2.0;
 
-    /// <summary>Fractional RTT step that starts a new clump, for high-RTT paths where a few ms is noise.</summary>
-    internal const double RttClumpStepFraction = 0.15;
+    /// <summary>
+    /// Fractional RTT step that starts a new clump, for high-RTT paths where a few ms
+    /// is noise. Kept below the floor's reach until ~20 ms so the 2 ms floor governs
+    /// the low-RTT regime - at metro RTTs, anything over 2 ms IS the next POP.
+    /// </summary>
+    internal const double RttClumpStepFraction = 0.10;
 
     /// <summary>
     /// Post-verification auto-selection: sorts each transit ASN's gate-clearing hops
@@ -1290,7 +1294,11 @@ public class UpstreamTracerService
         {
             if (result.Received >= minSuccesses)
             {
-                t.ApplyRtt(result.RttAvgMs);
+                // Burst MINIMUM, not average: this RTT feeds the POP clustering, and
+                // a single queued reply in the average drags a near hop into the far
+                // cluster (observed: a 11.3 ms hop measuring 14.7 avg bridged two
+                // POPs). The minimum is the standard path-distance estimator.
+                t.ApplyRtt(result.RttMinMs ?? result.RttAvgMs);
             }
             else
             {
