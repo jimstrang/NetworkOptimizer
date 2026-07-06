@@ -71,8 +71,8 @@ var handler = new HttpClientHandler();
 if (config.IgnoreSslErrors)
     handler.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
 // Short timeout: this client only carries enrollment and heartbeats. The
-// default 100s meant a heartbeat against a powered-off server host (SYN black
-// hole, e.g. NAS maintenance) hung for the full 100s per reconnect attempt.
+// default 100s meant a heartbeat against an offline server host (SYN black
+// hole, e.g. host down for maintenance) hung for the full 100s per attempt.
 using var http = new HttpClient(handler)
 {
     BaseAddress = new Uri(config.ServerUrl.TrimEnd('/') + "/"),
