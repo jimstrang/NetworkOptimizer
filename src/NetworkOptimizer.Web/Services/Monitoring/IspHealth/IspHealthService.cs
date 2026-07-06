@@ -1174,7 +1174,11 @@ public class IspHealthService
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "ISP Health could not load WAN speed test results");
+            // Warning, not Debug: an empty pool here renders as "No recent WAN speed
+            // test" in the report - indistinguishable from genuinely having none - and
+            // the report is then cached for CacheTtl. Post-restart DB contention can
+            // land exactly here, so the failure must be visible in default logs.
+            _logger.LogWarning(ex, "ISP Health could not load WAN speed test results; Speed vs Plan will show no tests until the next recompute");
             return new List<SpeedTestSample>();
         }
     }
