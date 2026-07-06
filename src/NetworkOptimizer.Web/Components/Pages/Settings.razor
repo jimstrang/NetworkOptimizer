@@ -34,6 +34,7 @@
 @inject NavigationManager NavigationManager
 @inject SiteManagementService SiteManagement
 @inject AgentEnrollmentService AgentEnrollment
+@inject AgentServerUrlProvider AgentServerUrl
 @inject AgentTunnelRegistry TunnelRegistry
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject SnmpDetectionService SnmpDetection
@@ -2963,9 +2964,14 @@
                                                                             <text>Online@(TunnelRegistry.IsConnected(agent.Id) ? " (tunnel)" : "")@(agent.LastVersion != null ? $" - v{agent.LastVersion}" : "")</text>
                                                                             @if (AgentVersionOutdated(agent))
                                                                             {
-                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.LatestAgentVersion)) is available. Update the agent by re-running its install one-liner. During the 2.0 beta, please update agents whenever a release calls for it.">
+                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.LatestAgentVersion)) is available. During the 2.0 beta, please update agents whenever a release calls for it.">
                                                                                     Update agent
                                                                                 </span>
+                                                                                <button class="btn btn-sm btn-secondary"
+                                                                                        @onclick="() => ToggleUpgradeCommand(agent.Id)"
+                                                                                        data-tooltip="Show the upgrade one-liner">
+                                                                                    @(_upgradeCommandAgentId == agent.Id ? "Hide command" : "Upgrade command")
+                                                                                </button>
                                                                             }
                                                                         }
                                                                         else
@@ -2980,6 +2986,16 @@
                                                                         Remove
                                                                     </button>
                                                                 </div>
+                                                                @if (_upgradeCommandAgentId == agent.Id)
+                                                                {
+                                                                    <div class="agent-upgrade-cmd">
+                                                                        <p class="form-help">Bare metal (systemd) - enrollment is preserved, only the binaries update:</p>
+                                                                        <pre><code>@NativeUpgradeCommand()</code></pre>
+                                                                        <p class="form-help">
+                                                                            Docker agents instead: <code>cd /opt/network-optimizer-agent &amp;&amp; docker compose pull &amp;&amp; docker compose up -d</code>
+                                                                        </p>
+                                                                    </div>
+                                                                }
                                                             }
                                                             <div class="site-agent-actions">
                                                                 @if (!site.IsDefault && NeedsAgentSetup(site.Id))
@@ -3046,14 +3062,10 @@
                                                                        value="@ClientSpeedTestTarget(site.Id)"
                                                                        @onchange="e => SaveClientSpeedTestTarget(site, e.Value?.ToString())" />
                                                                 <small class="form-help">
-                                                                    The address browsers on this site hit for the LAN and WAN speed test
-                                                                    pages. Set this whenever the agent's auto-detected https LAN IP isn't
-                                                                    how clients should reach it: a reverse proxy in front of the agent
-                                                                    (enter the proxy's https URL), or an agent serving plain http
-                                                                    (AGENT_SPEEDTEST_TLS=0 - enter the http:// URL). A bare IP or host
-                                                                    uses https on the agent port; a full URL is used exactly as entered.
-                                                                    Leave blank to use the agent's detected address. Doesn't affect the
-                                                                    network path trace.
+                                                                    Where browsers reach this site's speed test pages. Blank = the
+                                                                    agent's detected LAN IP over https. Enter a full URL for a reverse
+                                                                    proxy or an http agent (AGENT_SPEEDTEST_TLS=0); a bare host uses
+                                                                    https on the agent port. Doesn't affect the network path trace.
                                                                 </small>
                                                             </div>
                                                         </div>
@@ -3492,6 +3504,23 @@
     // lagging, and that must not nag.
     private static bool AgentVersionOutdated(SiteAgent agent) =>
         NetworkOptimizer.Core.Helpers.VersionUtilities.IsOlderThan(agent.LastVersion, AppVersionInfo.LatestAgentVersion);
+
+    // Which agent row is showing its upgrade one-liner. The install script
+    // preserves an enrolled agent.json, so the upgrade command is the install
+    // one-liner without a token.
+    private int? _upgradeCommandAgentId;
+
+    private void ToggleUpgradeCommand(int agentId) =>
+        _upgradeCommandAgentId = _upgradeCommandAgentId == agentId ? null : agentId;
+
+    private string NativeUpgradeCommand()
+    {
+        var server = string.IsNullOrWhiteSpace(AgentServerUrl.Url)
+            ? "https://your-network-optimizer" : AgentServerUrl.Url!.TrimEnd('/');
+        return "curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/agent/install-native.sh"
+            + $" | sudo bash -s -- --server \"{server}\""
+            + "\n# add --lan-speed-test if this agent hosts the LAN speed test page";
+    }
 
     // Placeholder shows what a blank override resolves to - the online agent's
     // detected LAN IP on the agent's https port (same pick as

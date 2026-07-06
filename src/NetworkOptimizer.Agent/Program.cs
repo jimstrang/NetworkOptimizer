@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using NetworkOptimizer.Agent;
 
@@ -112,6 +113,19 @@ Console.WriteLine($"Agent v{version} running for site '{config.SiteSlug}' agains
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+// systemd stops deliver SIGTERM to the whole control group: the agent itself AND
+// its child processes (in-flight ping probes, iperf3). Without this handler the
+// agent ignored SIGTERM, kept its loops and tunnel alive for systemd's full 90s
+// stop timeout (then got SIGKILLed), and - worse - parsed its killed ping
+// children as real packet loss and reported it upstream, planting a false loss
+// spike on every agent stop/update. Cancelling here makes the shutdown immediate
+// and flips the cancellation guards so in-flight probe results are discarded.
+using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+{
+    ctx.Cancel = true;
+    cts.Cancel();
+});
 
 // LAN speed test (independent of the tunnel - site clients hit the agent
 // directly). nginx serves the OpenSpeedTest page + the throughput-critical
