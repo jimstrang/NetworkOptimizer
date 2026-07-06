@@ -53,7 +53,12 @@
                         </td>
                         <td>
                             @if (!string.IsNullOrEmpty(sfp.SfpPart))
-                            { <code>@sfp.SfpPart</code> }
+                            {
+                                @if (!string.IsNullOrEmpty(sfp.SfpVendor))
+                                { <code data-tooltip="@sfp.SfpVendor">@sfp.SfpPart</code> }
+                                else
+                                { <code>@sfp.SfpPart</code> }
+                            }
                             else
                             { <span class="text-muted">-</span> }
                         </td>

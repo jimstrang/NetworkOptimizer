@@ -677,6 +677,59 @@ from(bucket: ""{_bucket}"")
         return result;
     }
 
+    /// <summary>The latest persisted DDM reading of one SFP port (see <see cref="QueryLatestSfpAsync"/>).</summary>
+    public class SfpLatestPoint
+    {
+        public string DeviceMac { get; init; } = "";
+        public string PortName { get; init; } = "";
+        public double? RxPowerDbm { get; init; }
+        public double? TxPowerDbm { get; init; }
+        public double? TxBiasMa { get; init; }
+        public double? TemperatureC { get; init; }
+        public double? VoltageV { get; init; }
+        public DateTime Time { get; init; }
+    }
+
+    /// <summary>
+    /// Latest persisted DDM reading per (device, port) from the <c>sfp</c>
+    /// measurement, used to warm the live SFP cache after a restart so the
+    /// Optical tables aren't blank until the slow tier's first cycle (up to
+    /// several minutes on agent-backed sites, whose first tick usually fires
+    /// before the tunnel console reconnects). Window bounded to recent history:
+    /// a module that stopped reporting long ago should not resurrect as "live".
+    /// </summary>
+    public async Task<IReadOnlyList<SfpLatestPoint>> QueryLatestSfpAsync(CancellationToken ct = default)
+    {
+        if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return Array.Empty<SfpLatestPoint>();
+
+        var flux = $@"
+from(bucket: ""{_longtermBucket}"")
+  |> range(start: -6h)
+  |> filter(fn: (r) => r._measurement == ""sfp"")
+  |> last()
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+";
+        var results = new List<SfpLatestPoint>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            var deviceMac = record.GetValueByKey("device_mac") as string ?? "";
+            var portName = record.GetValueByKey("port_name") as string ?? "";
+            if (deviceMac.Length == 0 || portName.Length == 0) continue;
+            results.Add(new SfpLatestPoint
+            {
+                DeviceMac = deviceMac,
+                PortName = portName,
+                RxPowerDbm = AsDoubleOrNull(record.GetValueByKey("rx_power_dbm")),
+                TxPowerDbm = AsDoubleOrNull(record.GetValueByKey("tx_power_dbm")),
+                TxBiasMa = AsDoubleOrNull(record.GetValueByKey("tx_bias_ma")),
+                TemperatureC = AsDoubleOrNull(record.GetValueByKey("temperature_c")),
+                VoltageV = AsDoubleOrNull(record.GetValueByKey("voltage_v")),
+                Time = ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
+            });
+        }
+        return results;
+    }
+
     public Task WriteSfpAsync(
         string deviceMac,
         string portName,

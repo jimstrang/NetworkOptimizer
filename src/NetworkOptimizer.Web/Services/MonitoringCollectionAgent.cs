@@ -174,6 +174,14 @@ public class MonitoringCollectionAgent : BackgroundService
         try { await SeedDefaultTargetsAsync(stoppingToken); }
         catch (Exception ex) { _logger.LogWarning(ex, "Default target seeding failed"); }
 
+        // Warm the live SFP cache from the latest persisted DDM points so the Optical
+        // tables aren't blank between a restart and the site's first successful slow
+        // tick - up to several minutes on agent-backed sites, whose first tick usually
+        // fires before the tunnel console reconnects. Live readings always win: the
+        // seed never overwrites an entry the slow tier has already recorded.
+        try { await SeedSfpLiveCacheAsync(stoppingToken); }
+        catch (Exception ex) { _logger.LogDebug(ex, "SFP live-cache seeding failed (site {Site})", _siteSlug); }
+
         // Four independent loops, slightly staggered to avoid burst overlap.
         var fastTask = RunTierAsync("fast", GetFastInterval, FastTierCollectAsync, TimeSpan.FromSeconds(5), stoppingToken);
         var mediumTask = RunTierAsync("medium", GetMediumInterval, MediumTierCollectAsync, TimeSpan.FromSeconds(10), stoppingToken);
@@ -1756,6 +1764,35 @@ public class MonitoringCollectionAgent : BackgroundService
         type == NetworkOptimizer.Core.Enums.DeviceType.Gateway
             ? settings.GatewayTempHighC
             : settings.SwitchTempHighC;
+
+    /// <summary>
+    /// Seeds the live SFP cache from the latest persisted <c>sfp</c> points (last 6 h)
+    /// so the Optical tables render immediately after a restart instead of waiting for
+    /// the slow tier. Skips any port the tier has already recorded this run.
+    /// </summary>
+    private async Task SeedSfpLiveCacheAsync(CancellationToken ct)
+    {
+        if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
+        if (!_influx.IsConfigured) return;
+
+        var seeded = 0;
+        foreach (var point in await _influx.QueryLatestSfpAsync(ct))
+        {
+            if (_liveStats.GetSfpStats(point.DeviceMac, point.PortName) != null) continue;
+            _liveStats.RecordSfp(
+                deviceMac: point.DeviceMac,
+                portName: point.PortName,
+                rxDbm: point.RxPowerDbm,
+                txDbm: point.TxPowerDbm,
+                biasMa: point.TxBiasMa,
+                tempC: point.TemperatureC,
+                voltageV: point.VoltageV,
+                timestamp: point.Time);
+            seeded++;
+        }
+        if (seeded > 0)
+            _logger.LogDebug("Seeded {Count} SFP live entries from InfluxDB (site {Site})", seeded, _siteSlug);
+    }
 
     private void CollectSfpForDevice(
         UniFiDeviceResponse device,

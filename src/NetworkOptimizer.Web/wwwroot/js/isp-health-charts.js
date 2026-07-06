@@ -76,6 +76,26 @@ function buildOpts() {
             theme: 'dark',
             shared: true,
             x: { format: 'MMM dd, HH:mm' },
+            // Rows ordered by RTT desc so the tooltip's vertical order matches the
+            // chart lines at the hovered instant (highest line = first row).
+            custom({ series, dataPointIndex, w }) {
+                const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+                const rows = [];
+                let ts = null;
+                for (let i = 0; i < series.length; i++) {
+                    const v = series[i]?.[dataPointIndex];
+                    if (v == null) continue;
+                    ts ??= w.globals.seriesX[i]?.[dataPointIndex];
+                    rows.push({ name: w.globals.seriesNames[i], color: w.globals.colors[i % w.globals.colors.length], v });
+                }
+                rows.sort((a, b) => b.v - a.v);
+                const when = ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+                return '<div class="isp-rtt-tt">'
+                    + (when ? '<div class="isp-rtt-tt-x">' + esc(when) + '</div>' : '')
+                    + rows.map(r => '<div class="isp-rtt-tt-row"><span class="isp-rtt-tt-dot" style="background:' + r.color + '"></span>'
+                        + esc(r.name) + ': <b>' + r.v.toFixed(1) + ' ms</b></div>').join('')
+                    + '</div>';
+            },
         },
         noData: { text: 'No path data in the last 24 hours', style: { color: '#64748b' } },
     };

@@ -16989,6 +16989,30 @@ a.isp-health-hero-speed:hover {
     overflow: visible;
 }
 
+.isp-rtt-tt {
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+}
+
+.isp-rtt-tt-x {
+    color: var(--text-secondary);
+    margin-bottom: 0.375rem;
+}
+
+.isp-rtt-tt-row {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    line-height: 1.5;
+}
+
+.isp-rtt-tt-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
 .isp-chart-reset-btn {
     position: absolute;
     top: 0.25rem;
