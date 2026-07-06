@@ -16986,7 +16986,7 @@ a.isp-health-hero-speed:hover {
 }
 
 .isp-health-chart-card {
-    overflow-y: visible;
+    overflow: visible;
 }
 
 .isp-chart-reset-btn {
