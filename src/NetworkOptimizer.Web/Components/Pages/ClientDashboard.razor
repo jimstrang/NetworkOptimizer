@@ -97,7 +97,7 @@
         </div>
     }
 
-    @if (_loading)
+    @if (_loading || _awaitingSiteIdentity)
     {
         <div class="skeleton-hero card">
             <div class="skeleton-row">
@@ -118,6 +118,23 @@
         </div>
         <div class="skeleton-chart card">
             <div class="skeleton-block skeleton-chart-area"></div>
+        </div>
+    }
+    else if (_showClientPicker)
+    {
+        <div class="card empty-state">
+            <h3>Select Your Device</h3>
+            <p>This site is monitored remotely, so your device can't be identified automatically from here. Choose a device to view its performance.</p>
+            <div class="client-picker-row">
+                <select class="form-control" @bind="_pickerSelection">
+                    <option value="">Choose a device...</option>
+                    @foreach (var c in _pickerClients)
+                    {
+                        <option value="@c.Ip">@c.Name (@c.Ip)@(c.IsWired ? " - wired" : "")</option>
+                    }
+                </select>
+                <button class="btn btn-primary" @onclick="ViewPickedClientAsync" disabled="@string.IsNullOrEmpty(_pickerSelection)">View</button>
+            </div>
         </div>
     }
     else if (_client == null)
@@ -1036,6 +1053,11 @@
         _isMobile = await JS.InvokeAsync<bool>("eval", "window.innerWidth <= 768");
         _showGpsWarning = _isInsecureContext && _isOwnDevice;
 
+        // Managed-site own-device identity needs JS (agent whoami probe / localStorage),
+        // so it runs here rather than in OnInitializedAsync.
+        if (_awaitingSiteIdentity)
+            await ResolveSiteIdentityAsync();
+
         if (_showGpsWarning)
             StateHasChanged();
 
@@ -1069,6 +1091,10 @@
     }
 
     private string? _clientIp;
+    private bool _awaitingSiteIdentity;
+    private bool _showClientPicker;
+    private List<ClientDashboardService.SelectableClient> _pickerClients = new();
+    private string? _pickerSelection;
 
     private async Task<ClientIdentity?> GetClientIdentityAsync()
     {
@@ -1076,6 +1102,16 @@
         if (string.IsNullOrEmpty(_clientIp) && !_isOwnDevice)
         {
             _clientIp = IpParam;
+        }
+
+        // On a managed (non-default) site this circuit arrives over the WAN, so the
+        // connection address is the site's public IP - never the viewer's LAN address.
+        // Identity comes from the on-site agent's whoami probe (or the device picker)
+        // after first render, when JS interop is available.
+        if (string.IsNullOrEmpty(_clientIp) && !SiteContext.IsDefault)
+        {
+            _awaitingSiteIdentity = true;
+            return null;
         }
 
         // In Blazor Server, HttpContext is only available during the initial HTTP request.
@@ -1099,6 +1135,78 @@
             return null;
 
         return await DashboardService.IdentifyClientAsync(_clientIp);
+    }
+
+    /// <summary>
+    /// Own-device identity on a managed site: ask the on-site agent's speed-test listener
+    /// who we are - it sees the viewer's LAN source address, where this central server only
+    /// ever sees the site's WAN IP. The browser relays the agent's answer back over this
+    /// circuit, so concurrent viewers can never cross (each round trip lives inside its own
+    /// session). Falls back to the manual device picker when the probe fails (no online
+    /// agent, or the agent's certificate isn't trusted by this browser).
+    /// </summary>
+    private async Task ResolveSiteIdentityAsync()
+    {
+        string? ip = null;
+        try
+        {
+            var target = await SiteTarget.ResolveAsync();
+            if (target.UsesAgent && !string.IsNullOrEmpty(target.BaseUrl))
+            {
+                ip = await JS.InvokeAsync<string?>("eval",
+                    $"fetch('{target.BaseUrl}/netopt/whoami', {{signal: AbortSignal.timeout(4000)}})" +
+                    ".then(r => r.json()).then(j => j.ip).catch(() => null)");
+            }
+        }
+        catch { /* probe is best-effort; the picker below always works */ }
+
+        _awaitingSiteIdentity = false;
+
+        if (!string.IsNullOrEmpty(ip) && System.Net.IPAddress.TryParse(ip, out _))
+        {
+            _clientIp = ip;
+            await IdentifyAndLoadAsync();
+            if (_client != null)
+            {
+                StateHasChanged();
+                return;
+            }
+            // The agent answered but the address isn't a known client - pick manually.
+            _clientIp = null;
+        }
+
+        await ShowClientPickerAsync();
+    }
+
+    private async Task ShowClientPickerAsync()
+    {
+        _pickerClients = await DashboardService.GetSelectableClientsAsync();
+        try
+        {
+            var remembered = await JS.InvokeAsync<string?>("eval",
+                $"localStorage.getItem('netopt-client-dashboard-ip-{SiteContext.Slug}')");
+            if (!string.IsNullOrEmpty(remembered) && _pickerClients.Any(c => c.Ip == remembered))
+                _pickerSelection = remembered;
+        }
+        catch { /* no preselect without localStorage */ }
+        _showClientPicker = true;
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task ViewPickedClientAsync()
+    {
+        // The bound value comes from our own option list, but it is about to be embedded
+        // in a JS string and a URL - accept nothing but a literal IP address.
+        if (string.IsNullOrEmpty(_pickerSelection) || !System.Net.IPAddress.TryParse(_pickerSelection, out _))
+            return;
+        try
+        {
+            await JS.InvokeVoidAsync("eval",
+                $"localStorage.setItem('netopt-client-dashboard-ip-{SiteContext.Slug}', '{_pickerSelection}')");
+        }
+        catch { /* remembering is best-effort */ }
+        NavigationManager.NavigateTo($"/client-dashboard?ip={Uri.EscapeDataString(_pickerSelection)}", forceLoad: true);
     }
 
     /// <summary>

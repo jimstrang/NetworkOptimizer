@@ -2533,6 +2533,16 @@ select.form-control {
     font-size: 0.8125rem;
 }
 
+.client-picker-row {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+}
+
+.client-picker-row select {
+    max-width: 320px;
+}
+
 /* Alerts/Messages */
 .alert {
     padding: 1rem;

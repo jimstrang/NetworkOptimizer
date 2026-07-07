@@ -75,6 +75,39 @@ public class ClientDashboardService
     /// <summary>Context for the database holding this instance's site data.</summary>
     private NetworkOptimizerDbContext CreateSiteDb() => _siteDbFactory.CreateForSite(_siteContext.Slug, _siteContext.IsDefault);
 
+    /// <summary>A device choice for the Client Performance page's manual picker.</summary>
+    public sealed record SelectableClient(string Ip, string Name, bool IsWired);
+
+    /// <summary>
+    /// This site's online clients as picker choices for the Client Performance page. Used on
+    /// managed (non-default) sites when the viewer's LAN address can't be discovered - the
+    /// browser reaches this central server over the WAN, and the on-site agent's whoami probe
+    /// may be unavailable (agent offline, or its certificate untrusted by the browser).
+    /// </summary>
+    public async Task<List<SelectableClient>> GetSelectableClientsAsync()
+    {
+        if (!_connectionService.IsConnected || _connectionService.Client == null)
+            return new List<SelectableClient>();
+        try
+        {
+            var clients = await _connectionService.Client.GetClientsAsync();
+            return (clients ?? new List<UniFiClientResponse>())
+                .Where(c => !string.IsNullOrEmpty(c.BestIp))
+                .Select(c => new SelectableClient(
+                    c.BestIp!,
+                    !string.IsNullOrWhiteSpace(c.Name) ? c.Name
+                        : !string.IsNullOrWhiteSpace(c.Hostname) ? c.Hostname : c.BestIp!,
+                    c.IsWired))
+                .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to load selectable clients for the device picker");
+            return new List<SelectableClient>();
+        }
+    }
+
     /// <summary>
     /// Identify a client by its IP address using UniFi controller data.
     /// After first identification, uses the single-client endpoint (stat/sta/{mac})
