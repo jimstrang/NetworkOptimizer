@@ -188,6 +188,34 @@ public class OutageDetectorTests
         events[0].Scope.Should().Be(OutageScope.Upstream);
         events[0].LastReachableHop.Should().BeNull();
         events[0].BrokenNetwork.Should().BeNull();
+        events[0].IsNearTotal.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Total_loss_on_every_hop_that_missed_the_blackout_pass_reads_near_total()
+    {
+        // A short sharp outage that straddles the blackout pass's bucket edges lands in the
+        // partial pass - but 100% peak loss on every reporting hop, access tier included, is
+        // no "partial loss". The event is flagged near-total so the UI reads total loss.
+        var ds = OutStart;
+        var de = OutStart.AddSeconds(40);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, de, 100), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 100), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 100), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 100), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Cloudflare", 4, LossSeries(ds, de, 100), IsInternet: true),
+            new OutageDetector.Hop("Google", 5, LossSeries(ds, de, 100), IsInternet: true),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].IsPartial.Should().BeTrue();
+        events[0].IsNearTotal.Should().BeTrue();
+        events[0].DegradedTargetCount.Should().Be(6);
+        events[0].PathTargetCount.Should().Be(6);
     }
 
     [Fact]

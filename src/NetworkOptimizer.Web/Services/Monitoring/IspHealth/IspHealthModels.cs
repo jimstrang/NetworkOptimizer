@@ -332,6 +332,13 @@ public class OutageEvent
     /// </summary>
     public bool IsPartial { get; init; }
 
+    /// <summary>
+    /// For a partial event: the loss reached the blackout dark threshold on (nearly) every
+    /// reporting hop - a short total outage whose bucket-edge dilution kept it out of the
+    /// blackout pass. Presentation upgrades the wording to total loss; scoring is unchanged.
+    /// </summary>
+    public bool IsNearTotal { get; init; }
+
     /// <summary>Worst per-target loss reached during the event. Feeds the partial-loss summary and the
     /// scorer's severity depth (peak loss fraction). Populated for blackouts and partials alike.</summary>
     public double PeakLossPct { get; init; }

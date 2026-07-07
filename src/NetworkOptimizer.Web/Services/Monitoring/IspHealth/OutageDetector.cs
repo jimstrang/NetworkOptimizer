@@ -253,11 +253,21 @@ public static class OutageDetector
         var recovery = PreciseRecovery(poolSeries, start, end, partialPct) ?? end;
         var reporting = pool.Count(h => hopBuckets[h].Any(kv => kv.Key >= start && kv.Key < end && kv.Value.Count > 0));
 
+        // A short sharp total outage that straddles the blackout pass's bucket edges dilutes
+        // every bucket mean below the dark threshold there, and lands here instead. When the
+        // loss still reached the blackout dark threshold on (nearly) every reporting hop,
+        // "partial" undersells it - flag it near-total so the UI can say total loss. Scoring
+        // is unchanged: it remains a partial-class event.
+        var nearTotal = reporting > 0
+            && (double)degraded.Count(d => d.Peak >= options.OutageDarkLossPct) / reporting
+                >= options.OutageCoverageFraction;
+
         return new OutageEvent
         {
             Start = onset,
             End = recovery,
             IsPartial = true,
+            IsNearTotal = nearTotal,
             IsBrief = recovery - onset < TimeSpan.FromSeconds(options.OutageBriefMaxSeconds),
             PeakLossPct = eventPeak,
             DegradedTargetCount = tiers.Count,

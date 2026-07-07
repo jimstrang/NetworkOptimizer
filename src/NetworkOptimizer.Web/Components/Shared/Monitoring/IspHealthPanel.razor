@@ -1084,12 +1084,12 @@ else
     }
 
     private static string OutageBadgeClass(OutageEvent o) =>
-        o.IsPartial ? "isp-event-badge-info"
+        o.IsPartial ? (o.IsNearTotal ? "isp-event-badge-warning" : "isp-event-badge-info")
         : o.IsBrief ? "isp-event-badge-warning"
         : "isp-event-badge-danger";
 
     private static string OutageBadgeText(OutageEvent o) =>
-        o.IsPartial ? "Partial loss" : o.IsBrief ? "Brief" : "Outage";
+        o.IsPartial ? (o.IsNearTotal ? "Total loss" : "Partial loss") : o.IsBrief ? "Brief" : "Outage";
 
     private static string OutageSectionTitle(IspHealthReport r) =>
         r.Outages.Any(o => !o.IsPartial && !o.IsBrief) ? "Internet Outages"
@@ -1101,6 +1101,7 @@ else
         OutageScope.Local => "LAN / Gateway outage",
         OutageScope.Upstream when !string.IsNullOrEmpty(o.LastReachableHop) => $"Break upstream of {o.LastReachableHop}",
         OutageScope.Upstream when !string.IsNullOrEmpty(o.BrokenNetwork) => $"Break in {o.BrokenNetwork}",
+        _ when o.IsPartial && o.IsNearTotal => "Path-wide total loss",
         _ when o.IsPartial => "Path-wide partial loss",
         _ => "Whole-WAN outage"
     };
