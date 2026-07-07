@@ -15,7 +15,7 @@ services:
     # 2.0 preview tag so the beta agent one-liner (fetched from `main`) works
     # before GA. FIX before release/2.0-multi-site -> main: restore :latest /
     # real version handling. BUMP this tag on every new beta.
-    image: ghcr.io/ozark-connect/agent:2.0.0-beta.4
+    image: ghcr.io/ozark-connect/agent:2.0.0-beta.5
     container_name: network-optimizer-agent
     restart: unless-stopped
     network_mode: host

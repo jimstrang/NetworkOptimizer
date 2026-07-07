@@ -39,7 +39,7 @@ SERVICE_NAME="netopt-agent"
 #   version or accept --version; default to /releases/latest for stable).
 #   Until then, BUMP this tag on every new beta (beta.2, beta.3, ...).
 # ############################################################################
-RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/v2.0.0-beta.4"
+RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/v2.0.0-beta.5"
 
 while [ $# -gt 0 ]; do
     case "$1" in
