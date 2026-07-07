@@ -21,6 +21,7 @@
 @inject IHttpContextAccessor HttpContextAccessor
 @inject ApMapService ApMapService
 @inject PullToRefreshState PtrState
+@inject ILogger<ClientDashboard> Logger
 
 <PageTitle>Client Performance - Network Optimizer</PageTitle>
 
@@ -1148,11 +1149,13 @@
     private async Task ResolveSiteIdentityAsync()
     {
         string? ip = null;
+        var probed = false;
         try
         {
             var target = await SiteTarget.ResolveAsync();
             if (target.UsesAgent && !string.IsNullOrEmpty(target.BaseUrl))
             {
+                probed = true;
                 ip = await JS.InvokeAsync<string?>("eval",
                     $"fetch('{target.BaseUrl}/netopt/whoami', {{signal: AbortSignal.timeout(4000)}})" +
                     ".then(r => r.json()).then(j => j.ip).catch(() => null)");
@@ -1164,6 +1167,7 @@
 
         if (!string.IsNullOrEmpty(ip) && System.Net.IPAddress.TryParse(ip, out _))
         {
+            Logger.LogDebug("Client identity (site {Site}): agent whoami resolved {Ip}", SiteContext.Slug, ip);
             _clientIp = ip;
             await IdentifyAndLoadAsync();
             if (_client != null)
@@ -1172,7 +1176,13 @@
                 return;
             }
             // The agent answered but the address isn't a known client - pick manually.
+            Logger.LogDebug("Client identity (site {Site}): whoami address {Ip} not in the client list - showing picker", SiteContext.Slug, ip);
             _clientIp = null;
+        }
+        else
+        {
+            Logger.LogDebug("Client identity (site {Site}): {Reason} - showing picker",
+                SiteContext.Slug, probed ? "agent whoami probe failed (offline or certificate untrusted)" : "no agent target to probe");
         }
 
         await ShowClientPickerAsync();
@@ -1206,6 +1216,7 @@
                 $"localStorage.setItem('netopt-client-dashboard-ip-{SiteContext.Slug}', '{_pickerSelection}')");
         }
         catch { /* remembering is best-effort */ }
+        Logger.LogDebug("Client identity (site {Site}): device picked manually ({Ip})", SiteContext.Slug, _pickerSelection);
         NavigationManager.NavigateTo($"/client-dashboard?ip={Uri.EscapeDataString(_pickerSelection)}", forceLoad: true);
     }
 
