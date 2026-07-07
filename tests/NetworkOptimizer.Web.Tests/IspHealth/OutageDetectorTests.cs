@@ -134,6 +134,39 @@ public class OutageDetectorTests
     }
 
     [Fact]
+    public void Coalesced_all_dark_runs_read_whole_wan_not_upstream_of_the_deepest_hop()
+    {
+        // Two all-dark runs bridged by a healthy stretch coalesce into one padded window.
+        // Dark duty over the padded window falls below 50% for every hop AT ONCE, which used
+        // to read as "everything stayed reachable" - scope Upstream, break anchored on the
+        // deepest hop, even though every row went dark and recovered together. Duty is now
+        // normalized to the trigger tier's own dark buckets: everything was dark whenever
+        // the internet was dark - a whole-WAN outage.
+        var aEnd = OutStart.AddSeconds(30);
+        var bStart = OutStart.AddSeconds(180);
+        var bEnd = OutStart.AddSeconds(240);
+        var internet1 = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+        var internet2 = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+        var access = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+        var transit = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, access, Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare (1.1.1.1)", 2, internet1, IsInternet: true),
+            new OutageDetector.Hop("Google (8.8.8.8)", 3, internet2, IsInternet: true),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.FullWan);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
     public void Internet_endpoint_never_anchors_the_break()
     {
         // The deepest clean row here is an internet display row - but "break upstream of a

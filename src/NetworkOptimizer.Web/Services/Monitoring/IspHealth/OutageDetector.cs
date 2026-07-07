@@ -101,10 +101,11 @@ public static class OutageDetector
 
         var events = new List<OutageEvent>();
         var minDuration = TimeSpan.FromSeconds(options.OutageMinDurationSeconds);
+        var darkTriggerBuckets = new HashSet<DateTime>(outageBuckets);
         foreach (var (start, end) in merged)
         {
             if (end - start < minDuration) continue;
-            events.Add(BuildEvent(start, end, triggerTargets, hops, hopBuckets, options));
+            events.Add(BuildEvent(start, end, triggerTargets, hops, hopBuckets, darkTriggerBuckets, options));
         }
         return events;
     }
@@ -383,18 +384,24 @@ public static class OutageDetector
         IReadOnlyList<IReadOnlyList<LatencySample>> triggerTargets,
         IReadOnlyList<Hop> hops,
         Dictionary<Hop, Dictionary<DateTime, List<double>>> hopBuckets,
+        IReadOnlyCollection<DateTime> darkTriggerBuckets,
         IspHealthOptions options)
     {
         var tiers = new List<(Hop Hop, OutageTierState State)>();
         // A hop on the broken path stays dark for (most of) the outage; a hop that merely
         // blipped at onset then held - like the OLT, which recovered ~10 min before the
         // upstream in the validation data - is NOT the break and must read as reachable.
-        // So attribution uses the dark duty cycle, not "ever went dark".
+        // So attribution uses the dark duty cycle, normalized to the buckets where the
+        // TRIGGER tier was actually dark: a merged window can be padded far beyond the real
+        // darkness (run coalescing across healthy blips and monitoring gaps), and duty over
+        // the padded window dilutes below the threshold for every hop at once - an all-dark
+        // outage then read as "everything stayed reachable". Darkness relative to the
+        // trigger's own dark span is padding-proof and keeps the onset-blip case anchored.
         var onBrokenPath = new Dictionary<int, bool>();
         foreach (var hop in hops.OrderBy(h => h.Depth))
         {
             double peakLoss = 0;
-            int darkBuckets = 0, totalBuckets = 0;
+            int darkBuckets = 0, totalBuckets = 0, darkInTrigger = 0, totalInTrigger = 0;
             DateTime? lastDarkBucket = null;
             foreach (var (bucketStart, losses) in hopBuckets[hop]
                          .Where(kv => kv.Key >= start && kv.Key < end)
@@ -402,18 +409,25 @@ public static class OutageDetector
             {
                 if (losses.Count == 0) continue;
                 totalBuckets++;
+                var inTrigger = darkTriggerBuckets.Contains(bucketStart);
+                if (inTrigger) totalInTrigger++;
                 var mean = losses.Average();
                 peakLoss = Math.Max(peakLoss, mean);
                 if (mean >= options.OutageDarkLossPct)
                 {
                     darkBuckets++;
+                    if (inTrigger) darkInTrigger++;
                     lastDarkBucket = bucketStart;
                 }
             }
             // No samples in the outage window means the target didn't exist or wasn't enabled
             // then - it has nothing to say about this outage, so don't give it a row.
             if (totalBuckets == 0) continue;
-            onBrokenPath[hop.Depth] = (double)darkBuckets / totalBuckets >= 0.5;
+            // A hop with no samples during the trigger-dark span can't be judged against it -
+            // fall back to window-wide duty for that hop alone.
+            onBrokenPath[hop.Depth] = totalInTrigger > 0
+                ? (double)darkInTrigger / totalInTrigger >= 0.5
+                : (double)darkBuckets / totalBuckets >= 0.5;
             tiers.Add((hop, new OutageTierState
             {
                 Name = hop.Name,
