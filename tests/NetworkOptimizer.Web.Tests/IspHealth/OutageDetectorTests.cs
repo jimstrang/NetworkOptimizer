@@ -191,6 +191,62 @@ public class OutageDetectorTests
     }
 
     [Fact]
+    public void Clean_sibling_branch_deeper_than_the_loss_does_not_anchor()
+    {
+        // Miniature of a real event: bursty loss at the access tier, four transit ASNs lossy
+        // the whole window, one sibling transit branch untouched and sorted deepest. The old
+        // attribution read "break upstream of <the clean sibling>" - but loss starting at the
+        // access tier means the clean deeper row is a parallel branch, not a boundary. No
+        // waterfall shape, no anchor, and the touched access tier also blocks blaming any
+        // single network: path-wide.
+        var ds = OutStart;
+        var de = OutStart.AddMinutes(10);
+        var burstEnd = OutStart.AddMinutes(2);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, burstEnd, 67), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 60), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 60), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 60), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Transit D", 4, LossSeries(ds, de, 60), AsnLabel: "Transit D"),
+            new OutageDetector.Hop("Sibling Transit (+6 ms hop)", 5, LossSeries(ds, de, 0), AsnLabel: "Sibling Transit (+6 ms hop)"),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Lossy_transit_branch_with_clean_access_is_named_as_the_broken_network()
+    {
+        // The branch-correct localization: access tier fully clean, one transit ASN lossy for
+        // the whole window, its sibling branch clean and deeper. Naming the sibling as "last
+        // reachable" would be wrong; the event names the lossy network itself instead.
+        var ds = OutStart;
+        var de = OutStart.AddMinutes(10);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, de, 0), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 60), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 60), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 60), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Transit D", 4, LossSeries(ds, de, 60), AsnLabel: "Transit D"),
+            new OutageDetector.Hop("Sibling Transit (+6 ms hop)", 5, LossSeries(ds, de, 0), AsnLabel: "Sibling Transit (+6 ms hop)"),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().Be("Transit A");
+    }
+
+    [Fact]
     public void Olt_blip_at_onset_then_recovery_still_reads_upstream_and_leads_the_waterfall()
     {
         var internet1 = Series(0, (OutStart, OutEnd, 100));

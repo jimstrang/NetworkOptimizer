@@ -271,9 +271,11 @@ public static class OutageDetector
 
     /// <summary>
     /// Break attribution for an Upstream-scoped event. The anchor is the deepest hop that
-    /// <paramref name="isClean"/> AND holds a known trace-map position AND is a path hop:
-    /// off-map rows (fabricated sort depth) and internet endpoints (destinations, not points
-    /// on the path) legitimately prove the break was upstream, but cannot say WHERE it sat.
+    /// <paramref name="isClean"/> AND holds a known trace-map position AND is a path hop AND
+    /// has nothing lossy nearer than it (a clean row deeper than a lossy one is usually a
+    /// sibling transit branch, not proof the break sat beyond it): off-map rows (fabricated
+    /// sort depth) and internet endpoints (destinations, not points on the path) legitimately
+    /// prove the break was upstream, but cannot say WHERE it sat.
     /// Anchored events prefer the ASN label over the per-target name. With no anchorable hop,
     /// fall back to naming the network the break surfaced in - the shallowest
     /// <paramref name="isBroken"/> hop's ASN - but only when every nearer anchorable hop was
@@ -287,11 +289,16 @@ public static class OutageDetector
         IEnumerable<Hop> wanHops, Func<Hop, bool> judged, Func<Hop, bool> isClean, Func<Hop, bool> isBroken)
     {
         var rows = wanHops.Where(judged).ToList();
+        // "Break upstream of X" claims a contiguous waterfall: everything nearer than X clean,
+        // the loss strictly beyond it. Hops sit on branching paths, so a clean row deeper than
+        // a lossy one is usually a SIBLING branch, not proof the loss sat beyond it - the
+        // anchor only stands when every nearer anchorable hop was also clean.
         var anchor = rows
             .Where(h => h.KnownPosition && !h.IsInternet && isClean(h))
             .OrderByDescending(h => h.Depth)
             .FirstOrDefault();
-        if (anchor != null)
+        if (anchor != null && !rows.Any(h =>
+                h.Depth < anchor.Depth && h.KnownPosition && !h.IsInternet && !isClean(h)))
             return (anchor.AsnLabel ?? anchor.Name, null);
         var broken = rows
             .Where(h => isBroken(h) && !string.IsNullOrEmpty(h.AsnLabel))
