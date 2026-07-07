@@ -43,11 +43,14 @@ public class SpeedTestServiceRegistry
             var connection = _siteConnections.GetFor(s);
             // Each site's path analyzer gets its own MemoryCache: the analyzer
             // caches topology under fixed keys, so a shared cache would leak
-            // one site's topology into another site's path analysis.
+            // one site's topology into another site's path analysis. Non-default
+            // sites are remote: their analyzers must not fall back to this host's
+            // HOST_IP / interfaces for server position (off-network there).
             var pathAnalyzer = new NetworkPathAnalyzer(
                 connection,
                 new MemoryCache(new MemoryCacheOptions()),
-                _serviceProvider.GetRequiredService<ILoggerFactory>());
+                _serviceProvider.GetRequiredService<ILoggerFactory>(),
+                isRemoteSite: s != SiteManagementService.DefaultSiteSlug);
             // Wrap the shared bus so every alert event these per-site services publish
             // is stamped with this site's slug, routing it to the site's rules, history,
             // and channels (same pattern as MonitoringAlertRegistry).

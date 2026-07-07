@@ -401,6 +401,22 @@ Suggested order: congestion / path-shift / outage navigation first (cheap, consi
 - Both should tear down / re-establish agent enrollment cleanly so a removed slug can be re-added
   from scratch with no stale rows.
 
+### Agent LAN IP detection on Docker hosts (test / harden)
+The agent detects its LAN IP once at startup via `NetworkUtilities.DetectLocalIpFromInterfaces()`
+(physical Ethernet > WiFi > other, skipping loopback and virtual/container NICs by name) and reports
+it on enrollment, every heartbeat, and the tunnel hello; the server stores it on `SiteAgents.LanIp`.
+That IP is what site clients are pointed at for LAN speed tests and what path analysis uses as the
+agent's trace source (LAN and agent-run WAN tests).
+
+- **Host network mode:** container sees the real host NICs - should work as-is, but untested.
+- **Bridge mode (the gap):** inside the container, `eth0` is a plain-looking Ethernet NIC with the
+  container-internal address (e.g. 172.17.x) - the docker/veth skip-list only matches host-side
+  names, so detection happily reports an IP that is unreachable from the site LAN and absent from
+  the site's UniFi topology. Speed-test targets and traces would silently break.
+- Likely fix: an explicit override in `agent.json` (e.g. `lanIp`) and/or an `AGENT_LAN_IP` env var
+  that wins over detection, plus a docs note that bridge-mode agents require it (or host mode).
+- Test matrix: native (works today), Docker host mode, Docker bridge with override.
+
 ### Site-specific alert channels (post-MVP)
 Today delivery channels are global: `DeliveryChannel` has no `SiteId`, `AlertProcessingService` is a
 singleton that dispatches against the main DB, and alert events/rules aren't site-tagged. Alerts are

@@ -26,6 +26,7 @@ public class UwnSpeedTestService : WanSpeedTestServiceBase
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly SiteTunnelRouting _tunnelRouting;
     private readonly AgentUwnService _agentUwn;
+    private readonly AgentEnrollmentService _agentEnrollment;
 
     protected override SpeedTestDirection Direction => SpeedTestDirection.UwnWan;
 
@@ -52,6 +53,7 @@ public class UwnSpeedTestService : WanSpeedTestServiceBase
         IServiceScopeFactory scopeFactory,
         SiteTunnelRouting tunnelRouting,
         AgentUwnService agentUwn,
+        AgentEnrollmentService agentEnrollment,
         NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         IAlertEventBus? alertEventBus = null,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
@@ -63,6 +65,7 @@ public class UwnSpeedTestService : WanSpeedTestServiceBase
         _scopeFactory = scopeFactory;
         _tunnelRouting = tunnelRouting;
         _agentUwn = agentUwn;
+        _agentEnrollment = agentEnrollment;
     }
 
     /// <summary>
@@ -291,7 +294,13 @@ public class UwnSpeedTestService : WanSpeedTestServiceBase
             Location: finalIsp ?? "",
             WanIp: finalWanIp));
 
-        var serverIp = _configuration["HOST_IP"];
+        // Local endpoint the test ran from, for path analysis. An agent run measures
+        // from the on-site agent, so the trace source is the agent's LAN IP on that
+        // site's topology (this server's HOST_IP is off-network there) - same
+        // resolution the Client Speed Test uses for agent-relayed results.
+        var serverIp = IsDefaultSite
+            ? _configuration["HOST_IP"]
+            : await _agentEnrollment.GetOnlineAgentLanIpAsync(SiteSlug);
 
         var result = new Iperf3Result
         {
