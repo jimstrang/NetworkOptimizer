@@ -53,23 +53,25 @@ public static class WanSpeedTestProgressAnimator
     /// <summary>
     /// Phase-boundary progress for a run whose page interpolates download (20-&gt;55) and upload
     /// (60-&gt;95) between the reported phases (agent). Holds each of download/upload for the test
-    /// duration so the interpolation doesn't run out early. Never throws on cancellation.
+    /// duration so the interpolation doesn't run out early. Reports no status text: the WAN page
+    /// renders status in a code block below the progress bar, and a simulated status could only
+    /// mirror the phase label already shown there. Never throws on cancellation.
     /// </summary>
     public static async Task AnimatePhasesAsync(Task runningTask, Action<string, int, string?> report, int durationSeconds, CancellationToken ct)
     {
         var phaseMs = Math.Max(8000, durationSeconds * 1000);
-        var phases = new (string Phase, int Percent, string Status, int DelayMs)[]
+        var phases = new (string Phase, int Percent, int DelayMs)[]
         {
-            ("Discovering servers", 5, "Discovering servers...", 2500),
-            ("Testing latency", 10, "Measuring latency...", 1500),
-            ("Testing download", 20, "Testing download...", phaseMs),
-            ("Testing upload", 60, "Testing upload...", phaseMs),
+            ("Discovering servers", 5, 2500),
+            ("Testing latency", 10, 1500),
+            ("Testing download", 20, phaseMs),
+            ("Testing upload", 60, phaseMs),
         };
 
         foreach (var phase in phases)
         {
             if (runningTask.IsCompleted) break;
-            report(phase.Phase, phase.Percent, phase.Status);
+            report(phase.Phase, phase.Percent, null);
             try { await Task.WhenAny(runningTask, Task.Delay(phase.DelayMs, ct)); }
             catch (OperationCanceledException) { break; }
         }
