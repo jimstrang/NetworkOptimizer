@@ -22,8 +22,11 @@ public static class OutageDetector
     /// stay on their own. <paramref name="AsnLabel"/> is the ASN-level label a row prefers over its
     /// per-target <paramref name="Name"/> (the PTR hostname); the detector disambiguates when one
     /// ASN owns several rows. Null AsnLabel (internet endpoints) falls back to <paramref name="Name"/>.
+    /// <paramref name="KnownPosition"/> is false for rows absent from the persisted trace map - their
+    /// Depth is a fabricated sort position (they sort last), so they can shape the outage but must
+    /// never anchor "break upstream of X" attribution.
     /// </summary>
-    public sealed record Hop(string Name, int Depth, IReadOnlyList<LatencySample> Series, bool Groupable = false, string? AsnLabel = null, bool IsGateway = false);
+    public sealed record Hop(string Name, int Depth, IReadOnlyList<LatencySample> Series, bool Groupable = false, string? AsnLabel = null, bool IsGateway = false, bool KnownPosition = true);
 
     /// <param name="triggerTargets">The internet/destination loss series whose near-total loss defines an outage.</param>
     /// <param name="hops">Every monitored hop, ordered by distance (Depth ascending = nearest first), for the shape.</param>
@@ -227,6 +230,11 @@ public static class OutageDetector
         var scope = nearest == null || degradedDepth[nearest.Depth] || lastClean == null
             ? OutageScope.FullWan
             : OutageScope.Upstream;
+        // Same split as the blackout builder: any clean WAN row decides the scope, but only a
+        // trace-map-anchored hop may name where the break sat.
+        var (lastReachableLabel, brokenNetwork) = scope == OutageScope.Upstream
+            ? AttributeBreak(pool, degradedDepth)
+            : (null, null);
 
         var poolSeries = pool.Select(h => (IReadOnlyList<LatencySample>)h.Series).ToList();
         var onset = FirstDark(poolSeries, start, end, partialPct) ?? start;
@@ -243,9 +251,35 @@ public static class OutageDetector
             DegradedTargetCount = tiers.Count,
             PathTargetCount = reporting,
             Scope = scope,
-            LastReachableHop = scope == OutageScope.Upstream ? (lastClean!.AsnLabel ?? lastClean.Name) : null,
+            LastReachableHop = lastReachableLabel,
+            BrokenNetwork = brokenNetwork,
             Tiers = tiers.OrderBy(t => t.Depth).ToList()
         };
+    }
+
+    /// <summary>
+    /// Break attribution for an Upstream-scoped event. The anchor is the deepest hop that stayed
+    /// clean AND holds a known trace-map position: a row absent from the trace map (KnownPosition
+    /// false) sits at a fabricated sort depth, so while its reachability legitimately proves the
+    /// break was upstream (scope), it cannot say WHERE the break sat. Anchored events prefer the
+    /// ASN label over the per-target name. With no anchorable hop, fall back to naming the network
+    /// the break surfaced in - the shallowest dark hop's ASN - via BrokenNetwork instead.
+    /// </summary>
+    private static (string? LastReachableHop, string? BrokenNetwork) AttributeBreak(
+        IEnumerable<Hop> wanHops, IReadOnlyDictionary<int, bool> darkAtDepth)
+    {
+        var judged = wanHops.Where(h => darkAtDepth.ContainsKey(h.Depth)).ToList();
+        var anchor = judged
+            .Where(h => h.KnownPosition && !darkAtDepth[h.Depth])
+            .OrderByDescending(h => h.Depth)
+            .FirstOrDefault();
+        if (anchor != null)
+            return (anchor.AsnLabel ?? anchor.Name, null);
+        var broken = judged
+            .Where(h => darkAtDepth[h.Depth] && !string.IsNullOrEmpty(h.AsnLabel))
+            .OrderBy(h => h.Depth)
+            .FirstOrDefault();
+        return (null, broken?.AsnLabel);
     }
 
     /// <summary>Per bucket, the list of each reporting target's mean loss in that bucket.</summary>
@@ -374,6 +408,11 @@ public static class OutageDetector
             : nearest == null || onBrokenPath[nearest.Depth] || lastReachable == null
                 ? OutageScope.FullWan
                 : OutageScope.Upstream;
+        // Scope reads reachability from every WAN row (an off-map row answering still proves the
+        // break was upstream); the break's NAME comes only from trace-map-anchored hops.
+        var (lastReachableLabel, brokenNetwork) = scope == OutageScope.Upstream
+            ? AttributeBreak(tiers.Where(t => !t.Hop.IsGateway).Select(t => t.Hop), onBrokenPath)
+            : (null, null);
 
         // Bucket edges are minute-aligned; report the real onset and recovery instants from
         // the pooled trigger stream so the window carries seconds. Fall back to the bucket
@@ -405,7 +444,8 @@ public static class OutageDetector
             DegradedTargetCount = darkTargets,
             PathTargetCount = reportingTargets,
             Scope = scope,
-            LastReachableHop = scope == OutageScope.Upstream ? lastReachable!.Name : null,
+            LastReachableHop = lastReachableLabel,
+            BrokenNetwork = brokenNetwork,
             Tiers = GroupAccessTiers(tiers, options)
         };
     }

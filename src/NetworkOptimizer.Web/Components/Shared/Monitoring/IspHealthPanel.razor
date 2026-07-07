@@ -1100,6 +1100,7 @@ else
     {
         OutageScope.Local => "LAN / Gateway outage",
         OutageScope.Upstream when !string.IsNullOrEmpty(o.LastReachableHop) => $"Break upstream of {o.LastReachableHop}",
+        OutageScope.Upstream when !string.IsNullOrEmpty(o.BrokenNetwork) => $"Break in {o.BrokenNetwork}",
         _ when o.IsPartial => "Path-wide partial loss",
         _ => "Whole-WAN outage"
     };

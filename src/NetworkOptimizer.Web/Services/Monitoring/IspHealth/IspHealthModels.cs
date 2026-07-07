@@ -348,9 +348,18 @@ public class OutageEvent
 
     /// <summary>
     /// The deepest tier/hop that stayed reachable through the outage - the break sat just
-    /// beyond it. Null when even the access hop went dark (a full WAN outage).
+    /// beyond it. Only hops with a known trace-map position anchor this (ASN label preferred
+    /// over the per-target name). Null when even the access hop went dark (a full WAN outage)
+    /// or when no anchorable hop stayed clean - see <see cref="BrokenNetwork"/>.
     /// </summary>
     public string? LastReachableHop { get; init; }
+
+    /// <summary>
+    /// For an Upstream outage that no trace-map-anchored hop can localize (only off-map rows
+    /// stayed reachable): the ASN of the network the break surfaced in - the shallowest dark
+    /// hop's ASN label. Null when <see cref="LastReachableHop"/> is set or no dark ASN is known.
+    /// </summary>
+    public string? BrokenNetwork { get; init; }
 
     /// <summary>Per-tier loss and recovery, nearest first, for the outage-shape display.</summary>
     public List<OutageTierState> Tiers { get; init; } = new();

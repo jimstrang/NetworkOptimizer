@@ -77,6 +77,63 @@ public class OutageDetectorTests
     }
 
     [Fact]
+    public void Offmap_row_never_anchors_the_break_a_known_hop_does()
+    {
+        // Mirrors the real event that motivated KnownPosition: a hostname-based ISP target
+        // absent from the trace map sorts deepest and stays reachable through the outage.
+        // The break label must come from the deepest CLEAN hop with a known position (by its
+        // ASN), not the off-map target's display name.
+        var internet1 = Series(0, (OutStart, OutEnd, 100));
+        var internet2 = Series(0, (OutStart, OutEnd, 100));
+        var access = Series(0); // clean, known position
+        var transit = Series(0, (OutStart, OutEnd, 100));
+        var offmapSpeedtest = Series(0); // clean, NOT in the trace map
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop-a", 0, access, Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare", 2, internet1),
+            new OutageDetector.Hop("Google", 2, internet2),
+            new OutageDetector.Hop("ISP Speedtest", 3, offmapSpeedtest, Groupable: true, AsnLabel: null, KnownPosition: false),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().Be("Access ISP");
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Only_offmap_rows_clean_falls_back_to_naming_the_dark_network()
+    {
+        // Every trace-mapped hop went dark; only an off-map row stayed reachable. Its
+        // reachability still proves the break was upstream (scope), but it cannot say where -
+        // the event names the shallowest dark network's ASN instead of the off-map target.
+        var internet1 = Series(0, (OutStart, OutEnd, 100));
+        var internet2 = Series(0, (OutStart, OutEnd, 100));
+        var offmap = Series(0); // clean, NOT in the trace map, sorted nearest here
+        var transit = Series(0, (OutStart, OutEnd, 100));
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("ISP Speedtest", 0, offmap, Groupable: true, AsnLabel: null, KnownPosition: false),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare", 2, internet1),
+            new OutageDetector.Hop("Google", 2, internet2),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().Be("Transit Net");
+    }
+
+    [Fact]
     public void Olt_blip_at_onset_then_recovery_still_reads_upstream_and_leads_the_waterfall()
     {
         var internet1 = Series(0, (OutStart, OutEnd, 100));

@@ -780,9 +780,14 @@ public class IspHealthService
                 0, gatewaySamples, Groupable: false, AsnLabel: null, IsGateway: true)
             : null;
         var baseDepth = gatewayHop != null ? 1 : 0;
+        // Rows without a persisted hop number sorted to the end above - that Depth is a sort
+        // position, not a path position, so they carry KnownPosition: false and never anchor
+        // the detector's "break upstream of X" attribution (e.g. a hostname-based ISP target
+        // the discovery traces never mapped).
         var outageHops = (gatewayHop != null ? new[] { gatewayHop } : Array.Empty<OutageDetector.Hop>())
             .Concat(orderedWanHops.Select((x, i) =>
-                new OutageDetector.Hop(x.Name, baseDepth + i, x.Series, x.Groupable, x.AsnLabel)))
+                new OutageDetector.Hop(x.Name, baseDepth + i, x.Series, x.Groupable, x.AsnLabel,
+                    KnownPosition: x.HopNumber != int.MaxValue)))
             .ToList();
         ct.ThrowIfCancellationRequested();
         var outages = OutageDetector.Detect(internetTriggerTargets, outageHops, _options);
