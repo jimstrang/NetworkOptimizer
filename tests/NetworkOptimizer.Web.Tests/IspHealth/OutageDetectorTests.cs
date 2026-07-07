@@ -134,6 +134,63 @@ public class OutageDetectorTests
     }
 
     [Fact]
+    public void Internet_endpoint_never_anchors_the_break()
+    {
+        // The deepest clean row here is an internet display row - but "break upstream of a
+        // destination" says nothing (everything is upstream of it). The deepest clean PATH
+        // hop names the break instead.
+        var internet1 = Series(0, (OutStart, OutEnd, 100));
+        var internet2 = Series(0, (OutStart, OutEnd, 100));
+        var access = Series(0);
+        var transit = Series(0, (OutStart, OutEnd, 100));
+        var cleanInternetRow = Series(0);
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, access, Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare (1.1.1.1)", 2, internet1, IsInternet: true),
+            new OutageDetector.Hop("Google (8.8.8.8)", 3, cleanInternetRow, IsInternet: true),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().Be("Access ISP");
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Bursty_partial_loss_touching_every_tier_reads_path_wide_not_upstream_of_an_endpoint()
+    {
+        // Miniature of a real event: the nearest access row degraded in a short burst (low duty,
+        // so the duty test alone calls it "clean"), all transit lossy the whole window, internet
+        // endpoints bursty at 67%. The old attribution anchored on the least-lossy internet
+        // endpoint and read "break upstream of Google (8.8.8.8)". Nothing was cleanly reachable,
+        // so no hop may be named and no single network blamed - the event reads path-wide.
+        var ds = OutStart;
+        var de = OutStart.AddMinutes(10);
+        var burstEnd = OutStart.AddMinutes(2);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, burstEnd, 67), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 60), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 60), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 60), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Transit D", 4, LossSeries(ds, de, 60), AsnLabel: "Transit D"),
+            new OutageDetector.Hop("Google (8.8.8.8)", 5, LossSeries(ds, burstEnd, 67), IsInternet: true),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
     public void Olt_blip_at_onset_then_recovery_still_reads_upstream_and_leads_the_waterfall()
     {
         var internet1 = Series(0, (OutStart, OutEnd, 100));

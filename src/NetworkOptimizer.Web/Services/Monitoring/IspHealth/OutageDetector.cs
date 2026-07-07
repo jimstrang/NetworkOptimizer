@@ -24,9 +24,12 @@ public static class OutageDetector
     /// ASN owns several rows. Null AsnLabel (internet endpoints) falls back to <paramref name="Name"/>.
     /// <paramref name="KnownPosition"/> is false for rows absent from the persisted trace map - their
     /// Depth is a fabricated sort position (they sort last), so they can shape the outage but must
-    /// never anchor "break upstream of X" attribution.
+    /// never anchor "break upstream of X" attribution. <paramref name="IsInternet"/> marks internet
+    /// endpoint rows (destinations reached over diverse paths, not points on THE path) - they trigger
+    /// and shape outages but likewise never anchor attribution: "break upstream of a destination"
+    /// says nothing.
     /// </summary>
-    public sealed record Hop(string Name, int Depth, IReadOnlyList<LatencySample> Series, bool Groupable = false, string? AsnLabel = null, bool IsGateway = false, bool KnownPosition = true);
+    public sealed record Hop(string Name, int Depth, IReadOnlyList<LatencySample> Series, bool Groupable = false, string? AsnLabel = null, bool IsGateway = false, bool KnownPosition = true, bool IsInternet = false);
 
     /// <param name="triggerTargets">The internet/destination loss series whose near-total loss defines an outage.</param>
     /// <param name="hops">Every monitored hop, ordered by distance (Depth ascending = nearest first), for the shape.</param>
@@ -184,8 +187,11 @@ public static class OutageDetector
     {
         var partialPct = options.OutagePartialLossPct;
         // Degraded duty cycle per hop, mirroring the blackout attribution but at the partial
-        // threshold: the break sits just beyond the deepest hop that stayed clean.
+        // threshold: the break sits just beyond the deepest hop that stayed clean. touchedDepths
+        // tracks ANY degraded bucket - a hop that spent 40% of the window at 60% loss passes the
+        // duty test yet is no "reachable" anchor, so attribution uses the stricter set.
         var degradedDepth = new Dictionary<int, bool>();
+        var touchedDepths = new HashSet<int>();
         var degraded = new List<(Hop Hop, double Peak)>();
         double eventPeak = 0;
         foreach (var hop in pool.OrderBy(h => h.Depth))
@@ -203,6 +209,7 @@ public static class OutageDetector
             degradedDepth[hop.Depth] = (double)degradedBuckets / totalBuckets >= 0.5;
             if (degradedBuckets > 0)
             {
+                touchedDepths.Add(hop.Depth);
                 eventPeak = Math.Max(eventPeak, peak);
                 degraded.Add((hop, peak));
             }
@@ -231,9 +238,14 @@ public static class OutageDetector
             ? OutageScope.FullWan
             : OutageScope.Upstream;
         // Same split as the blackout builder: any clean WAN row decides the scope, but only a
-        // trace-map-anchored hop may name where the break sat.
+        // trace-map-anchored path hop may name where the break sat. Partial-loss cleanliness is
+        // strict (no degraded bucket at all): partials are intermittent by nature, so the duty
+        // test that suits blackouts would let a 60%-peak-loss hop pass as "reachable".
         var (lastReachableLabel, brokenNetwork) = scope == OutageScope.Upstream
-            ? AttributeBreak(pool, degradedDepth)
+            ? AttributeBreak(pool,
+                judged: h => degradedDepth.ContainsKey(h.Depth),
+                isClean: h => !touchedDepths.Contains(h.Depth),
+                isBroken: h => degradedDepth[h.Depth])
             : (null, null);
 
         var poolSeries = pool.Select(h => (IReadOnlyList<LatencySample>)h.Series).ToList();
@@ -258,28 +270,38 @@ public static class OutageDetector
     }
 
     /// <summary>
-    /// Break attribution for an Upstream-scoped event. The anchor is the deepest hop that stayed
-    /// clean AND holds a known trace-map position: a row absent from the trace map (KnownPosition
-    /// false) sits at a fabricated sort depth, so while its reachability legitimately proves the
-    /// break was upstream (scope), it cannot say WHERE the break sat. Anchored events prefer the
-    /// ASN label over the per-target name. With no anchorable hop, fall back to naming the network
-    /// the break surfaced in - the shallowest dark hop's ASN - via BrokenNetwork instead.
+    /// Break attribution for an Upstream-scoped event. The anchor is the deepest hop that
+    /// <paramref name="isClean"/> AND holds a known trace-map position AND is a path hop:
+    /// off-map rows (fabricated sort depth) and internet endpoints (destinations, not points
+    /// on the path) legitimately prove the break was upstream, but cannot say WHERE it sat.
+    /// Anchored events prefer the ASN label over the per-target name. With no anchorable hop,
+    /// fall back to naming the network the break surfaced in - the shallowest
+    /// <paramref name="isBroken"/> hop's ASN - but only when every nearer anchorable hop was
+    /// clean; a loss picture that starts at the first hop is path-wide, and blaming one
+    /// network would be a guess. Callers supply the cleanliness tests: blackouts use the
+    /// duty-cycle test (an onset blip must not disqualify the true anchor - validated on a
+    /// real access-ISP outage), partials require a hop untouched in the window (intermittent
+    /// 60%-loss buckets are not "reachable").
     /// </summary>
     private static (string? LastReachableHop, string? BrokenNetwork) AttributeBreak(
-        IEnumerable<Hop> wanHops, IReadOnlyDictionary<int, bool> darkAtDepth)
+        IEnumerable<Hop> wanHops, Func<Hop, bool> judged, Func<Hop, bool> isClean, Func<Hop, bool> isBroken)
     {
-        var judged = wanHops.Where(h => darkAtDepth.ContainsKey(h.Depth)).ToList();
-        var anchor = judged
-            .Where(h => h.KnownPosition && !darkAtDepth[h.Depth])
+        var rows = wanHops.Where(judged).ToList();
+        var anchor = rows
+            .Where(h => h.KnownPosition && !h.IsInternet && isClean(h))
             .OrderByDescending(h => h.Depth)
             .FirstOrDefault();
         if (anchor != null)
             return (anchor.AsnLabel ?? anchor.Name, null);
-        var broken = judged
-            .Where(h => darkAtDepth[h.Depth] && !string.IsNullOrEmpty(h.AsnLabel))
+        var broken = rows
+            .Where(h => isBroken(h) && !string.IsNullOrEmpty(h.AsnLabel))
             .OrderBy(h => h.Depth)
             .FirstOrDefault();
-        return (null, broken?.AsnLabel);
+        if (broken == null)
+            return (null, null);
+        var nearerUnclean = rows.Any(h =>
+            h.Depth < broken.Depth && h.KnownPosition && !h.IsInternet && !isClean(h));
+        return nearerUnclean ? (null, null) : (null, broken.AsnLabel);
     }
 
     /// <summary>Per bucket, the list of each reporting target's mean loss in that bucket.</summary>
@@ -409,9 +431,12 @@ public static class OutageDetector
                 ? OutageScope.FullWan
                 : OutageScope.Upstream;
         // Scope reads reachability from every WAN row (an off-map row answering still proves the
-        // break was upstream); the break's NAME comes only from trace-map-anchored hops.
+        // break was upstream); the break's NAME comes only from trace-map-anchored path hops.
         var (lastReachableLabel, brokenNetwork) = scope == OutageScope.Upstream
-            ? AttributeBreak(tiers.Where(t => !t.Hop.IsGateway).Select(t => t.Hop), onBrokenPath)
+            ? AttributeBreak(tiers.Where(t => !t.Hop.IsGateway).Select(t => t.Hop),
+                judged: h => onBrokenPath.ContainsKey(h.Depth),
+                isClean: h => !onBrokenPath[h.Depth],
+                isBroken: h => onBrokenPath[h.Depth])
             : (null, null);
 
         // Bucket edges are minute-aligned; report the real onset and recovery instants from

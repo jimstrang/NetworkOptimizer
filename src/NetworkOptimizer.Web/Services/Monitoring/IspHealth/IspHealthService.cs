@@ -758,14 +758,15 @@ public class IspHealthService
                 TargetIds = { t.TargetId },
                 Samples = ispSeries[t.TargetId],
                 HopIps = { t.Address }
-            }, Groupable: true, AsnLabel: AsnNameCleanup.Clean(t.AsnName) ?? accessAsnName))
-            .Concat(transitChart.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)TransitLabel(s))))
-            .Concat(displayInternet.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)null)));
+            }, Groupable: true, AsnLabel: AsnNameCleanup.Clean(t.AsnName) ?? accessAsnName, IsInternet: false))
+            .Concat(transitChart.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)TransitLabel(s), IsInternet: false)))
+            .Concat(displayInternet.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)null, IsInternet: true)));
         var orderedWanHops = outageSources
             .Select(x => new
             {
                 x.Groupable,
                 x.AsnLabel,
+                x.IsInternet,
                 Name = x.Series.AsnName ?? x.Series.TargetIds.FirstOrDefault() ?? "hop",
                 Series = (IReadOnlyList<LatencySample>)x.Series.Samples,
                 HopNumber = ClusterHopNumber(x.Series),
@@ -783,11 +784,12 @@ public class IspHealthService
         // Rows without a persisted hop number sorted to the end above - that Depth is a sort
         // position, not a path position, so they carry KnownPosition: false and never anchor
         // the detector's "break upstream of X" attribution (e.g. a hostname-based ISP target
-        // the discovery traces never mapped).
+        // the discovery traces never mapped). Internet endpoint rows are likewise flagged so
+        // a destination can never be named as the hop the break sat beyond.
         var outageHops = (gatewayHop != null ? new[] { gatewayHop } : Array.Empty<OutageDetector.Hop>())
             .Concat(orderedWanHops.Select((x, i) =>
                 new OutageDetector.Hop(x.Name, baseDepth + i, x.Series, x.Groupable, x.AsnLabel,
-                    KnownPosition: x.HopNumber != int.MaxValue)))
+                    KnownPosition: x.HopNumber != int.MaxValue, IsInternet: x.IsInternet)))
             .ToList();
         ct.ThrowIfCancellationRequested();
         var outages = OutageDetector.Detect(internetTriggerTargets, outageHops, _options);
