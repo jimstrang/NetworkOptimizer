@@ -16917,7 +16917,7 @@ a.isp-outage-ack:hover {
 }
 
 .issue-ack {
-    margin-top: 0.5rem;
+    margin-top: 0.75rem;
     font-size: 0.75rem;
     color: var(--text-muted);
 }
@@ -17000,7 +17000,11 @@ a.isp-outage-ack:hover {
     }
     .isp-outage-scope {
         margin-left: 0;
-        flex-basis: 100%;
+        flex: 1 0 auto;
+    }
+
+    .isp-outage-head .isp-outage-ack {
+        margin-left: auto;
     }
 }
 
