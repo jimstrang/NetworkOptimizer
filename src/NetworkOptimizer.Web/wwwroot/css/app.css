@@ -16243,6 +16243,11 @@ tr.stats-row-filtered {
     .isp-health-card .issue-recommendation {
         grid-row: auto;
     }
+
+    /* The grid's row-gap already spaces the ack blurb here; the desktop margin doubles it. */
+    .isp-health-card .issue-ack {
+        margin-top: 0.375rem;
+    }
 }
 
 .isp-health-toolbar {
@@ -16926,7 +16931,7 @@ a.isp-outage-ack:hover {
 }
 
 .issue-ack {
-    margin-top: 0.375rem;
+    margin-top: 0.75rem;
     margin-bottom: 0.25rem;
     font-size: 0.75rem;
     color: var(--text-muted);
