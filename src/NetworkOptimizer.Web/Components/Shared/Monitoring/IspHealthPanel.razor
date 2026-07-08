@@ -805,6 +805,10 @@ else
     {
         if (_refreshing || _windowComputing) return;
         _refreshing = true;
+        // Rendered explicitly: pull-to-refresh invokes this as a plain delegate (not a Blazor
+        // event), so without it nothing repaints the button/hero spinners until the recompute
+        // finishes. Redundant but harmless on the button path.
+        StateHasChanged();
         try
         {
             if (IsLiveWindow)
@@ -825,6 +829,7 @@ else
         finally
         {
             _refreshing = false;
+            StateHasChanged();
         }
     }
 
