@@ -1319,8 +1319,10 @@ public class IspHealthScorer
                 Description = $"{count} hit the path: many targets degraded at once without going fully dark, so the internet was lossy but not unreachable.{breadth}{impact}{UsageNote(partialDisruptions)}",
                 Recommendation = "Coincident partial loss across many targets is usually upstream/transit congestion or a brief routing wobble; logged so you can correlate it with ISP incidents or watch for a pattern.",
                 LinkUrl = "#isp-outages",
-                LinkText = "Shown on the timeline below.",
-                OutageStarts = partialDisruptions.Select(o => o.Start).ToList()
+                LinkText = "Shown on the timeline below."
+                // No "that was me" here: partial loss is congestion/routing behavior, not the
+                // signature of the user's own maintenance (that reads as a blackout). The
+                // per-event action on the disruption rows still allows excluding one.
             });
         }
 
