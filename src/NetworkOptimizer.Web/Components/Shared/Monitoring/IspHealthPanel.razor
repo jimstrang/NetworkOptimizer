@@ -5,6 +5,7 @@
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject Microsoft.AspNetCore.Mvc.ViewFeatures.IFileVersionProvider FileVersionProvider
+@inject NetworkOptimizer.Web.Services.PullToRefreshState PtrState
 
 @* Date/time filter (left) + Refresh. The live/cached view (the effective auto-computed window, which
    auto-fallback may have reduced below the configured target) is the only state where Refresh is
@@ -737,6 +738,11 @@ else
 
     protected override async Task OnInitializedAsync()
     {
+        // Pull-to-refresh on this tab recomputes the scorecard (the Refresh button's action)
+        // instead of the layout's full-page-reload fallback.
+        PtrState.RefreshCallback = RefreshAsync;
+        PtrState.NotifyStateChanged = StateHasChanged;
+
         try
         {
             _report = await IspHealth.GetReportAsync();
@@ -1365,6 +1371,13 @@ else
 
     public void Dispose()
     {
+        // Restore the default pull-to-refresh (full reload) when leaving the tab, but only
+        // if no later page/tab has already registered its own callback.
+        if (PtrState.RefreshCallback == (Func<Task>)RefreshAsync)
+        {
+            PtrState.RefreshCallback = null;
+            PtrState.NotifyStateChanged = null;
+        }
         _ageTimer?.Dispose();
         if (_chartMounted)
         {

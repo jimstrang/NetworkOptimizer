@@ -16942,7 +16942,7 @@ a.isp-outage-ack:hover {
     color: var(--text-muted);
 }
 
-.issue-ack a.isp-outage-ack {
+.issue-ack .isp-outage-ack {
     font-size: 0.75rem;
     margin-left: 0.35rem;
 }
