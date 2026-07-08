@@ -864,7 +864,10 @@ else
 
     private async Task ToggleOutageAckAsync(DateTime outageStartUtc, bool acknowledged)
     {
-        if (_ackPending.Count > 0 || !_ackPending.Add(outageStartUtc)) return;
+        if (_refreshing || _windowComputing || _ackPending.Count > 0 || !_ackPending.Add(outageStartUtc)) return;
+        // Drive the same busy state as the Refresh button: the ack runs the identical forced
+        // recompute, so the button and hero spinners should say so.
+        _refreshing = true;
         StateHasChanged();
         try
         {
@@ -877,6 +880,7 @@ else
         finally
         {
             _ackPending.Remove(outageStartUtc);
+            _refreshing = false;
             StateHasChanged();
         }
     }
