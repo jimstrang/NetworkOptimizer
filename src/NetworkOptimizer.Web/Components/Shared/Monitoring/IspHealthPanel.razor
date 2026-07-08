@@ -271,6 +271,18 @@ else
                                        data-tooltip="Jump to the most recent matching loss event on the Network Performance charts" data-tooltip-hover-only>@(issue.InvestigateText ?? "Investigate on the charts")</a>
                                 </div>
                             }
+                            @if (issue.OutageStarts.Count > 0)
+                            {
+                                <div class="issue-ack">
+                                    <span>Caused by something you did (pulled a cable, swapped equipment)?</span>
+                                    @foreach (var start in issue.OutageStarts)
+                                    {
+                                        <a class="isp-outage-ack" href="javascript:void(0)"
+                                           data-tooltip="Exclude this event from ISP Health scoring"
+                                           @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start)})" : "")</a>
+                                    }
+                                </div>
+                            }
                         </div>
                     </div>
                 }
@@ -510,6 +522,18 @@ else
                                 @if (outage.IsPartial)
                                 {
                                     <span class="isp-outage-window">peak @outage.PeakLossPct.ToString("0")% &middot; @outage.DegradedTargetCount/@outage.PathTargetCount targets</span>
+                                }
+                                @if (outage.Acknowledged)
+                                {
+                                    <span class="isp-outage-ack isp-outage-ack-done">that was me &middot; not scored
+                                        <a href="javascript:void(0)" @onclick="() => UnacknowledgeOutageAsync(outage.Start)">undo</a>
+                                    </span>
+                                }
+                                else if (outage.Scope != OutageScope.Local)
+                                {
+                                    <a class="isp-outage-ack" href="javascript:void(0)"
+                                       data-tooltip="Your own doing (pulled a cable, re-seated a connector, swapped equipment)? Click to exclude this event from ISP Health scoring."
+                                       @onclick="() => AcknowledgeOutageAsync(outage.Start)">that was me</a>
                                 }
                             </div>
                             @if (outage.Tiers.Any(t => t.WentDark))
@@ -801,6 +825,32 @@ else
     }
 
     /// <summary>
+    /// Marks an outage "that was me" (user-caused, excluded from scoring) and reloads the report
+    /// for the current window so the score and findings drop it immediately.
+    /// </summary>
+    private async Task AcknowledgeOutageAsync(DateTime outageStartUtc)
+    {
+        await IspHealth.AcknowledgeOutageAsync(outageStartUtc);
+        await ReloadAfterOutageAckAsync();
+    }
+
+    /// <summary>Removes a "that was me" mark so the outage scores normally again.</summary>
+    private async Task UnacknowledgeOutageAsync(DateTime outageStartUtc)
+    {
+        await IspHealth.UnacknowledgeOutageAsync(outageStartUtc);
+        await ReloadAfterOutageAckAsync();
+    }
+
+    private async Task ReloadAfterOutageAckAsync()
+    {
+        if (IsLiveWindow)
+            _report = await IspHealth.GetReportAsync();
+        else if (_windowStart.HasValue && _windowEnd.HasValue)
+            _report = await IspHealth.GetReportForWindowAsync(_windowStart.Value, _windowEnd.Value, forceRefresh: true);
+        StateHasChanged();
+    }
+
+    /// <summary>
     /// Overrides the scored access technology from the pill selector and reloads the report for the
     /// current window so the score and thresholds reflect the new technology immediately.
     /// </summary>
@@ -1061,8 +1111,17 @@ else
         }
         foreach (var shift in r.PathShifts)
         {
-            var direction = shift.Direction == PathShiftDirection.Up ? "up" : "down";
             var where = string.IsNullOrEmpty(shift.AsnName) ? (shift.TargetId ?? "path") : shift.AsnName;
+            if (shift.IsUnreachable)
+            {
+                var span = shift.UnreachableEnd.HasValue ? FormatDuration(shift.UnreachableEnd.Value - shift.Time) : "the window";
+                var hops = shift.CorrelatedTargetCount > 1 ? $" ({shift.CorrelatedTargetCount} monitored hops)" : "";
+                entries.Add(new TimelineEntry(shift.Time, "Path change", "isp-event-badge-info",
+                    $"{where} went fully unreachable for {span}{hops} - a routing (BGP) change, not access-layer loss. Excluded from the Packet Loss factor; still counted against {where}'s own network grade.",
+                    shift.UnreachableEnd));
+                continue;
+            }
+            var direction = shift.Direction == PathShiftDirection.Up ? "up" : "down";
             var correlated = shift.CorrelatedTargetCount > 1 ? $", seen on {shift.CorrelatedTargetCount} paths" : "";
             entries.Add(new TimelineEntry(shift.Time, "Path shift", "isp-event-badge-info",
                 $"RTT stepped {direction} {Math.Abs(shift.DeltaMs):0.#} ms on {where} ({shift.BeforeMedianMs:0.#} to {shift.AfterMedianMs:0.#} ms){correlated}. BGP or transport fabric change."));
@@ -1107,11 +1166,13 @@ else
     };
 
     private static string OutageScoreTooltip(OutageEvent o) =>
-        o.Scope == OutageScope.Local
-            ? "Not scored; a LAN/gateway outage is your own network, not the ISP."
-            : o.ScorePenaltyPoints > 0
-                ? $"Lowered your ISP Health score by {o.ScorePenaltyPoints} {(o.ScorePenaltyPoints == 1 ? "point" : "points")}."
-                : "No score impact.";
+        o.Acknowledged
+            ? "Not scored; you marked this as caused by your own work."
+            : o.Scope == OutageScope.Local
+                ? "Not scored; a LAN/gateway outage is your own network, not the ISP."
+                : o.ScorePenaltyPoints > 0
+                    ? $"Lowered your ISP Health score by {o.ScorePenaltyPoints} {(o.ScorePenaltyPoints == 1 ? "point" : "points")}."
+                    : "No score impact.";
 
     // Share of the outage window this hop spent dark (red), for the recovery-waterfall bar.
     // Capped at 95% so a sliver of the blue "up" track always shows on even the longest bars -

@@ -133,6 +133,51 @@ public class IspHealthService
         await GetReportAsync(forceRefresh: true, ct);
     }
 
+    /// <summary>
+    /// Marks the outage starting at <paramref name="outageStartUtc"/> as user-caused ("that
+    /// was me" - their own maintenance, e.g. pulling the coax to add a pad), which excludes it
+    /// from the score and the findings, then recomputes. Keyed on the onset time and matched
+    /// by tolerance (<see cref="IspHealthOptions.OutageAckMatchToleranceSeconds"/>), because a
+    /// recompute can shift a detected outage's boundaries by a bucket.
+    /// </summary>
+    public async Task AcknowledgeOutageAsync(DateTime outageStartUtc, CancellationToken ct = default)
+    {
+        await using (var db = await CreateSiteDbAsync(ct))
+        {
+            var tolerance = TimeSpan.FromSeconds(_options.OutageAckMatchToleranceSeconds);
+            var exists = (await db.OutageAcknowledgements.AsNoTracking().ToListAsync(ct))
+                .Any(a => (a.OutageStartUtc - outageStartUtc).Duration() <= tolerance);
+            if (!exists)
+            {
+                db.OutageAcknowledgements.Add(new OutageAcknowledgement
+                {
+                    OutageStartUtc = outageStartUtc,
+                    AcknowledgedAt = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        await GetReportAsync(forceRefresh: true, ct);
+    }
+
+    /// <summary>Removes a "that was me" acknowledgement (tolerance-matched) and recomputes.</summary>
+    public async Task UnacknowledgeOutageAsync(DateTime outageStartUtc, CancellationToken ct = default)
+    {
+        await using (var db = await CreateSiteDbAsync(ct))
+        {
+            var tolerance = TimeSpan.FromSeconds(_options.OutageAckMatchToleranceSeconds);
+            var matches = (await db.OutageAcknowledgements.ToListAsync(ct))
+                .Where(a => (a.OutageStartUtc - outageStartUtc).Duration() <= tolerance)
+                .ToList();
+            if (matches.Count > 0)
+            {
+                db.OutageAcknowledgements.RemoveRange(matches);
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        await GetReportAsync(forceRefresh: true, ct);
+    }
+
     public IspHealthOptions Options => _options;
 
     /// <summary>
@@ -417,6 +462,9 @@ public class IspHealthService
         // (the trace map landed post-launch), where the caller falls back to RTT.
         Dictionary<string, int> hopNumberByTargetId;
         bool hopOrderKnown;
+        // Onsets of outages the user marked "that was me", stamped onto the detected events
+        // below (tolerance-matched; a recompute can shift a boundary by a bucket).
+        List<DateTime> ackedOutageStarts;
         await using (var db = await CreateSiteDbAsync(ct))
         {
             var settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
@@ -467,6 +515,10 @@ public class IspHealthService
                 .Where(d => targetIdById.ContainsKey(d.MonitoringTargetId!.Value))
                 .GroupBy(d => targetIdById[d.MonitoringTargetId!.Value])
                 .ToDictionary(g => g.Key, g => g.Min(d => d.HopNumber));
+
+            ackedOutageStarts = await db.OutageAcknowledgements.AsNoTracking()
+                .Select(a => a.OutageStartUtc)
+                .ToListAsync(ct);
         }
 
         var ispTargets = targets.Where(t => t.TargetType == MonitoringTargetType.AccessIsp).ToList();
@@ -577,6 +629,21 @@ public class IspHealthService
             if (internetDeltas.Count > 0) internetMedianDelta = SeriesStats.Median(internetDeltas);
         }
 
+        // Windows where a transit target sat at total loss for minutes: a routing/BGP change
+        // (the hop left the forwarding path), not access-layer loss. Carved out of THAT
+        // target's loss-pool contribution below - every other access/transit/DNS series keeps
+        // feeding the pool through the same span, so pooled loss stays usable on paths with
+        // several upstream ASNs - and surfaced as path events after outage detection. The
+        // ASN's own grade uses the unfiltered grading series, so it still takes the hit.
+        var transitDarkWindows = transitTargets
+            .Where(t => transitSeries.ContainsKey(t.TargetId))
+            .SelectMany(t => TransitUnreachableDetector.Detect(
+                t.TargetId, t.AsnNumber ?? 0, AsnNameCleanup.Clean(t.AsnName), transitSeries[t.TargetId], _options))
+            .ToList();
+        var darkByTargetId = transitDarkWindows
+            .GroupBy(w => w.TargetId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
         // Loss pool: ALL enabled AccessIsp + Transit targets plus well-known anycast DNS.
         // Every probe crosses the access link before reaching its target, so loss on ANY
         // of these is a signal of access-layer loss - including under load, where the
@@ -585,9 +652,13 @@ public class IspHealthService
         // access-loss signal than one sparse hop. (Latency, by contrast, uses only the
         // nearest hop because far-hop RTT carries transit variance that isn't the access
         // link's loaded behavior - see PickFirstCleanHop / spec "Measurement sources".)
+        // Transit series enter minus their unreachable windows (see transitDarkWindows above).
         var lossPool = new List<List<LatencySample>>();
         lossPool.AddRange(ispTargets.Where(t => ispSeries.ContainsKey(t.TargetId)).Select(t => ispSeries[t.TargetId]));
-        lossPool.AddRange(transitTargets.Where(t => transitSeries.ContainsKey(t.TargetId)).Select(t => transitSeries[t.TargetId]));
+        lossPool.AddRange(transitTargets.Where(t => transitSeries.ContainsKey(t.TargetId)).Select(t =>
+            darkByTargetId.TryGetValue(t.TargetId, out var dark)
+                ? transitSeries[t.TargetId].Where(s => !dark.Any(w => s.Time >= w.Start && s.Time <= w.End)).ToList()
+                : transitSeries[t.TargetId]));
         lossPool.AddRange(targets
             .Where(t => t.TargetType == MonitoringTargetType.InternetService
                 && AnycastDnsIps.Contains(t.Address)
@@ -799,6 +870,34 @@ public class IspHealthService
             outageHops, outages.Select(o => (o.Start, o.End)).ToList(), _options);
         outages = outages.Concat(partialDisruptions).OrderBy(o => o.Start).ToList();
 
+        // Surface the transit-unreachable windows as path events, merged per ASN - unless the
+        // span mostly sat inside a blackout outage, where the whole path was dark and the
+        // outage machinery already owns the story (its window is masked from the loss factors
+        // anyway). Informational like RTT-step shifts; the score effect is the loss-pool
+        // carve-out above, never the event itself.
+        var blackoutSpans = outages.Where(o => !o.IsPartial).Select(o => (o.Start, o.End)).ToList();
+        double OverlapSeconds(DateTime s, DateTime e) => blackoutSpans.Sum(b =>
+            Math.Max(0, (new DateTime(Math.Min(e.Ticks, b.End.Ticks)) - new DateTime(Math.Max(s.Ticks, b.Start.Ticks))).TotalSeconds));
+        var unreachableEvents = TransitUnreachableDetector.MergeByAsn(transitDarkWindows, _options)
+            .Where(e => OverlapSeconds(e.Start, e.End) < (e.End - e.Start).TotalSeconds * 0.5)
+            .Select(e => new PathShiftEvent
+            {
+                Time = e.Start,
+                AsnNumber = e.AsnNumber > 0 ? e.AsnNumber : null,
+                AsnName = e.AsnName,
+                IsUnreachable = true,
+                UnreachableEnd = e.End,
+                CorrelatedTargetCount = e.TargetCount
+            })
+            .ToList();
+        if (unreachableEvents.Count > 0)
+        {
+            foreach (var e in unreachableEvents)
+                _logger.LogDebug("ISP Health: transit unreachable {Asn} {Start:HH:mm:ss} - {End:HH:mm:ss} ({Targets} target(s)); loss excluded from the access-layer pool",
+                    e.AsnName ?? $"AS{e.AsnNumber}", e.Time, e.UnreachableEnd, e.CorrelatedTargetCount);
+            pathShifts = pathShifts.Concat(unreachableEvents).OrderBy(p => p.Time).ToList();
+        }
+
         // Weight each outage by the time-of-day usage fingerprint so a drop during heavy-usage hours
         // counts in full and one during typically-idle hours dings less. Null fingerprint (weighting
         // off, or too few days of data) leaves every UsageWeight at 1.0 - no grade-down.
@@ -809,6 +908,15 @@ public class IspHealthService
             foreach (var o in outages)
                 o.UsageWeight = UsageWeighting.Weight(
                     usageFingerprint, UsageWeighting.LocalHoursSpanned(o.Start, o.End, usageZone), _options.UsageWeightFloor);
+        }
+
+        // Stamp the user's "that was me" acknowledgements onto the detected events so the
+        // scorer leaves them out of the penalty and the findings.
+        if (ackedOutageStarts.Count > 0)
+        {
+            var ackTolerance = TimeSpan.FromSeconds(_options.OutageAckMatchToleranceSeconds);
+            foreach (var o in outages)
+                o.Acknowledged = ackedOutageStarts.Any(a => (a - o.Start).Duration() <= ackTolerance);
         }
 
         // chartClusters (one line per cluster) is the chart view computed from the same

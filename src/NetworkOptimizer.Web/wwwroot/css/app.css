@@ -16880,6 +16880,41 @@ a.isp-health-hero-speed:hover {
     margin-left: auto;
 }
 
+.isp-outage-ack {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    text-decoration: none;
+}
+
+a.isp-outage-ack:hover {
+    color: var(--text-secondary);
+    text-decoration: underline;
+}
+
+.isp-outage-ack-done {
+    cursor: default;
+}
+
+.isp-outage-ack-done a {
+    color: var(--text-muted);
+    margin-left: 0.3rem;
+}
+
+.isp-outage-ack-done a:hover {
+    color: var(--text-secondary);
+    text-decoration: underline;
+}
+
+.issue-ack {
+    margin-top: 0.35rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.6rem;
+}
+
 .isp-outage-shape {
     display: flex;
     flex-direction: column;

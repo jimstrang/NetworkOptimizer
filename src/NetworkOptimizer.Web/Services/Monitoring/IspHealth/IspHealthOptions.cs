@@ -328,6 +328,28 @@ public class IspHealthOptions
     public double StepStableIqrFraction { get; set; } = 0.15;
 
     /// <summary>
+    /// Loss (percent) at or above which a transit target's sample counts as unreachable for
+    /// the transit-unreachable (route change) carve-out. Effectively total loss: a transit
+    /// hop that is merely lossy keeps feeding the access-layer loss pool, so a stable path's
+    /// loss floor and loaded loss are untouched.
+    /// </summary>
+    public double TransitUnreachableLossPct { get; set; } = 99.0;
+
+    /// <summary>
+    /// Minimum seconds of sustained total loss before a transit target reads as withdrawn
+    /// from the path (a BGP/routing change) rather than a loss burst. A couple of minutes:
+    /// brief total-loss flaps stay in the loss pool; a multi-minute washout is a path event.
+    /// </summary>
+    public int TransitUnreachableMinSeconds { get; set; } = 180;
+
+    /// <summary>
+    /// A monitoring gap between dark samples no longer than this keeps one unreachable run
+    /// intact instead of splitting it (an unreachable target stays dark through a console
+    /// restart). Also the merge gap when per-target windows collapse into one per-ASN event.
+    /// </summary>
+    public int TransitUnreachableMaxGapSeconds { get; set; } = 300;
+
+    /// <summary>
     /// Bucket size in seconds for outage detection. Sub-minute so a brief (~30 s) drop resolves
     /// into its own fully-dark buckets instead of being diluted to a partial-loss bucket inside a
     /// one-minute window and failing the dark-fraction gate. At the internet targets' ~7-10 s
@@ -380,6 +402,13 @@ public class IspHealthOptions
     /// it short - the over-count is bounded by this value per seam.
     /// </summary>
     public int OutageMaxGapSeconds { get; set; } = 180;
+
+    /// <summary>
+    /// Tolerance in seconds for matching a persisted "that was me" outage acknowledgement to
+    /// a detected outage's onset. Recomputes can shift an outage boundary by a bucket or a
+    /// coalesced seam, so the match cannot be exact-time.
+    /// </summary>
+    public int OutageAckMatchToleranceSeconds { get; set; } = 120;
 
     /// <summary>
     /// Bucket size in seconds for the partial-loss (degradation) pass. Wider than the blackout

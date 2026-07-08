@@ -23,6 +23,7 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<UniFiSshSettings> UniFiSshSettings { get; set; }
     public DbSet<GatewaySshSettings> GatewaySshSettings { get; set; }
     public DbSet<DismissedIssue> DismissedIssues { get; set; }
+    public DbSet<OutageAcknowledgement> OutageAcknowledgements { get; set; }
     public DbSet<SystemSetting> SystemSettings { get; set; }
     public DbSet<UniFiConnectionSettings> UniFiConnectionSettings { get; set; }
     public DbSet<SqmWanConfiguration> SqmWanConfigurations { get; set; }
@@ -185,6 +186,13 @@ public class NetworkOptimizerDbContext : DbContext
         {
             entity.ToTable("DismissedIssues");
             entity.HasIndex(e => e.IssueKey).IsUnique();
+        });
+
+        // OutageAcknowledgement configuration ("that was me" on ISP Health outages)
+        modelBuilder.Entity<OutageAcknowledgement>(entity =>
+        {
+            entity.ToTable("OutageAcknowledgements");
+            entity.HasIndex(e => e.OutageStartUtc);
         });
 
         // SystemSetting configuration (key-value store)

@@ -119,6 +119,17 @@ function buildAnnotations(events) {
                     style: { color: '#ededef', background: e.shared ? '#7f1d1d' : '#78350f', fontSize: '10px' },
                 },
             });
+        } else if (e.type === 'unreachable') {
+            xaxis.push({
+                x: new Date(e.start).getTime(),
+                x2: e.end ? new Date(e.end).getTime() : undefined,
+                fillColor: '#4797ff',
+                opacity: 0.12,
+                label: {
+                    text: e.label,
+                    style: { color: '#ededef', background: '#1e3a5f', fontSize: '10px' },
+                },
+            });
         } else {
             xaxis.push({
                 x: new Date(e.start).getTime(),

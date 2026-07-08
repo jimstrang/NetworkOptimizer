@@ -156,6 +156,12 @@ public class IspHealthIssue
     /// mirroring the Access Layer sub-score headers (e.g. ?investigate=loaded-loss).</summary>
     public string? InvestigateUrl { get; init; }
     public string? InvestigateText { get; init; }
+
+    /// <summary>
+    /// Onset times (UTC) of the outage events this finding aggregates, so the panel can offer
+    /// the per-event "that was me" exclusion on the finding itself. Empty for non-outage findings.
+    /// </summary>
+    public List<DateTime> OutageStarts { get; init; } = new();
 }
 
 /// <summary>
@@ -285,6 +291,18 @@ public class PathShiftEvent
     /// <summary>True when this shift came from an internet/CDN destination (by DB TargetType),
     /// not an on-path ISP/transit hop. Correlation prefers a non-destination as the label.</summary>
     public bool IsDestination { get; init; }
+
+    /// <summary>
+    /// True for a transit-unreachable event: the target(s) went to total loss for minutes -
+    /// a route withdrawal/BGP change, not an RTT step. <see cref="Time"/> is the window
+    /// start and <see cref="UnreachableEnd"/> its end; the median/delta fields are unused
+    /// (0). The window's loss is carved out of the access-layer loss pool; the ASN's own
+    /// network grade still sees it.
+    /// </summary>
+    public bool IsUnreachable { get; init; }
+
+    /// <summary>End of the unreachable window (last dark sample); null for RTT-step shifts.</summary>
+    public DateTime? UnreachableEnd { get; init; }
 }
 
 /// <summary>Whether the access/first hop itself went dark, or only everything beyond it.</summary>
@@ -385,6 +403,15 @@ public class OutageEvent
     /// penalty so a drop during a quiet hour dings less than the same drop at peak. Set by the service.
     /// </summary>
     public double UsageWeight { get; set; } = 1.0;
+
+    /// <summary>
+    /// True when the user marked this event "that was me" (their own maintenance - pulled the
+    /// coax to add a pad, re-seated a connector), excluding it from the outage score penalty
+    /// and the findings. Still shown on the timeline, and a blackout's dark window still
+    /// masks its loss from the other factors. Set by the service from the persisted
+    /// acknowledgements, matched to the onset time by tolerance.
+    /// </summary>
+    public bool Acknowledged { get; set; }
 }
 
 /// <summary>One network tier's behavior during an outage, for the recovery-shape display.</summary>
