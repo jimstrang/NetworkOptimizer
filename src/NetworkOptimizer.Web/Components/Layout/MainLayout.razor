@@ -109,6 +109,9 @@
         }
 
         var autoHideTimer = null;
+        // Auto-hide fires once per page visit; once the bar has hidden, revealing it
+        // by scrolling up must not re-arm the timer (re-hiding on its own feels jarring)
+        var autoHideDone = false;
 
         function isContentScrollable() {
             return currentEl && currentEl.scrollHeight > currentEl.clientHeight + 10;
@@ -116,6 +119,7 @@
 
         function startAutoHideTimer(topBar) {
             clearAutoHideTimer();
+            if (autoHideDone) return;
             var page = document.querySelector('[data-autohide-nav]');
             if (!page) return;
             var delay = parseInt(page.getAttribute('data-autohide-nav')) || 3000;
@@ -126,6 +130,7 @@
                 // the open menu inherit pointer-events: none and freeze it on screen
                 if (document.querySelector('.site-switcher-menu')) return;
                 if (topBar && !topBar.classList.contains('top-bar-hidden')) {
+                    autoHideDone = true;
                     topBar.classList.add('top-bar-hidden');
                     setTimeout(function() { if (topBar.classList.contains('top-bar-hidden') && currentEl && currentEl.scrollHeight - topBar.offsetHeight > currentEl.clientHeight + 10) topBar.classList.add('top-bar-collapsed'); }, 350);
                     if (currentEl) currentEl.style.scrollPaddingTop = '0px';
@@ -171,6 +176,7 @@
                         topBar.classList.add('top-bar-hidden');
                         currentEl.style.scrollPaddingTop = '0px';
                         clearAutoHideTimer();
+                        autoHideDone = true;
                     } else if (!nearBottom && scrollUpAccum > 60) {
                         // Require 60px cumulative upward scroll, not near bottom
                         topBar.classList.remove('top-bar-hidden', 'top-bar-collapsed');
@@ -206,8 +212,10 @@
                     if (hidden) {
                         topBar.classList.add('top-bar-hidden');
                         clearAutoHideTimer();
+                        autoHideDone = true;
                     } else {
                         topBar.classList.remove('top-bar-hidden', 'top-bar-collapsed');
+                        autoHideDone = false;
                         startAutoHideTimer(topBar);
                     }
                 }
