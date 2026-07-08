@@ -17049,6 +17049,10 @@ a.isp-outage-ack:hover {
         gap: 1.25rem;
         padding: 1.25rem 1rem;
         justify-items: center;
+        /* Stacked layout is much taller than desktop's row, so the desktop min-height lets
+           the hero collapse (and jump) when the loading spinner replaces the score. Hold the
+           stacked height so the spinner box matches the score box. */
+        min-height: 440px;
     }
     .isp-speed-measured {
         font-size: 2rem;
