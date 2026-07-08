@@ -3259,6 +3259,11 @@ select.form-control {
         right: 0;
     }
 
+    .top-bar.top-bar-hidden .site-switcher-menu,
+    .top-bar.top-bar-hidden .site-switcher-backdrop {
+        pointer-events: auto;
+    }
+
     .app-footer {
         padding: 0.5rem 1rem;
         font-size: 0.6rem;
