@@ -16930,6 +16930,11 @@ a.isp-outage-ack:hover {
     color: var(--text-primary);
 }
 
+.isp-outage-ack-locked {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
 .issue-ack {
     margin-top: 0.75rem;
     margin-bottom: 0.25rem;

@@ -277,10 +277,17 @@ else
                                     <span>Caused by something you did (pulled a cable, swapped equipment)?</span>
                                     @foreach (var start in issue.OutageStarts)
                                     {
-                                        <a class="isp-outage-ack" href="javascript:void(0)"
-                                           data-tooltip="Exclude this event from ISP Health scoring"
-                                           data-tooltip-hover-only
-                                           @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start)})" : "")</a>
+                                        @if (_ackPending.Contains(start))
+                                        {
+                                            <span class="isp-outage-ack">excluding...</span>
+                                        }
+                                        else
+                                        {
+                                            <a class="isp-outage-ack @AckLockClass" href="javascript:void(0)"
+                                               data-tooltip="Exclude this event from ISP Health scoring"
+                                               data-tooltip-hover-only
+                                               @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start)})" : "")</a>
+                                        }
                                     }
                                 </div>
                             }
@@ -524,15 +531,19 @@ else
                                 {
                                     <span class="isp-outage-window">peak @outage.PeakLossPct.ToString("0")% &middot; @outage.DegradedTargetCount/@outage.PathTargetCount targets</span>
                                 }
-                                @if (outage.Acknowledged)
+                                @if (_ackPending.Contains(outage.Start))
+                                {
+                                    <span class="isp-outage-ack">@(outage.Acknowledged ? "restoring..." : "excluding...")</span>
+                                }
+                                else if (outage.Acknowledged)
                                 {
                                     <span class="isp-outage-ack isp-outage-ack-done">that was me &middot; not scored
-                                        <a href="javascript:void(0)" @onclick="() => UnacknowledgeOutageAsync(outage.Start)">undo</a>
+                                        <a href="javascript:void(0)" class="@AckLockClass" @onclick="() => UnacknowledgeOutageAsync(outage.Start)">undo</a>
                                     </span>
                                 }
                                 else if (outage.Scope != OutageScope.Local)
                                 {
-                                    <a class="isp-outage-ack" href="javascript:void(0)"
+                                    <a class="isp-outage-ack @AckLockClass" href="javascript:void(0)"
                                        data-tooltip="Your own doing (pulled a cable, re-seated a connector, swapped equipment)? Click to exclude this event from ISP Health scoring."
                                        data-tooltip-hover-only
                                        @onclick="() => AcknowledgeOutageAsync(outage.Start)">that was me</a>
@@ -826,16 +837,15 @@ else
         StateHasChanged();
     }
 
-    // Outage starts with an ack/undo in flight, so a second press can't queue a second
-    // full recompute while the first one runs.
+    // The outage start whose ack/undo is in flight. While set, every ack link (outage rows
+    // and findings alike) is locked out and the pressed one shows a busy label - the persist +
+    // forced recompute behind the reload takes seconds, and without visible feedback the press
+    // reads as if it didn't register.
     private readonly HashSet<DateTime> _ackPending = new();
+    private string AckLockClass => _ackPending.Count > 0 ? "isp-outage-ack-locked" : "";
 
-    /// <summary>
-    /// Marks an outage "that was me" (user-caused, excluded from scoring) and reloads the report
-    /// for the current window. The displayed event is flipped optimistically first: the persist +
-    /// forced recompute behind the real reload takes seconds, and with no immediate feedback the
-    /// press reads as if it didn't register.
-    /// </summary>
+    /// <summary>Marks an outage "that was me" (user-caused, excluded from scoring) and reloads
+    /// the report for the current window so the score and findings drop it.</summary>
     private Task AcknowledgeOutageAsync(DateTime outageStartUtc) => ToggleOutageAckAsync(outageStartUtc, true);
 
     /// <summary>Removes a "that was me" mark so the outage scores normally again.</summary>
@@ -843,15 +853,10 @@ else
 
     private async Task ToggleOutageAckAsync(DateTime outageStartUtc, bool acknowledged)
     {
-        if (!_ackPending.Add(outageStartUtc)) return;
+        if (_ackPending.Count > 0 || !_ackPending.Add(outageStartUtc)) return;
+        StateHasChanged();
         try
         {
-            var shown = _report?.Outages.FirstOrDefault(o => o.Start == outageStartUtc);
-            if (shown != null)
-            {
-                shown.Acknowledged = acknowledged;
-                StateHasChanged();
-            }
             if (acknowledged)
                 await IspHealth.AcknowledgeOutageAsync(outageStartUtc);
             else
