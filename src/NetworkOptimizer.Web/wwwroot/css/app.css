@@ -16235,10 +16235,13 @@ tr.stats-row-filtered {
         grid-column: 1 / -1;
     }
 
-    /* Title sits in row 1 here (not the generic row 2), so pull the description up to
-       row 2 - otherwise the auto-placed recommendation fills the empty row between them. */
-    .isp-health-card .issue-description {
-        grid-row: 2;
+    /* The generic rules pin description/recommendation to fixed rows for the audit-card
+       layout (title in row 2, context in row 4). Here the title sits in row 1 and there
+       is no context row, so fixed rows leave holes that the auto-placed investigate/ack
+       blocks backfill out of order - let the content flow in DOM order instead. */
+    .isp-health-card .issue-description,
+    .isp-health-card .issue-recommendation {
+        grid-row: auto;
     }
 }
 
