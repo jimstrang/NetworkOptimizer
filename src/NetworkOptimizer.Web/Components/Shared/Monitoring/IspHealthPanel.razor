@@ -826,21 +826,43 @@ else
         StateHasChanged();
     }
 
+    // Outage starts with an ack/undo in flight, so a second press can't queue a second
+    // full recompute while the first one runs.
+    private readonly HashSet<DateTime> _ackPending = new();
+
     /// <summary>
     /// Marks an outage "that was me" (user-caused, excluded from scoring) and reloads the report
-    /// for the current window so the score and findings drop it immediately.
+    /// for the current window. The displayed event is flipped optimistically first: the persist +
+    /// forced recompute behind the real reload takes seconds, and with no immediate feedback the
+    /// press reads as if it didn't register.
     /// </summary>
-    private async Task AcknowledgeOutageAsync(DateTime outageStartUtc)
-    {
-        await IspHealth.AcknowledgeOutageAsync(outageStartUtc);
-        await ReloadAfterOutageAckAsync();
-    }
+    private Task AcknowledgeOutageAsync(DateTime outageStartUtc) => ToggleOutageAckAsync(outageStartUtc, true);
 
     /// <summary>Removes a "that was me" mark so the outage scores normally again.</summary>
-    private async Task UnacknowledgeOutageAsync(DateTime outageStartUtc)
+    private Task UnacknowledgeOutageAsync(DateTime outageStartUtc) => ToggleOutageAckAsync(outageStartUtc, false);
+
+    private async Task ToggleOutageAckAsync(DateTime outageStartUtc, bool acknowledged)
     {
-        await IspHealth.UnacknowledgeOutageAsync(outageStartUtc);
-        await ReloadAfterOutageAckAsync();
+        if (!_ackPending.Add(outageStartUtc)) return;
+        try
+        {
+            var shown = _report?.Outages.FirstOrDefault(o => o.Start == outageStartUtc);
+            if (shown != null)
+            {
+                shown.Acknowledged = acknowledged;
+                StateHasChanged();
+            }
+            if (acknowledged)
+                await IspHealth.AcknowledgeOutageAsync(outageStartUtc);
+            else
+                await IspHealth.UnacknowledgeOutageAsync(outageStartUtc);
+            await ReloadAfterOutageAckAsync();
+        }
+        finally
+        {
+            _ackPending.Remove(outageStartUtc);
+            StateHasChanged();
+        }
     }
 
     private async Task ReloadAfterOutageAckAsync()
