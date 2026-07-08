@@ -279,6 +279,7 @@ else
                                     {
                                         <a class="isp-outage-ack" href="javascript:void(0)"
                                            data-tooltip="Exclude this event from ISP Health scoring"
+                                           data-tooltip-hover-only
                                            @onclick="() => AcknowledgeOutageAsync(start)">that was me@(issue.OutageStarts.Count > 1 ? $" ({EventTimeLabel(start)})" : "")</a>
                                     }
                                 </div>
@@ -533,6 +534,7 @@ else
                                 {
                                     <a class="isp-outage-ack" href="javascript:void(0)"
                                        data-tooltip="Your own doing (pulled a cable, re-seated a connector, swapped equipment)? Click to exclude this event from ISP Health scoring."
+                                       data-tooltip-hover-only
                                        @onclick="() => AcknowledgeOutageAsync(outage.Start)">that was me</a>
                                 }
                             </div>
