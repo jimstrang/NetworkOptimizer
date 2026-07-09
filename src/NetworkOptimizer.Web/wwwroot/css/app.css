@@ -14430,7 +14430,7 @@ a.affected-client:hover {
     background: var(--bg-tertiary);
 }
 
-.wan-speedtest .wan-test-option-unavailable {
+.wan-speedtest .wan-test-option-unavailable > *:not(.alert) {
     opacity: 0.6;
 }
 
