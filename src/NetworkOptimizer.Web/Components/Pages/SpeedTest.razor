@@ -71,17 +71,29 @@
     </div>
 </div>
 
-@if (_siteAgentOffline)
+@if (_agentRequired)
 {
     <div class="alert alert-warning iperf3-missing-alert">
         <div class="iperf3-missing-content">
             <div class="iperf3-missing-icon">!</div>
             <div class="iperf3-missing-text">
-                <strong>Site Agent Offline</strong>
-                <p>
-                    This site's LAN speed tests run through its on-site agent, which isn't
-                    connected right now. Tests resume automatically when the agent reconnects.
-                </p>
+                @if (_siteAgentOffline)
+                {
+                    <strong>Site Agent Offline</strong>
+                    <p>
+                        This site's LAN speed tests run through its on-site agent, which isn't
+                        connected right now. Tests resume automatically when the agent reconnects.
+                    </p>
+                }
+                else
+                {
+                    <strong>No Site Agent</strong>
+                    <p>
+                        LAN speed tests on a managed site run from its on-site agent, and this
+                        site has none online. Set up the site's agent under
+                        <a href="/settings#multi-site">Settings</a> to enable them.
+                    </p>
+                }
             </div>
         </div>
     </div>
@@ -123,7 +135,7 @@
     </div>
 }
 
-<div class="speedtest-container @((localIperf3Status != null && !localIperf3Status.IsAvailable) || _siteAgentOffline ? "locked-out" : "")">
+<div class="speedtest-container @((localIperf3Status != null && !localIperf3Status.IsAvailable) || _agentRequired ? "locked-out" : "")">
     <!-- Gateway Speed Test Section -->
     <div class="card" id="gateway-test">
         <div class="card-header">
@@ -142,6 +154,10 @@
                     <span class="spinner"></span>
                     <span>Loading...</span>
                 </div>
+            }
+            else if (!string.IsNullOrEmpty(gatewayLoadError))
+            {
+                <div class="alert alert-danger">@gatewayLoadError</div>
             }
             else if (!gatewayConfigured)
             {
@@ -1329,6 +1345,10 @@
     // LAN tests run through that agent (SSH to devices + throughput at the site),
     // so they're locked out until it reconnects; the poll re-enables them.
     private bool _siteAgentOffline;
+    // A managed (non-default) site with no live agent at all - covers both the
+    // via-agent-but-disconnected case (_siteAgentOffline) and a site that has
+    // never set an agent up. LAN tests can't run either way, so the page locks out.
+    private bool _agentRequired;
     private System.Threading.Timer? _agentStatusTimer;
 
     // Schedule banner
@@ -1408,6 +1428,7 @@
     private bool gatewayExpanded = false;
     private string gatewayMessage = "";
     private string gatewayMessageClass = "";
+    private string? gatewayLoadError;    // set when the gateway SSH settings read fails, so we degrade instead of claiming "not configured"
     private GatewaySpeedTestResult? gatewayLastResult;
     private Iperf3Status? gatewayIperf3Status;
 
@@ -1448,9 +1469,13 @@
     /// </summary>
     private async Task RefreshAgentAvailabilityAsync()
     {
-        _siteAgentOffline = !SiteContext.IsDefault
-            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
-            && !TunnelRouting.IsAgentOnline(SiteContext.Slug);
+        // A managed site with no live agent can't run LAN tests, full stop: a site
+        // that is via-agent configured but momentarily disconnected gets the
+        // "resumes when it reconnects" message, a site with no agent set up at all
+        // gets pointed at agent setup instead of a runnable-but-wrong test.
+        var agentOnline = TunnelRouting.IsAgentOnline(SiteContext.Slug);
+        _agentRequired = !SiteContext.IsDefault && !agentOnline;
+        _siteAgentOffline = _agentRequired && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug);
     }
 
     /// <summary>
@@ -1467,9 +1492,9 @@
             {
                 await InvokeAsync(async () =>
                 {
-                    var before = _siteAgentOffline;
+                    var before = (_siteAgentOffline, _agentRequired);
                     await RefreshAgentAvailabilityAsync();
-                    if (before != _siteAgentOffline)
+                    if (before != (_siteAgentOffline, _agentRequired))
                         StateHasChanged();
                 });
             }
@@ -1502,11 +1527,17 @@
     private async Task LoadGatewayConfiguration()
     {
         gatewayLoading = true;
+        gatewayLoadError = null;
         try
         {
             var settings = await GatewaySpeedTestService.GetSettingsAsync();
             gatewayConfigured = settings.Enabled && settings.HasCredentials && !string.IsNullOrEmpty(settings.Host);
             gatewayLastResult = GatewaySpeedTestService.GetLastResult();
+        }
+        catch
+        {
+            gatewayConfigured = false;
+            gatewayLoadError = "Could not check gateway status";
         }
         finally
         {
