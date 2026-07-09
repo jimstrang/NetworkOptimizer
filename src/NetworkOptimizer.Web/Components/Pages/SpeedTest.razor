@@ -1386,6 +1386,7 @@
     // Discovered devices from UniFi controller (using unified discovery service)
     private List<DiscoveredDevice> discoveredDevices = new();
     private bool loadingDiscovered = false;
+    private bool _discoveredDevicesLoaded;    // set once the device list has loaded from a connected console; the agent-status poll retries the load when the console reconnects
 
     // Saved devices form state
     private bool showAddDevice = false;
@@ -1509,7 +1510,18 @@
                 {
                     var before = (_siteAgentOffline, _agentRequired);
                     await RefreshAgentAvailabilityAsync();
-                    if (before != (_siteAgentOffline, _agentRequired))
+                    var changed = before != (_siteAgentOffline, _agentRequired);
+
+                    // The console comes back a moment after the agent tunnel does; once
+                    // it's connected, load the UniFi device list so it populates without
+                    // a manual Refresh.
+                    if (!_discoveredDevicesLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadDiscoveredDevices();
+                        changed = true;
+                    }
+
+                    if (changed)
                         StateHasChanged();
                 });
             }
@@ -2155,6 +2167,7 @@
                 .Where(d => d.Type != DeviceType.Gateway && d.CanRunIperf3)
                 .OrderBy(d => d.Name)
                 .ToList();
+            _discoveredDevicesLoaded = true;
         }
         catch (Exception ex)
         {
