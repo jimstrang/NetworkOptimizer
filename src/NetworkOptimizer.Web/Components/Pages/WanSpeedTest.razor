@@ -34,7 +34,14 @@
             <div class="banner-content">
                 <span class="banner-icon banner-icon-info">i</span>
                 <div class="banner-text" style="flex:1;">
-                    Schedule recurring WAN speed tests to track performance over time.
+                    @if (SiteContext.IsDefault)
+                    {
+                        <text>Schedule recurring WAN speed tests to track performance over time.</text>
+                    }
+                    else
+                    {
+                        <text>Scheduled speed tests are per site. Set one up for this site to track its WAN performance over time.</text>
+                    }
                 </div>
                 <div class="banner-actions">
                     <a href="/alerts" class="btn btn-sm btn-primary">Set up schedule</a>
