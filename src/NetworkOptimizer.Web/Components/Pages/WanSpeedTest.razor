@@ -108,6 +108,10 @@
                     <div class="wan-test-option-hint">
                         Deploys a speed test binary to the gateway and runs it directly. Most accurate WAN measurement - no LAN overhead.
                     </div>
+                    @if (!_gatewayAvailable && !_isRunning && !string.IsNullOrEmpty(_gatewayUnavailableReason))
+                    {
+                        <div class="alert alert-warning">@_gatewayUnavailableReason</div>
+                    }
                 </div>
 
                 @* Server Option - Secondary *@
