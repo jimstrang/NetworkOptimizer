@@ -1216,7 +1216,9 @@
         user-select: none;
     }
 
-    .speedtest-container.locked-out > *:not(.alert) {
+    .speedtest-container.locked-out > *:not(.alert):not(.card),
+    .speedtest-container.locked-out .card-header,
+    .speedtest-container.locked-out .card-body > *:not(.alert) {
         opacity: 0.5;
     }
 
