@@ -508,22 +508,27 @@ public class ChannelRecommendationService
         for (int i = 0; i < n; i++)
             currentApScores[i] = ScoreAp(graph, currentAssignment, i, band);
 
-        // Soak-period suppression: an AP whose channel changed recently keeps the new config
-        // long enough to measure it, so channels the radio just left are removed from its
-        // candidate set - the search, per-AP fallback and altruistic passes all iterate
-        // ValidChannels, so one filter covers every move-decision path. Applies to every band.
-        // A mesh group moves as one (children mirror the leader's channel), so the LEADER's
-        // candidates are gated by the union of the whole group's soaked channels - otherwise
-        // the child-sync at the end would hop a soaking child straight back onto the channel
-        // it just left. A group that is MEASURABLY suffering on the new channel (any member's
-        // measured airtime past the catastrophic thresholds) is exempt: soak prevents churn,
-        // not rescue. The escape deliberately requires the radio's own measured stress rather
-        // than the inferred score - on a dense band the score is inflated by idle-neighbor
-        // external load and can sit permanently above any absolute ceiling, which would make
-        // soak a no-op exactly where it matters most. The current channel is never filtered,
-        // so the invalid-channel handling below is unaffected.
+        // Soak-period suppression: an AP whose channel changed recently HOLDS that channel long
+        // enough to measure it - its candidate set is locked to the current channel/width, so the
+        // search, per-AP fallback and altruistic passes (all of which iterate ValidChannels) leave
+        // it put. Holding beats the earlier "remove only the channels it left" filter, which let a
+        // soaking AP hop onto any not-recently-left channel (e.g. one newly opened by a DFS-mode
+        // change) and produced the exact churn soak exists to prevent. Applies to every band.
+        // A mesh group moves as one (children mirror the leader's channel), so the leader's soak is
+        // driven by the union of the whole group's soaked channels and the child follows the held
+        // leader. A group that is MEASURABLY suffering on the new channel (any member's measured
+        // airtime past the catastrophic thresholds) is exempt: soak prevents churn, not rescue. The
+        // escape deliberately requires the radio's own measured stress rather than the inferred
+        // score - on a dense band the score is inflated by idle-neighbor external load and can sit
+        // permanently above any absolute ceiling, which would make soak a no-op exactly where it
+        // matters most. A soaking AP is only held if its current channel is itself valid, so the
+        // invalid-channel handling below (an AP stranded on a non-standard channel) is unaffected.
         var soakRemoved = new List<int>?[n];
         var soakEnds = new DateTimeOffset?[n];
+        // Channels currently held by a soaking group. Other APs must not be moved onto them
+        // (see the second pass below) - stacking onto a radio that is mid-soak corrupts the very
+        // measurement the soak exists to gather, and the soaking radio is locked and can't escape.
+        var soakingChannels = new HashSet<int>();
         for (int i = 0; i < n; i++)
         {
             var node = graph.Nodes[i];
@@ -555,25 +560,69 @@ public class ChannelRecommendationService
                 continue;
             }
 
-            var filtered = node.ValidChannels
-                .Where(ch => ch == node.CurrentChannel || !soaked.Contains(ch))
-                .ToArray();
-            if (filtered.Length == node.ValidChannels.Length) continue;
-            // An AP stuck on an invalid channel must move SOMEWHERE - if soak would empty its
-            // candidate set (current channel not valid, every valid channel recently left),
-            // leave the set alone rather than strand the search.
-            if (filtered.Length == 0) continue;
+            // Report only the recently-left channels that are still real candidates - a channel
+            // excluded for another reason (the user's DFS setting, a non-standard channel) must
+            // not be presented as merely soaking. The current channel is never "left".
+            var removed = node.ValidChannels
+                .Where(ch => ch != node.CurrentChannel && soaked.Contains(ch))
+                .OrderBy(ch => ch)
+                .ToList();
+            if (removed.Count == 0) continue;
 
-            // Report only what was actually removed - a channel excluded for another reason
-            // (e.g. the user's DFS setting) must not be presented as merely soaking.
-            var removed = node.ValidChannels.Except(filtered).OrderBy(ch => ch).ToList();
+            // A radio that changed onto its current channel recently HOLDS that channel for the
+            // whole soak window - not just the channels it left. A freshly-changed radio commits
+            // to its new channel until it has measured data on it, even when a channel that was
+            // newly added to the running (e.g. DFS just switched on) now scores better. Locking
+            // the whole config (channel + width) is stronger than the earlier "block hop-back"
+            // filter, which let a soaking AP jump to any not-recently-left channel and produced
+            // exactly the churn soak exists to prevent. The catastrophic-suffering escape above
+            // still overrides this - soak prevents churn, not rescue.
+            if (node.ValidChannels.Contains(node.CurrentChannel))
+            {
+                node.ValidChannels = new[] { node.CurrentChannel };
+                node.ValidWidths = new[] { node.CurrentWidth };
+                soakingChannels.Add(node.CurrentChannel);
+            }
+            else
+            {
+                // Current channel isn't valid (e.g. a non-standard 2.4 GHz channel) - the AP must
+                // move SOMEWHERE, so only drop the recently-left channels rather than strand it.
+                var filtered = node.ValidChannels.Where(ch => !soaked.Contains(ch)).ToArray();
+                if (filtered.Length == 0) continue;
+                node.ValidChannels = filtered;
+            }
+
             _logger.LogDebug(
-                "[ChannelRec] {ApName} {Band}: soaking until {SoakEnd:MM/dd HH:mm} - excluding " +
-                "recently-left channel(s) [{Channels}] from candidates",
+                "[ChannelRec] {ApName} {Band}: soaking until {SoakEnd:MM/dd HH:mm} - holding current " +
+                "channel; recently-left channel(s) [{Channels}] suppressed",
                 node.Name, band, soakEnd, string.Join(", ", removed));
-            node.ValidChannels = filtered;
             soakRemoved[i] = removed;
             soakEnds[i] = soakEnd;
+        }
+
+        // Second pass: keep every other AP off the channels a soaking group is holding. A move onto
+        // a soaking radio's channel is sometimes the lowest-interference option, but it is the wrong
+        // call while that radio is mid-soak - it corrupts the measurement and the soaking radio is
+        // locked, so it can't move out of the way. An AP already resident on such a channel keeps it
+        // (grandfathered by the current-channel clause); we only prevent NEW collisions. Guarded so a
+        // filter that would empty an AP's candidate set is skipped rather than stranding the search.
+        if (soakingChannels.Count > 0)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var node = graph.Nodes[i];
+                if (soakRemoved[i] != null) continue; // this AP is itself soak-locked
+                if (node.MeshGroupLeader >= 0 && node.MeshGroupLeader != i) continue; // child follows leader
+                var filtered = node.ValidChannels
+                    .Where(ch => ch == node.CurrentChannel || !soakingChannels.Contains(ch))
+                    .ToArray();
+                if (filtered.Length == node.ValidChannels.Length || filtered.Length == 0) continue;
+                var reserved = node.ValidChannels.Except(filtered).OrderBy(ch => ch).ToList();
+                _logger.LogDebug(
+                    "[ChannelRec] {ApName} {Band}: excluding channel(s) [{Channels}] held by a soaking AP",
+                    node.Name, band, string.Join(", ", reserved));
+                node.ValidChannels = filtered;
+            }
         }
 
         // Optimize
@@ -1170,6 +1219,10 @@ public class ChannelRecommendationService
             var leaderRec = plan.Recommendations[leader];
             plan.Recommendations[i].RecommendedChannel = leaderRec.RecommendedChannel;
             plan.Recommendations[i].RecommendedWidth = leaderRec.RecommendedWidth;
+            // A child soaks with its leader: the whole backhaul holds the leader's channel, so the
+            // child's row shows "Soaking" too (its channel changes only when the parent's does).
+            plan.Recommendations[i].SoakSuppressedChannels = leaderRec.SoakSuppressedChannels;
+            plan.Recommendations[i].SoakEndsAt = leaderRec.SoakEndsAt;
             finalAssignment[i] = (leaderRec.RecommendedChannel, leaderRec.RecommendedWidth);
         }
 
