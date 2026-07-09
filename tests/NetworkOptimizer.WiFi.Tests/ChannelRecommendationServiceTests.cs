@@ -1509,9 +1509,9 @@ public class ChannelRecommendationServiceTests
 
     /// <summary>
     /// A single 5 GHz AP with heavy measured stress on its current channel. Historical stress
-    /// of X% yields roughly X/100 * (3.0 + 1.5 + 1.0) on the current channel, so ~60% lands
-    /// the score in the move window (2.0-4.0) while staying below the measured external
-    /// interference threshold (70%) that lifts soak; 90% trips it.
+    /// of X% yields roughly X/100 * (3.0 + 1.5 + 1.0) on the current channel, so ~45% lands the
+    /// score in the move window (2.0-4.0) while staying below the 5 GHz soak-escape interference
+    /// threshold (50%) that lifts the soak lock; 55%+ trips it.
     /// </summary>
     private InterferenceGraph BuildStressedSingleApGraph(double stressPct, ChannelSoakInfo? soak)
     {
@@ -1538,9 +1538,9 @@ public class ChannelRecommendationServiceTests
         // channel scores better - it committed to the new channel and must gather measured data
         // before another move (the DFS-toggle scenario in issue #961). Leave one non-soaked,
         // non-overlapping channel that WOULD win if the AP were free to move; the AP must still
-        // stay put. 60% interference sits in the move window but below the 70% escape threshold,
-        // so the soak lock holds.
-        var probeGraph = BuildStressedSingleApGraph(60, soak: null);
+        // stay put. 45% interference sits in the move window but below the 5 GHz 50% escape
+        // threshold, so the soak lock holds.
+        var probeGraph = BuildStressedSingleApGraph(45, soak: null);
         var validChannels = probeGraph.Nodes[0].ValidChannels;
         // A channel that doesn't share ch36's bonding block, so the AP's measured stress doesn't
         // follow it there - i.e. a genuinely better destination it is being denied by the soak.
@@ -1557,12 +1557,12 @@ public class ChannelRecommendationServiceTests
             SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
         };
 
-        var graph = BuildStressedSingleApGraph(60, soak);
+        var graph = BuildStressedSingleApGraph(45, soak);
         var plan = _service.Optimize(graph, RadioBand.Band5GHz, null);
 
         var rec = plan.Recommendations[0];
         rec.CurrentScore.Should().BeInRange(2.0, 4.0,
-            "the test relies on a stressed-but-not-catastrophic AP so the soak lock stays active");
+            "the test relies on a stressed-but-below-escape AP so the soak lock stays active");
         rec.IsChanged.Should().BeFalse(
             "a soaking AP holds its current channel even though a better channel is available");
         rec.RecommendedChannel.Should().Be(36, "the soaking AP holds the channel it is proving out");
@@ -1576,8 +1576,8 @@ public class ChannelRecommendationServiceTests
     public void Optimize_SoakSuppression_LiftedForCatastrophicAp()
     {
         // Soak EVERY alternative channel. An AP whose MEASURED external interference on the new
-        // channel is catastrophic (90%, past the 70% threshold) must still escape - soak
-        // prevents churn, not rescue.
+        // channel is a disaster (90%, well past the 5 GHz escape threshold) must still escape -
+        // soak prevents churn, not rescue.
         var probeGraph = BuildStressedSingleApGraph(90, soak: null);
         var soak = new ChannelSoakInfo
         {
@@ -1592,6 +1592,63 @@ public class ChannelRecommendationServiceTests
         var rec = plan.Recommendations[0];
         rec.IsChanged.Should().BeTrue("a measurably suffering AP must be allowed to leave despite soak");
         rec.IsSoaking.Should().BeFalse("lifted suppression is not reported as active");
+    }
+
+    [Fact]
+    public void Optimize_SoakEscape_LiftsWhenChannelTerrible_5GHz()
+    {
+        // A soaking 5 GHz AP whose current channel measures 55% foreign airtime - not a disaster,
+        // but past the 50% escape threshold - must be allowed a reasonable escape even though every
+        // alternative is soaked. This is the "escape a terrible channel" case: below the old
+        // disaster-only 70% bar it would have stayed stuck.
+        var probeGraph = BuildStressedSingleApGraph(55, soak: null);
+        var soak = new ChannelSoakInfo
+        {
+            SoakedChannels = probeGraph.Nodes[0].ValidChannels.Where(ch => ch != 36).ToHashSet(),
+            LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
+            SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
+        };
+
+        var graph = BuildStressedSingleApGraph(55, soak);
+        var plan = _service.Optimize(graph, RadioBand.Band5GHz, null);
+
+        var rec = plan.Recommendations[0];
+        rec.IsChanged.Should().BeTrue("55% foreign airtime is terrible enough to escape on 5 GHz");
+        rec.IsSoaking.Should().BeFalse("lifted suppression is not reported as active");
+    }
+
+    [Fact]
+    public void Optimize_SoakEscape_HoldsAtSameInterferenceOn24GHz()
+    {
+        // The per-band contrast: the SAME 55% foreign airtime that escapes on 5 GHz must HOLD on
+        // 2.4 GHz, where the band is crowded by nature and the escape bar is higher (60%). A better
+        // channel exists (ch11 is clean) but the soaking AP stays put on ch1.
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-1", RadioBand.Band2_4GHz, 1, width: 20)
+        };
+        var stress = new Dictionary<string, Dictionary<int, (double, double, double)>>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new() { [1] = (55d, 55d, 55d) }
+        };
+        var soakInfo = new Dictionary<string, ChannelSoakInfo>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new ChannelSoakInfo
+            {
+                SoakedChannels = new HashSet<int> { 6 },
+                LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
+                SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
+            }
+        };
+
+        var graph = _service.BuildInterferenceGraph(
+            aps, RadioBand.Band2_4GHz, null, null, null, null, stress, soakInfo);
+        var plan = _service.Optimize(graph, RadioBand.Band2_4GHz, null);
+
+        var rec = plan.Recommendations[0];
+        rec.RecommendedChannel.Should().Be(1,
+            "55% foreign airtime is below the 60% escape bar on crowded-by-nature 2.4 GHz, so the soak holds");
+        rec.IsSoaking.Should().BeTrue();
     }
 
     [Fact]
@@ -1658,10 +1715,10 @@ public class ChannelRecommendationServiceTests
         // A mesh group moves as one: the leader is stressed enough to want a move, but the
         // CHILD is soaking on every alternative channel. The leader must stay put - otherwise
         // the child-sync would hop the child straight back onto a channel it just left.
-        // In the move window, below the 70% external interference escape threshold.
+        // In the move window, below the 5 GHz 50% external interference escape threshold.
         var leaderStress = new Dictionary<string, Dictionary<int, (double, double, double)>>
         {
-            ["aa:bb:cc:dd:ee:01"] = new() { [36] = (60d, 60d, 60d) }
+            ["aa:bb:cc:dd:ee:01"] = new() { [36] = (45d, 45d, 45d) }
         };
         List<AccessPointSnapshot> BuildAps() => new()
         {

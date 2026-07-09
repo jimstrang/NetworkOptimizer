@@ -197,11 +197,19 @@ public class ChannelRecommendationService
     private const double CatastrophicAbsoluteScore = 4.0;
 
     /// <summary>
-    /// Measured EXTERNAL interference (other networks' airtime) past which a freshly-changed
-    /// channel counts as catastrophically bad and the soak suppression is lifted. Anchored to
-    /// the radio's own time-averaged interference - the same ground-truth channel-quality
-    /// signal the comfort anchor uses (comfortable sits below 20%; 70% means the channel is
-    /// dominated by other networks and is genuinely a disaster worth breaking soak for).
+    /// Measured EXTERNAL interference (other networks' airtime) past which a soaking AP's current
+    /// channel counts as too bad to keep holding, so the soak lock lifts and a move back into play
+    /// (a "reasonable escape") is allowed. Anchored to the radio's own time-averaged interference -
+    /// the same ground-truth channel-quality signal the comfort anchor uses (comfortable sits below
+    /// <see cref="ComfortableInterferencePct"/> = 20% on every band).
+    ///
+    /// Per band, because "terrible" is band-relative: 2.4 GHz is congested by nature (only three
+    /// non-overlapping channels, legacy devices, Bluetooth), so a high bar avoids constant churn on
+    /// a band where a move rarely helps; 6 GHz is the cleanest band, so sustained foreign airtime is
+    /// meaningful sooner. This mirrors <see cref="GetBandStressMultiplier"/>'s band philosophy.
+    /// The lock only lifts - the improvement gates still require a meaningfully better destination
+    /// before any move is actually recommended, so lifting on a band where nothing is better is a
+    /// no-op.
     ///
     /// Deliberately NOT the inferred score (idle-neighbor external load inflates it past any
     /// absolute ceiling on dense bands, which would make soak a permanent no-op there), and
@@ -210,7 +218,13 @@ public class ChannelRecommendationService
     /// escaping soak no matter where it moved - the exact self-induced false positive this
     /// feature exists to avoid. Tunable.
     /// </summary>
-    private const double CatastrophicInterferencePct = 70.0;
+    private static double GetSoakEscapeInterferencePct(RadioBand band) => band switch
+    {
+        RadioBand.Band2_4GHz => 60.0, // Crowded by nature; bar stays high, and in a truly self-crowded
+                                      // environment the crowding friction + global guardrail hold it put anyway
+        RadioBand.Band5GHz => 50.0,   // Over half the airtime foreign is clearly bad on a wider band
+        _ => 45.0                     // 6 GHz: clean band, sustained interference is meaningful sooner
+    };
 
     /// <summary>
     /// Minimum neighbor signal to count as external interference. Matches the CCA
@@ -517,8 +531,9 @@ public class ChannelRecommendationService
         // A mesh group moves as one (children mirror the leader's channel), so the leader's soak is
         // driven by the union of the whole group's soaked channels and the child follows the held
         // leader. A group that is MEASURABLY suffering on the new channel (any member's measured
-        // airtime past the catastrophic thresholds) is exempt: soak prevents churn, not rescue. The
-        // escape deliberately requires the radio's own measured stress rather than the inferred
+        // airtime past the band's soak-escape threshold) is exempt: soak prevents churn, not rescue,
+        // so a genuinely terrible channel can still escape. The escape requires the radio's own
+        // measured stress rather than the inferred
         // score - on a dense band the score is inflated by idle-neighbor external load and can sit
         // permanently above any absolute ceiling, which would make soak a no-op exactly where it
         // matters most. A soaking AP is only held if its current channel is itself valid, so the
@@ -554,9 +569,10 @@ public class ChannelRecommendationService
             if (sufferingIndex >= 0)
             {
                 _logger.LogDebug(
-                    "[ChannelRec] {ApName} {Band}: soak suppression lifted - {SufferingAp} measures " +
-                    "catastrophic airtime on its current channel, all channels stay in play",
-                    node.Name, band, graph.Nodes[sufferingIndex].Name);
+                    "[ChannelRec] {ApName} {Band}: soak lock lifted for a reasonable escape - " +
+                    "{SufferingAp} measures foreign airtime past the {Escape:F0}% escape threshold " +
+                    "on its current channel, all channels stay in play",
+                    node.Name, band, graph.Nodes[sufferingIndex].Name, GetSoakEscapeInterferencePct(band));
                 continue;
             }
 
@@ -1535,27 +1551,28 @@ public class ChannelRecommendationService
     }
 
     /// <summary>
-    /// Whether the AP's own measured (1d/7d) record for its current channel shows catastrophic
-    /// EXTERNAL interference - other networks' airtime past <see cref="CatastrophicInterferencePct"/>.
-    /// This is the soak-escape signal, and it reads measured ground truth ONLY: never
-    /// <see cref="ApNode.PropagatedStress"/> or the inferred score (idle-neighbor load inflates
-    /// both, so on a dense 2.4 GHz band every AP would sit above any absolute ceiling forever,
-    /// making soak a permanent no-op), and never utilization or TX retries (contaminated by the
-    /// AP's own serving traffic, which follows it to any channel). No averaged data for the new
-    /// channel yet (e.g. within the first hour after a change) means no escape - the soak is
-    /// short, and rescue can wait for evidence.
+    /// Whether the AP's own measured (1d/7d) record for its current channel shows EXTERNAL
+    /// interference past the band's soak-escape threshold (<see cref="GetSoakEscapeInterferencePct"/>)
+    /// - i.e. the channel is bad enough to lift the soak lock and allow a reasonable escape.
+    /// It reads measured ground truth ONLY: never <see cref="ApNode.PropagatedStress"/> or the
+    /// inferred score (idle-neighbor load inflates both, so on a dense 2.4 GHz band every AP would
+    /// sit above any absolute ceiling forever, making soak a permanent no-op), and never utilization
+    /// or TX retries (contaminated by the AP's own serving traffic, which follows it to any channel).
+    /// No averaged data for the new channel yet (e.g. within the first hour after a change) means no
+    /// escape - the soak is short, and rescue can wait for evidence.
     /// </summary>
     private static bool IsCurrentChannelMeasurablySuffering(InterferenceGraph graph, RadioBand band, int apIndex)
     {
         var node = graph.Nodes[apIndex];
         if (node.HistoricalStress == null || node.HistoricalStress.Count == 0) return false;
 
+        var escapePct = GetSoakEscapeInterferencePct(band);
         var currentSpan = ChannelSpanHelper.GetChannelSpan(band, node.CurrentChannel, node.CurrentWidth);
         foreach (var (histChannel, stress) in node.HistoricalStress)
         {
             var histSpan = ChannelSpanHelper.GetChannelSpan(band, histChannel, node.CurrentWidth);
             if (ChannelSpanHelper.SpansOverlap(currentSpan, histSpan))
-                return stress.Interference >= CatastrophicInterferencePct;
+                return stress.Interference >= escapePct;
         }
         return false;
     }
