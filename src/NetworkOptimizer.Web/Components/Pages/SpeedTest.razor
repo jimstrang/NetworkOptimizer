@@ -28,7 +28,9 @@
 <div class="page-header">
     <h1>LAN Speed Test</h1>
     <p class="page-description">Test network bandwidth using iperf3</p>
-    @if (localIperf3Status != null && localIperf3Status.IsAvailable)
+    @* Managed sites run LAN tests through their on-site agent, so the central server's
+       iperf3 version is meaningless there - and the agent doesn't report its own. Hide it. *@
+    @if (localIperf3Status != null && localIperf3Status.IsAvailable && SiteContext.IsDefault)
     {
         <div class="iperf3-version-badge">
             <span class="version-label">Server iperf3 version:</span>
