@@ -1212,9 +1212,12 @@
 
     /* Locked out state */
     .speedtest-container.locked-out {
-        opacity: 0.5;
         pointer-events: none;
         user-select: none;
+    }
+
+    .speedtest-container.locked-out > *:not(.alert) {
+        opacity: 0.5;
     }
 
     .speedtest-container.locked-out::after {
