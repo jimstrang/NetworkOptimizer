@@ -145,9 +145,16 @@ public class MonitoringCollectionAgent : BackgroundService
         {
             await using var db = await _dbFactory.CreateDbContextAsync(ct);
             var site = await db.Sites.AsNoTracking().FirstOrDefaultAsync(s => s.Slug == _siteSlug, ct);
+            var wasEnrolled = _siteAgentEnrolled;
             _siteAgentEnrolled = site != null && await db.SiteAgents.AsNoTracking()
                 .AnyAsync(a => a.SiteId == site.Id && a.Enabled && a.EnrolledAt != null, ct);
             _agentCoverageCheckedAt = DateTime.UtcNow;
+
+            // The moment an external site first gains an agent, activate the default internet
+            // targets that were seeded disabled while it had none - the agent can now probe them
+            // from inside the site (AgentProbeResultSink only pushes enabled targets).
+            if (!wasEnrolled && _siteAgentEnrolled)
+                await EnableSeededDefaultTargetsAsync(ct);
         }
         catch (Exception ex)
         {
@@ -168,6 +175,13 @@ public class MonitoringCollectionAgent : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("Monitoring collection agent starting (site {Site})", _siteSlug);
+
+        // Resolve agent coverage before seeding so an external (non-default) site seeds its
+        // default internet targets disabled until an agent is deployed - otherwise the central
+        // server, which can't see the site's network, would probe anycast DNS from its own
+        // stack and log that as the site's ISP latency. No-op on the default site (always seeds
+        // enabled), where this returns immediately.
+        await RefreshAgentCoverageAsync(stoppingToken);
 
         // Seed default targets on startup so the latency tier has something to probe even
         // before the upstream wizard runs. Safe to call repeatedly — only inserts if absent.
@@ -1126,9 +1140,13 @@ public class MonitoringCollectionAgent : BackgroundService
         // the tunnel pushes to the agent for probing from inside the network.
         await ReconcileFabricTargetsAsync(ct);
 
-        // Probing itself stands down while an agent is connected - RTT measured from the
-        // central server would be the WAN path, not the site's own fabric/WAN view.
-        if (AgentCoversCollection()) return;
+        // Probing itself stands down for every non-default (external) site, agent or not. The
+        // central server can't see the site's network: with an agent connected it double-probes
+        // the WAN path instead of the site's own fabric/WAN view, and with no agent yet it would
+        // log its own anycast RTT as the site's ISP latency. The site's agent probes its enabled
+        // targets from inside once deployed (AgentProbeResultSink). The default site keeps
+        // probing locally as before.
+        if (!_isDefault) return;
 
         await using var db = await CreateSiteDbAsync(ct);
         var targets = await db.MonitoringTargets
@@ -1252,6 +1270,10 @@ public class MonitoringCollectionAgent : BackgroundService
         }
     }
 
+    // TargetIds of the two default internet targets created by SeedDefaultTargetsAsync. Kept in
+    // sync with the literals in the seed rows below; used by EnableSeededDefaultTargetsAsync.
+    private static readonly string[] DefaultInternetTargetIds = { "wan-cloudflare-1111", "wan-google-8888" };
+
     private async Task SeedDefaultTargetsAsync(CancellationToken ct)
     {
         await using var db = await CreateSiteDbAsync(ct);
@@ -1271,7 +1293,10 @@ public class MonitoringCollectionAgent : BackgroundService
                 VantagePoint = "server",
                 PollIntervalSeconds = 10,
                 PingCount = 5,
-                Enabled = true,
+                // External sites seed disabled until an agent is deployed (enabled inline on the
+                // default site and on external sites that already have an agent). See
+                // EnableSeededDefaultTargetsAsync for the enroll-time flip.
+                Enabled = _isDefault || _siteAgentEnrolled,
                 AutoDiscovered = true,
                 AutoLabel = "Cloudflare DNS",
                 CreatedAt = DateTime.UtcNow
@@ -1286,7 +1311,8 @@ public class MonitoringCollectionAgent : BackgroundService
                 VantagePoint = "server",
                 PollIntervalSeconds = 10,
                 PingCount = 5,
-                Enabled = true,
+                // See the Cloudflare row above: disabled on an external site until an agent exists.
+                Enabled = _isDefault || _siteAgentEnrolled,
                 AutoDiscovered = true,
                 AutoLabel = "Google DNS",
                 CreatedAt = DateTime.UtcNow
@@ -1303,6 +1329,38 @@ public class MonitoringCollectionAgent : BackgroundService
             }
         }
         if (added) await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>
+    /// Activate the two seeded default internet targets once an agent is deployed for a
+    /// (non-default) external site. They are seeded disabled while the site has no agent so the
+    /// central server never probes anycast DNS from its own stack and mislabels it as the site's
+    /// ISP latency; once an agent can probe them from inside the network, baseline internet
+    /// monitoring should begin. Only ever touches a default that is still disabled AND has never
+    /// been probed (LastVerified == null): the enroll "transition" re-fires on every process
+    /// restart (the flag is in-memory), and that never-verified guard keeps it from re-enabling a
+    /// default the user has since paused. Default site never calls this (RefreshAgentCoverageAsync
+    /// returns early there).
+    /// </summary>
+    private async Task EnableSeededDefaultTargetsAsync(CancellationToken ct)
+    {
+        try
+        {
+            await using var db = await CreateSiteDbAsync(ct);
+            var rows = await db.MonitoringTargets
+                .Where(t => DefaultInternetTargetIds.Contains(t.TargetId) && !t.Enabled && t.LastVerified == null)
+                .ToListAsync(ct);
+            if (rows.Count == 0) return;
+            foreach (var t in rows) t.Enabled = true;
+            await db.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "Enabled {Count} seeded default internet target(s) for site {Slug} after agent enrollment",
+                rows.Count, _siteSlug);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Enabling seeded default targets on enrollment failed for site {Slug}", _siteSlug);
+        }
     }
 
     private async Task ReconcileFabricTargetsAsync(CancellationToken ct)

@@ -5,6 +5,7 @@
 @inject UpstreamTracerService Tracer
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject SiteContextService SiteCtx
+@inject NetworkOptimizer.Web.Services.Monitoring.ProbeExecutorFactory ExecutorFactory
 @inject IJSRuntime JS
 @inject NetworkOptimizer.Web.Services.LanFlowMap.LanFlowMapCache FlowMapCache
 
@@ -28,7 +29,16 @@
                 update your targets.
             </div>
         }
-        @if (_state.Step == TracerStep.Idle)
+        @if (!CanDiscover)
+        {
+            <div class="alert alert-info" style="margin-bottom: 0;">
+                <strong>Deploy an on-site agent first.</strong>
+                Upstream discovery traces the path from inside this site's network, so it needs a
+                connected agent at the site. Enroll one from <a href="/settings">Settings</a>, then
+                run discovery here.
+            </div>
+        }
+        else if (_state.Step == TracerStep.Idle)
         {
             <p class="section-description">
                 Trace your network's path from the gateway to common internet destinations
@@ -317,6 +327,11 @@
 @code {
     [Parameter] public bool ForceExpand { get; set; }
     [Parameter] public EventCallback OnSaved { get; set; }
+
+    // Discovery must trace from inside the site's network. On an external (non-default) site
+    // that requires a connected on-site agent - without one the trace would run from the central
+    // server and mis-attribute its path as this site's. The default site always traces locally.
+    private bool CanDiscover => SiteCtx.IsDefault || ExecutorFactory.ServerVantageIsAgent;
 
     private UpstreamTracerState _state = new();
     private System.Threading.Timer? _pollTimer;

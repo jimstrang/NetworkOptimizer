@@ -3,6 +3,7 @@
 @inject MonitoringLiveStats LiveStats
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject SiteContextService SiteCtx
+@inject NetworkOptimizer.Web.Services.Monitoring.ProbeExecutorFactory ExecutorFactory
 @inject NetworkOptimizer.Web.Services.Monitoring.AsnResolutionService AsnResolution
 
 <div class="card">
@@ -149,7 +150,14 @@
             </p>
         }
 
-        @if (_showAddTarget)
+        @if (!CanAddTargets)
+        {
+            <p class="page-description" style="margin-top: 0.75rem;">
+                Deploy an on-site agent to this site to add latency targets - the agent probes
+                them from inside the site's network.
+            </p>
+        }
+        else if (_showAddTarget)
         {
             <div class="add-target-form" style="margin-top: 1rem; padding: 1rem; background: var(--bg-tertiary); border-radius: 8px;">
                 <div style="display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: end;">
@@ -231,6 +239,11 @@
 
     [Parameter]
     public EventCallback OnTargetsChanged { get; set; }
+
+    // A manually added target is probed from the "server" vantage, which on an external
+    // (non-default) site is the on-site agent. Without a connected agent there's nothing to probe
+    // from inside the site, so adding is gated. The default site always probes locally.
+    private bool CanAddTargets => SiteCtx.IsDefault || ExecutorFactory.ServerVantageIsAgent;
 
     // Targets are per-site data: route through the current site's database.
     private NetworkOptimizerDbContext CreateDb() => SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
