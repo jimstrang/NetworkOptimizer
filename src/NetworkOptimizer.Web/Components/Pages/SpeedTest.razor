@@ -309,7 +309,7 @@
     </div>
 
     <!-- SSH Credentials Status -->
-    @if (!sshConfigured)
+    @if (_sshConfigLoaded && !sshConfigured)
     {
         <div class="alert alert-warning">
             <strong>SSH credentials not configured.</strong>
@@ -1370,6 +1370,7 @@
     private List<ApMapMarker> apMapMarkers = new();
     private Iperf3Result? currentResult;
     private bool sshConfigured = false;
+    private bool _sshConfigLoaded;    // gates the "SSH not configured" warning so it doesn't flash before the check runs
 
     // Pagination
     private int historyPage = 1;
@@ -1657,6 +1658,10 @@
         catch
         {
             sshConfigured = false;
+        }
+        finally
+        {
+            _sshConfigLoaded = true;
         }
     }
 
