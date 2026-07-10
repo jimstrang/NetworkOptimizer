@@ -603,13 +603,10 @@
 </div>
 
 <style>
-    .page-header.wan-speedtest-header {
-        align-items: center;
-    }
     .wan-speedtest-header h1 {
         margin-right: auto;
     }
-    .monitoring-stat-card.wan-header-isp-tile {
+    .wan-speedtest-header .monitoring-stat-card.wan-header-isp-tile {
         flex: 0 0 auto;
         min-width: 100px;
         min-height: 0;
@@ -694,6 +691,7 @@
 
     // Poll timer for tracking in-progress test state
     private System.Threading.Timer? _pollTimer;
+    private System.Threading.Timer? _ispHealthRefreshTimer;
 
     // Chart state
     private ApexChart<WanChartDataPoint>? _chart;
@@ -830,6 +828,38 @@
         // Subscribe to path analysis completion to refresh UI
         WanSpeedTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
         GatewayWanTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
+
+        StartIspHealthRefresh();
+    }
+
+    // The header ISP Health tile computes its score in the background on first view;
+    // poll until it lands so the value appears without navigating away and back.
+    private void StartIspHealthRefresh()
+    {
+        var snapshot = IspHealthService.GetCachedScore();
+        if (snapshot.Status == IspHealthStatus.Ready)
+            return;
+
+        var lastText = snapshot.TileText;
+        var attempts = 0;
+        _ispHealthRefreshTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                var current = IspHealthService.GetCachedScore();
+                if (current.TileText != lastText)
+                {
+                    lastText = current.TileText;
+                    await InvokeAsync(StateHasChanged);
+                }
+                if (++attempts >= 30 || current.Status == IspHealthStatus.Ready)
+                {
+                    _ispHealthRefreshTimer?.Dispose();
+                    _ispHealthRefreshTimer = null;
+                }
+            }
+            catch { }
+        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
     }
 
     /// <summary>
@@ -2164,6 +2194,8 @@
         StopPolling();
         _agentStatusTimer?.Dispose();
         _agentStatusTimer = null;
+        _ispHealthRefreshTimer?.Dispose();
+        _ispHealthRefreshTimer = null;
         WanSpeedTestService.OnPathAnalysisComplete -= OnPathAnalysisComplete;
         GatewayWanTestService.OnPathAnalysisComplete -= OnPathAnalysisComplete;
     }
