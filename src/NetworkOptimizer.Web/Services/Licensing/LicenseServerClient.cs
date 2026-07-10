@@ -151,6 +151,43 @@ public class LicenseServerClient
 
         return LicenseCheckResult.Ok(payload, body);
     }
+
+    /// <summary>
+    /// Best-effort release of this installation's binding for a key, so it can be
+    /// claimed on another installation. Fire-and-forget by design: the response is
+    /// not verified and failures are swallowed (an unreachable server just leaves
+    /// the binding in place for the operator to clear). Returns true when the
+    /// server acknowledged the release.
+    /// </summary>
+    public async Task<bool> ReleaseAsync(
+        string licenseKey,
+        Guid installationId,
+        CancellationToken cancellationToken = default)
+    {
+        var baseUrl = await GetServerUrlAsync();
+        var request = new LicenseReleaseRequest
+        {
+            LicenseKey = licenseKey,
+            InstallationId = installationId,
+        };
+
+        try
+        {
+            var client = _httpClientFactory.CreateClient(HttpClientName);
+            using var content = new StringContent(JsonSerializer.Serialize(request), Encoding.UTF8, "application/json");
+            using var response = await client.PostAsync($"{baseUrl}/api/v1/license-releases", content, cancellationToken);
+            if (response.IsSuccessStatusCode)
+                return true;
+
+            _logger.LogDebug("License release returned {Status} for {BaseUrl}", (int)response.StatusCode, baseUrl);
+            return false;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UriFormatException or InvalidOperationException)
+        {
+            _logger.LogDebug(ex, "License server unreachable for release at {BaseUrl}", baseUrl);
+            return false;
+        }
+    }
 }
 
 /// <summary>Request body for POST /api/v1/license-checks.</summary>
@@ -167,4 +204,14 @@ public sealed record LicenseCheckRequest
 
     [JsonPropertyName("siteCount")]
     public int SiteCount { get; init; }
+}
+
+/// <summary>Request body for POST /api/v1/license-releases.</summary>
+public sealed record LicenseReleaseRequest
+{
+    [JsonPropertyName("licenseKey")]
+    public string LicenseKey { get; init; } = string.Empty;
+
+    [JsonPropertyName("installationId")]
+    public Guid InstallationId { get; init; }
 }

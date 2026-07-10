@@ -67,6 +67,7 @@ public class LicenseActivationService
             return "That does not look like a valid license key. Check for typos and try again.";
 
         var now = _time.GetUtcNow().UtcDateTime;
+        var wasNewlyAdded = false;
 
         await using (var db = await _mainDbFactory.CreateDbContextAsync())
         {
@@ -81,10 +82,31 @@ public class LicenseActivationService
                     UpdatedAt = now,
                 });
                 await db.SaveChangesAsync();
+                wasNewlyAdded = true;
             }
         }
 
         var error = await RefreshKeyAsync(canonical);
+
+        // A brand-new key that verifies as revoked was denied by the server: either the
+        // license is already bound to another installation (node-lock seat conflict) or it
+        // was revoked. Don't leave a confusing Revoked row or assign sites to it - roll the
+        // just-added key back and tell the operator what to do.
+        if (error == null && wasNewlyAdded)
+        {
+            await using var db = await _mainDbFactory.CreateDbContextAsync();
+            var record = await db.LicenseKeyRecords.FirstOrDefaultAsync(k => k.LicenseKey == canonical);
+            if (record is { Status: LicenseKeyStatuses.Revoked })
+            {
+                db.LicenseKeyRecords.Remove(record);
+                await db.SaveChangesAsync();
+                await _stateService.RecomputeAsync();
+                return "This key can't be activated on this installation. It may already be in use on "
+                    + "another installation, or it is no longer valid. If you moved installations, remove "
+                    + "the key from the old one first, then try again. Otherwise contact support.";
+            }
+        }
+
         await AutoAssignAsync();
         await _stateService.RecomputeAsync();
         return error;
@@ -145,15 +167,24 @@ public class LicenseActivationService
     /// <summary>Removes a key; its site assignments cascade away. </summary>
     public async Task RemoveAsync(int licenseKeyRecordId)
     {
+        string? removedKey = null;
         await using (var db = await _mainDbFactory.CreateDbContextAsync())
         {
             var record = await db.LicenseKeyRecords.FindAsync(licenseKeyRecordId);
             if (record == null)
                 return;
+            removedKey = record.LicenseKey;
             db.LicenseKeyRecords.Remove(record);
             await db.SaveChangesAsync();
             _logger.LogInformation("License {Key} removed", LicenseKeyUtilities.MaskKey(record.LicenseKey));
         }
+
+        // Best-effort: free this installation's binding on the server so the key can
+        // be claimed on another installation. Never block local removal on it - if the
+        // server is unreachable the binding stays put and the operator clears it there.
+        var installationId = await GetOrCreateInstallationIdAsync();
+        await _client.ReleaseAsync(removedKey, installationId);
+
         await _stateService.RecomputeAsync();
     }
 
