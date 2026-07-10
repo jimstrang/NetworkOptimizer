@@ -18130,6 +18130,17 @@ body.kiosk-mode .status-indicators {
     min-width: 0;
 }
 
+.license-site-name strong {
+    font-size: 0.9rem;
+    color: var(--text-primary);
+}
+
+.license-site-name span {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
 .license-site-select {
-    max-width: 320px;
+    width: 100%;
+    max-width: 600px;
 }

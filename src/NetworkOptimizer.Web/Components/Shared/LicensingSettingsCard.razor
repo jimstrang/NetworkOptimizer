@@ -125,8 +125,8 @@
             {
                 <div class="license-site-row">
                     <div class="license-site-name">
-                        <strong style="color: var(--text-primary);">@site.Name</strong>
-                        <span style="color: var(--text-muted);"> @site.Slug</span>
+                        <strong>@site.Name</strong>
+                        <span> @site.Slug</span>
                     </div>
                     @if (LicenseState.GetStatus(site.Slug) is { } status)
                     {
