@@ -16,6 +16,7 @@ using NetworkOptimizer.Web;
 using NetworkOptimizer.Web.Endpoints;
 using NetworkOptimizer.Web.Services;
 using NetworkOptimizer.Web.Services.CableModemProviders;
+using NetworkOptimizer.Web.Services.Licensing;
 using NetworkOptimizer.Web.Services.CellularModemProviders;
 using NetworkOptimizer.Web.Services.OntProviders;
 using NetworkOptimizer.Web.Services.Ssh;
@@ -272,6 +273,18 @@ builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertSiteScope>(s
 // Resolves a site's display name so delivered alerts name their originating site.
 builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.IAlertSiteNameResolver, AlertSiteNameResolver>();
 builder.Services.AddSingleton<AgentEnrollmentService>();
+
+// Licensing: singleton state machine, activation and phone-home loop. All
+// licensing data is instance-wide registry data in the main database.
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddHttpClient("LicenseServer", client => client.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddSingleton<LicenseServerClient>();
+builder.Services.AddSingleton<LicenseStateService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<LicenseStateService>());
+builder.Services.AddSingleton<LicenseActivationService>();
+builder.Services.AddSingleton<LicensePhoneHomeService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<LicensePhoneHomeService>());
+
 // Shared site-local speed-test target resolution (Client Dashboard, LAN Speed
 // Test page, WAN speed test link) - scoped, follows the current site context.
 builder.Services.AddScoped<SiteSpeedTestTargetResolver>();

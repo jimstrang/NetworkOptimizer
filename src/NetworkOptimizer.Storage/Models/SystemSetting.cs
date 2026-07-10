@@ -46,6 +46,10 @@ public static class SystemSettingKeys
     public const string LicensingInstallationId = "licensing.installation_id";
     public const string LicensingServerUrl = "licensing.server_url";
 
+    // Internal bookkeeping: JSON map of site slug -> UTC timestamp when the site
+    // lost license coverage, anchoring the uncovered-site grace countdown.
+    public const string LicensingUncoveredSince = "licensing.uncovered_since";
+
     // Per-site Client Speed Test target override (agent sites only): an IP/host or a
     // full URL the browser should hit for the LAN speed test, used when the agent's
     // auto-detected LAN IP isn't its client-facing address (e.g. behind a reverse
