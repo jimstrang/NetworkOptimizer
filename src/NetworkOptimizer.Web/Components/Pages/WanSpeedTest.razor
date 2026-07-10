@@ -38,6 +38,7 @@
                 <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
             }
         </div>
+        <p class="page-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
     </div>
 
     @if (!_wanScheduleBannerDismissed)
@@ -65,8 +66,10 @@
 
     @* Run Test Card *@
     <div class="card" id="wan-run-test">
+        <div class="card-header">
+            <h2 class="card-title">Run a Speed Test</h2>
+        </div>
         <div class="card-body">
-            <p class="wan-test-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
             <div class="wan-test-options">
                 @* Gateway (Direct) Option - Primary *@
                 <div class="wan-test-option @(_gatewayAvailable ? "" : "wan-test-option-unavailable")">
