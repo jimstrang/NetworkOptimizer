@@ -79,6 +79,17 @@ public class SponsorshipService : ISponsorshipService
         try
         {
             using var scope = _serviceProvider.CreateScope();
+
+            // A licensed install has already paid for the product - never nag it
+            // for sponsorship. Cached property, so this costs nothing per page load.
+            // alwaysShow (the Settings preview) still works so the operator can see
+            // what the prompts look like.
+            var licenseState = scope.ServiceProvider.GetRequiredService<Licensing.LicenseStateService>();
+            if (licenseState.AnyKeysActive && !alwaysShow)
+            {
+                return null;
+            }
+
             var settingsService = scope.ServiceProvider.GetRequiredService<ISystemSettingsService>();
 
             // Sponsorship nag state is instance-wide (one operator), so it always lives in
