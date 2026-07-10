@@ -138,6 +138,11 @@ export function startPolling(intervalMs = 3000) {
     const signal = _pollAbort.signal;
     _fetchSnapshot(signal).catch(() => {});
     _pollTimer = setInterval(() => {
+        // The topology snapshot is fetched once at start. If it wasn't ready then (e.g. the
+        // site's console connection came up after the map mounted), keep retrying it until it
+        // has nodes - otherwise the map has no topology to draw and stays blank indefinitely.
+        if (!_snapshot || !_snapshot.nodes || _snapshot.nodes.length === 0)
+            _fetchSnapshot(signal).catch(() => {});
         _fetchLive(signal).catch(() => {});
     }, intervalMs);
 }
