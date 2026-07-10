@@ -9,6 +9,7 @@
 @using NetworkOptimizer.Web.Services.Ssh
 @using NetworkOptimizer.UniFi
 @using NetworkOptimizer.Core.Helpers
+@using NetworkOptimizer.Web.Services.Monitoring.IspHealth
 @inject UwnSpeedTestService WanSpeedTestService
 @inject GatewayWanSpeedTestService GatewayWanTestService
 @inject ISqmService SqmService
@@ -20,12 +21,23 @@
 @inject IJSRuntime JS
 @inject SystemSettingsService SettingsService
 @inject PullToRefreshState PtrState
+@inject IspHealthService IspHealthService
+@inject NavigationManager NavigationManager
 
 <PageTitle>WAN Speed Test - Network Optimizer</PageTitle>
 
 <div class="speedtest-container wan-speedtest">
-    <div class="page-header">
+    <div class="page-header wan-speedtest-header">
         <h1>WAN Speed Test</h1>
+        @{ var ispHealth = IspHealthService.GetCachedScore(); }
+        <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=isp-health"))">
+            <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
+            <div class="stat-label">ISP Health</div>
+            @if (ispHealth.Status == IspHealthStatus.Ready && ispHealth.Score.HasValue)
+            {
+                <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
+            }
+        </div>
     </div>
 
     @if (!_wanScheduleBannerDismissed)
@@ -589,6 +601,20 @@
         </div>
     </div>
 </div>
+
+<style>
+    .page-header.wan-speedtest-header {
+        align-items: center;
+    }
+    .wan-speedtest-header h1 {
+        margin-right: auto;
+    }
+    .monitoring-stat-card.wan-header-isp-tile {
+        flex: 0 0 auto;
+        min-width: 100px;
+        min-height: 0;
+    }
+</style>
 
 @code {
     // Resolve the current site's path analyzer (not the main-pinned singleton) so historical
