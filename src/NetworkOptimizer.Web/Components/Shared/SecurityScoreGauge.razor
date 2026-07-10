@@ -2,7 +2,7 @@
     <div class="gauge-container">
         <svg viewBox="0 0 200 120" class="gauge-svg">
             @* Flat origin, rounded leading end: butt caps with a cap dot at each arc's tip *@
-            <path d="M 20 100 A 80 80 0 0 1 180 100"
+            <path d="M 20.62 109.97 A 80 80 0 1 1 180 100"
                   fill="none"
                   stroke="#232326"
                   stroke-width="20"
@@ -10,7 +10,7 @@
             <circle cx="180" cy="100" r="10" fill="#232326"/>
 
             <!-- Score arc -->
-            <path d="M 20 100 A 80 80 0 0 1 180 100"
+            <path d="M 20.62 109.97 A 80 80 0 1 1 180 100"
                   fill="none"
                   stroke="@GetScoreColor()"
                   stroke-width="20"
@@ -37,10 +37,16 @@
     [Parameter]
     public int Score { get; set; } = 0;
 
-    private string TipX => (100 - 80 * Math.Cos(Score / 100.0 * Math.PI))
+    // The butt origin wraps CCW past 180 degrees by the cap-radius angle so its span mirrors
+    // the rounded leading end's reach (both ends dip equally below the baseline).
+    private const double Delta = 10.0 / 80.0;
+
+    private double TipPhi => -Delta + Score / 100.0 * (Math.PI + Delta);
+
+    private string TipX => (100 - 80 * Math.Cos(TipPhi))
         .ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 
-    private string TipY => (100 - 80 * Math.Sin(Score / 100.0 * Math.PI))
+    private string TipY => (100 - 80 * Math.Sin(TipPhi))
         .ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 
     private string GetScoreColor()
@@ -57,8 +63,8 @@
 
     private string GetDashArray()
     {
-        // Arc length of half circle = π * r (radius = 80)
-        double totalLength = Math.PI * 80;
+        // Arc length of the wrapped arc: (π + Delta) * r (radius = 80)
+        double totalLength = (Math.PI + Delta) * 80;
         double scoreLength = (Score / 100.0) * totalLength;
         double remainingLength = totalLength - scoreLength;
         return $"{scoreLength} {remainingLength}";
