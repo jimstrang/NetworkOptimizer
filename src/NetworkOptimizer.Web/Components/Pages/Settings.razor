@@ -1802,57 +1802,11 @@
         </div>
     </div>
 
-    @* License Information - hidden for now
-    <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">License</h2>
-        </div>
-        <div class="card-body">
-            <div class="license-info">
-                <div class="info-row">
-                    <span class="info-label">License Type:</span>
-                    <span class="info-value">@licenseType</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Licensed To:</span>
-                    <span class="info-value">@licensedTo</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Controller ID:</span>
-                    <span class="info-value">@controllerId</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Activation Date:</span>
-                    <span class="info-value">@activationDate</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Status:</span>
-                    <span class="info-value status-@licenseStatus.ToLower()">@licenseStatus</span>
-                </div>
-            </div>
-
-            @if (licenseStatus == "Grace Period")
-            {
-                <div class="alert alert-warning">
-                    <strong>Grace Period Active:</strong> Controller ID changed. You have @gracePeriodDays days remaining to re-activate your license.
-                </div>
-            }
-
-            <div class="action-buttons">
-                <button class="btn btn-primary" @onclick="ActivateLicense">
-                    Enter License Key
-                </button>
-                <button class="btn btn-secondary" @onclick="RequestReactivation">
-                    Request Re-activation
-                </button>
-            </div>
-        </div>
-    </div>
-    *@
-
     @* Instance-wide settings below are only shown on the main site. *@
     @if (SiteContext.IsDefault)
     {
+    <LicensingSettingsCard />
+
     <!-- 10. Application Settings -->
     <div class="card settings-tab-application" id="application-settings">
         <div class="card-header">

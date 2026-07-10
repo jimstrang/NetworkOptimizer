@@ -4,6 +4,8 @@
 @inject IGatewaySshService GatewaySshService
 @inject PerfTweaksDeploymentService DeployService
 @inject ModuleUpdateNotificationService ModuleUpdates
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
 @inject ILogger<PerformanceTweaks> Logger
 @inject PullToRefreshState PtrState
 @rendermode InteractiveServer
@@ -15,6 +17,8 @@
     <h1>Performance Tweaks</h1>
     <p class="page-description">Deploy and manage performance optimizations for your UCG-Fiber, UXG-Fiber, or UCG-Max gateway. These tweaks address eMMC write pressure, thermal management, and SFP+ link speed - all persistent across reboots via udm-boot. We have more tweaks in testing that we'll be bringing over soon, and we're always looking for ideas.</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized && !string.IsNullOrEmpty(ConnectionService.LastError))
 {
@@ -357,7 +361,7 @@
                         @if (effectiveStatus == TweakDisplayStatus.NotDeployed)
                         {
                             <button class="btn btn-primary btn-sm"
-                                    disabled="@(!_canDeploy || _deployingTweakId == def.Id || exclusiveOtherActive || (def.Id == "sfp-sgmiiplus" && _status?.SfpModuleAlreadyLoaded == true) || (def.Id == "sfp-sgmiiplus-port6" && _status?.SfpPort6ModuleAlreadyLoaded == true) || ((def.Id == "sfp-sgmiiplus" || def.Id == "sfp-sgmiiplus-port6") && _status?.SfpQcaSsdkMissing == true) || (def.Id == "mongodb-ssd" && _status?.SsdAvailable != true))"
+                                    disabled="@(!_canDeploy || _deployingTweakId == def.Id || exclusiveOtherActive || (def.Id == "sfp-sgmiiplus" && _status?.SfpModuleAlreadyLoaded == true) || (def.Id == "sfp-sgmiiplus-port6" && _status?.SfpPort6ModuleAlreadyLoaded == true) || ((def.Id == "sfp-sgmiiplus" || def.Id == "sfp-sgmiiplus-port6") && _status?.SfpQcaSsdkMissing == true) || (def.Id == "mongodb-ssd" && _status?.SsdAvailable != true) || IsLicenseRestricted)"
                                     @onclick="() => ShowDeployConfirmation(def.Id)"
                                     data-tooltip="@(!_canDeploy ? (_status?.FirmwareSupported != true ? "Unsupported firmware" : "Install UDM Boot first") : null)">
                                 @if (_deployingTweakId == def.Id)
@@ -378,7 +382,7 @@
                         {
                             @if (tweakStatus?.ScriptOutdated == true)
                             {
-                                <button class="btn btn-sm btn-primary" @onclick="() => ShowDeployConfirmation(def.Id)" disabled="@(_deployingTweakId == def.Id)">
+                                <button class="btn btn-sm btn-primary" @onclick="() => ShowDeployConfirmation(def.Id)" disabled="@(_deployingTweakId == def.Id || IsLicenseRestricted)">
                                     @if (_deployingTweakId == def.Id)
                                     {
                                         <span class="spinner spinner-sm"></span>
@@ -428,7 +432,7 @@
                         }
                         else if (effectiveStatus == TweakDisplayStatus.Issue)
                         {
-                            <button class="btn btn-sm btn-primary" @onclick="() => ShowDeployConfirmation(def.Id)" disabled="@(_deployingTweakId == def.Id)">
+                            <button class="btn btn-sm btn-primary" @onclick="() => ShowDeployConfirmation(def.Id)" disabled="@(_deployingTweakId == def.Id || IsLicenseRestricted)">
                                 @if (_deployingTweakId == def.Id)
                                 {
                                     <span class="spinner spinner-sm"></span>
@@ -505,7 +509,7 @@
             </div>
             <div class="pt-modal-footer">
                 <button class="btn btn-secondary btn-sm" @onclick="CancelDeploy">Cancel</button>
-                <button class="btn btn-primary btn-sm" @onclick="ConfirmDeploy" disabled="@(!_allConfirmed)">
+                <button class="btn btn-primary btn-sm" @onclick="ConfirmDeploy" disabled="@(!_allConfirmed || IsLicenseRestricted)">
                     Confirm Deploy
                 </button>
             </div>
@@ -970,6 +974,8 @@ ls -la /var/config/run-syslog.sh</code></pre>
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     private bool _isLoading = true;
     private bool _gatewayConfigured;
     private bool _gatewayConnected;

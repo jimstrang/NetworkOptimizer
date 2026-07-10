@@ -7,6 +7,8 @@
 @using AuditSeverity = NetworkOptimizer.Audit.Models.AuditSeverity
 @inject AuditService AuditService
 @inject UniFiConnectionService ConnectionService
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
 @inject IJSRuntime JSRuntime
 @inject ILogger<Audit> Logger
 @inject NavigationManager NavigationManager
@@ -20,6 +22,8 @@
     <h1>Security Audit</h1>
     <p class="page-description">Comprehensive network security analysis</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
 {
@@ -48,7 +52,7 @@
     <div class="card">
         <div class="card-body">
             <div class="audit-controls">
-                <button class="btn btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected)" style="min-width: 140px;">
+                <button class="btn btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected || IsLicenseRestricted)" style="min-width: 140px;">
                     @if (isRunning)
                     {
                         <span class="spinner"></span>
@@ -876,6 +880,8 @@
 </div>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     private static string FormatCoveringRules(IReadOnlyList<CoveringRuleInfo> rules)
     {
         return string.Join("; ", rules.Select(r =>

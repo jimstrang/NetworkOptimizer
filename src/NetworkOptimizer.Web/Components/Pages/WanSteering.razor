@@ -4,6 +4,7 @@
 @inject UniFiConnectionService ConnectionService
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject SiteContextService SiteCtx
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject SiteTunnelRouting TunnelRouting
 @inject IGatewaySshService GatewaySshService
 @inject ILogger<WanSteering> Logger
@@ -26,6 +27,8 @@
     <h1>WAN Steering</h1>
     <p class="page-description">Load balance the traffic you choose across multiple WANs - without leaving failover mode. Route by source, destination, port, or protocol, load balance across your failover connections, and keep critical traffic on your fastest WAN. Includes health-check failover and automatic rule recovery after gateway reprovisioning.</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized && !string.IsNullOrEmpty(ConnectionService.LastError))
 {
@@ -294,7 +297,7 @@
         <div class="ws-deploy-buttons">
             @if (_status?.IsRunning == true)
             {
-                <button class="btn btn-primary" @onclick="ReloadConfigAsync" disabled="@(_isDeploying || _siteAgentOffline)">
+                <button class="btn btn-primary" @onclick="ReloadConfigAsync" disabled="@(_isDeploying || _siteAgentOffline || IsLicenseRestricted)">
                     @if (_isDeploying)
                     {
                         <span class="spinner spinner-sm"></span>
@@ -305,13 +308,13 @@
                         <span>Deploy Config</span>
                     }
                 </button>
-                <button class="btn btn-secondary" @onclick="DeployAsync" disabled="@(_isDeploying || _siteAgentOffline)">Redeploy</button>
+                <button class="btn btn-secondary" @onclick="DeployAsync" disabled="@(_isDeploying || _siteAgentOffline || IsLicenseRestricted)">Redeploy</button>
                 <button class="btn btn-secondary" @onclick="StopAsync" disabled="@(_isDeploying || _siteAgentOffline)">Stop</button>
                 <button class="btn btn-danger btn-sm" @onclick="RemoveAsync" disabled="@(_isDeploying || _siteAgentOffline)" data-tooltip="Stop daemon and remove all files from gateway" data-tooltip-hover-only>Remove</button>
             }
             else
             {
-                <button class="btn btn-primary" @onclick="DeployAsync" disabled="@(_isDeploying || _siteAgentOffline)">
+                <button class="btn btn-primary" @onclick="DeployAsync" disabled="@(_isDeploying || _siteAgentOffline || IsLicenseRestricted)">
                     @if (_isDeploying)
                     {
                         <span class="spinner spinner-sm"></span>
@@ -529,6 +532,8 @@
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteCtx.Slug);
+
     // State
     private bool _isLoading = true;
     private bool _isDeploying;

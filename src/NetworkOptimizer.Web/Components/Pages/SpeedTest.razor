@@ -15,6 +15,7 @@
 @inject GatewaySpeedTestService GatewaySpeedTestService
 @inject SpeedTestServiceRegistry SpeedTestRegistry
 @inject SiteContextService SiteContext
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject SiteTunnelRouting TunnelRouting
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
@@ -38,6 +39,8 @@
         </div>
     }
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!_lanScheduleBannerDismissed)
 {
@@ -246,7 +249,7 @@
 
                 <!-- Actions -->
                 <div class="gateway-actions">
-                    <button class="btn btn-primary test-button" style="width: 9.5rem;" @onclick="RunGatewaySpeedTest" disabled="@gatewayRunning">
+                    <button class="btn btn-primary test-button" style="width: 9.5rem;" @onclick="RunGatewaySpeedTest" disabled="@(gatewayRunning || IsLicenseRestricted)">
                         @if (gatewayRunning)
                         {
                             <div class="test-progress">
@@ -517,7 +520,7 @@
                                 <td>
                                     <div class="action-buttons">
                                         <button class="btn btn-primary btn-sm test-button" @onclick="() => RunSpeedTest(device)"
-                                                disabled="@(isRunningTest || !device.Enabled || (!sshConfigured && !device.HasOwnCredentials))">
+                                                disabled="@(isRunningTest || !device.Enabled || (!sshConfigured && !device.HasOwnCredentials) || IsLicenseRestricted)">
                                             @if (runningTestHost == device.Host)
                                             {
                                                 <div class="test-progress">
@@ -1347,6 +1350,8 @@
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     // Resolve the current site's path analyzer (not the main-pinned singleton) so historical
     // and fallback path re-computes trace against this site's topology.
     private INetworkPathAnalyzer PathAnalyzer => SpeedTestRegistry.GetFor(SiteContext.Slug).PathAnalyzer;

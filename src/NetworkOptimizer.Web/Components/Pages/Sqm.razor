@@ -6,6 +6,7 @@
 @inject NetworkOptimizer.Storage.Interfaces.ISpeedTestRepository SpeedTestRepository
 @inject TcMonitorClient SqmMonitorClient
 @inject SiteContextService SiteContext
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject IGatewaySshService GatewaySshService
 @inject IJSRuntime JS
 @inject ILogger<Sqm> Logger
@@ -24,6 +25,8 @@
     <h1>Adaptive SQM Manager</h1>
     <p class="page-description">Dynamic bandwidth optimization with dual-mode (Speedtest + Ping) adjustment. Uses 7-day congestion profiles tuned for your connection type to keep SQM tight and bufferbloat in check. Queue memory and burst sizes are scaled to your WAN speed to prevent hard packet drops - reducing collateral impact on other devices and slightly improving overall throughput.</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized && !string.IsNullOrEmpty(ConnectionService.LastError))
 {
@@ -892,7 +895,7 @@
                 }
 
                 <div class="action-buttons">
-                    <button class="btn btn-primary" @onclick="DeploySqm" disabled="@isDeploying">
+                    <button class="btn btn-primary" @onclick="DeploySqm" disabled="@(isDeploying || IsLicenseRestricted)">
                         @if (isDeploying)
                         {
                             <span class="spinner-border spinner-border-sm"></span>
@@ -904,7 +907,7 @@
                         }
                     </button>
                     <span title="@(deploymentStatus?.IsDeployed != true ? "Deploy SQM scripts first" : "")">
-                        <button class="btn btn-secondary" @onclick="DeployTcMonitor" disabled="@(isDeploying || deploymentStatus?.IsDeployed != true)">
+                        <button class="btn btn-secondary" @onclick="DeployTcMonitor" disabled="@(isDeploying || deploymentStatus?.IsDeployed != true || IsLicenseRestricted)">
                             Deploy SQM Monitor Only
                         </button>
                     </span>
@@ -1549,6 +1552,8 @@
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     // Cache settings
     private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(5);
     private static DateTime _lastStatusCheck = DateTime.MinValue;

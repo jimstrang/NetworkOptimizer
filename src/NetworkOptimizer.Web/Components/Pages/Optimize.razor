@@ -4,6 +4,8 @@
 @using NetworkOptimizer.Core.Enums
 @inject DiagnosticsService DiagnosticsService
 @inject UniFiConnectionService ConnectionService
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
 @inject ILogger<Optimize> Logger
 @inject PullToRefreshState PtrState
 @rendermode InteractiveServer
@@ -14,6 +16,8 @@
     <h1>Config Optimizer</h1>
     <p class="page-description">Get optimization suggestions for your network configuration</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
 {
@@ -42,7 +46,7 @@
     <div class="card">
         <div class="card-body">
             <div class="diagnostics-controls">
-                <button class="btn btn-primary" @onclick="RunDiagnostics" disabled="@(_isRunning || !ConnectionService.IsConnected)" style="min-width: 160px;">
+                <button class="btn btn-primary" @onclick="RunDiagnostics" disabled="@(_isRunning || !ConnectionService.IsConnected || IsLicenseRestricted)" style="min-width: 160px;">
                     @if (_isRunning)
                     {
                         <span class="spinner"></span>
@@ -442,6 +446,8 @@
 </div>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     private DiagnosticsResult? _result;
     private bool _isRunning;
     private bool _runApLockAnalyzer = true;

@@ -18094,3 +18094,38 @@ body.kiosk-mode .status-indicators {
     margin-left: auto;
     color: var(--text-secondary);
 }
+
+.connection-banner.license-restricted-banner {
+    background: var(--danger-color);
+}
+
+.license-key-cell {
+    font-family: monospace;
+}
+
+.license-check-error {
+    font-size: 0.8125rem;
+}
+
+.license-section-title {
+    color: var(--text-primary);
+    margin: 1.25rem 0 0.5rem;
+}
+
+.license-site-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.license-site-name {
+    flex: 1;
+    min-width: 0;
+}
+
+.license-site-select {
+    max-width: 320px;
+}

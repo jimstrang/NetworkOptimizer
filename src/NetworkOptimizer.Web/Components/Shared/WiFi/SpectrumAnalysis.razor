@@ -3,6 +3,8 @@
 @using NetworkOptimizer.WiFi.Models
 @inject WiFiOptimizerService WiFiService
 @inject UniFiConnectionService ConnectionService
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
 @inject ILogger<SpectrumAnalysis> Logger
 @inject NavigationManager NavigationManager
 
@@ -81,7 +83,7 @@
                     <div class="empty-icon-img"><img src="/icons/chart-v2.png" alt="" /></div>
                     <h3>No Scan Data</h3>
                     <p>No neighboring networks detected. Your APs may not have recent RF scan data available.</p>
-                    <button class="btn btn-primary" @onclick="RefreshData">Scan Now</button>
+                    <button class="btn btn-primary" @onclick="RefreshData" disabled="@IsLicenseRestricted">Scan Now</button>
                 </div>
             </div>
         </div>
@@ -910,6 +912,8 @@
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     [Parameter] public EventCallback<string> OnClientClick { get; set; }
 
     private List<ChannelScanResult> scanResults = new();

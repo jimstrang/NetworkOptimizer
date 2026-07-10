@@ -4,12 +4,14 @@
 @using Microsoft.EntityFrameworkCore
 @using NetworkOptimizer.Storage.Models
 @using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Web.Services.Licensing
 @inject SiteManagementService SiteManagement
 @inject SiteContextService SiteContext
 @inject SiteConnectionRegistry SiteConnections
 @inject AgentEnrollmentService AgentEnrollment
 @inject AgentTunnelRegistry TunnelRegistry
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 
@@ -69,6 +71,10 @@ else
                     @if (site.IsDefault)
                     {
                         <span class="status-badge">Default</span>
+                    }
+                    @if (LicenseState.GetStatus(site.Slug) is { } licenseStatus)
+                    {
+                        <span class="status-badge @LicenseBadgeClass(licenseStatus)" data-tooltip="@LicenseBadgeTooltip(licenseStatus)">@LicenseBadgeLabel(licenseStatus)</span>
                     }
                 </div>
                 <div class="site-card-footer">
@@ -174,6 +180,32 @@ else
 
     private int OnlineAgentCount(int siteId) =>
         _agents.Count(a => a.SiteId == siteId && TunnelRegistry.IsAgentLive(a));
+
+    private static string LicenseBadgeClass(SiteLicenseStatus status) => status.State switch
+    {
+        SiteLicenseState.Licensed => "status-connected",
+        SiteLicenseState.Grace => "status-provisioning",
+        SiteLicenseState.Restricted => "status-error",
+        _ => "",
+    };
+
+    private static string LicenseBadgeLabel(SiteLicenseStatus status) => status.State switch
+    {
+        SiteLicenseState.Licensed => "Licensed",
+        SiteLicenseState.Grace => $"Grace - {GraceDaysLeft(status)} days left",
+        SiteLicenseState.Restricted => "Restricted",
+        _ => "Free tier",
+    };
+
+    private static string? LicenseBadgeTooltip(SiteLicenseStatus status) =>
+        status.State == SiteLicenseState.Licensed && !string.IsNullOrEmpty(status.CoveringKeyOrg)
+            ? status.CoveringKeyOrg
+            : null;
+
+    private static int GraceDaysLeft(SiteLicenseStatus status) =>
+        status.GraceDeadline is { } deadline
+            ? Math.Max(0, (int)Math.Ceiling((deadline - DateTime.UtcNow).TotalDays))
+            : 0;
 
     private async Task SwitchToAsync(Site site)
     {
