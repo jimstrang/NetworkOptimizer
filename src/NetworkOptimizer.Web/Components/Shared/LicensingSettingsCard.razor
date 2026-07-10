@@ -20,7 +20,7 @@
         @if (LicenseState.AnyKeysActive)
         {
             <p class="section-description">
-                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used.
+                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used &middot; @FreeSlots free@(SoonestTermExpiry is { } expiry ? $" · earliest term expires {expiry.ToLocalTime():MMM d, yyyy}" : "")
             </p>
         }
         else
@@ -194,6 +194,22 @@
             var now = DateTime.UtcNow;
             var activeKeyIds = _keys.Where(k => LicenseStateService.IsActiveCurrent(k, now)).Select(k => k.Id).ToHashSet();
             return _assignments.Count(a => activeKeyIds.Contains(a.LicenseKeyRecordId));
+        }
+    }
+
+    private int FreeSlots => Math.Max(0, LicenseState.TotalAllowance - UsedSlots);
+
+    /// <summary>Soonest paid-through date among active term keys; null when all keys are perpetual.</summary>
+    private DateTime? SoonestTermExpiry
+    {
+        get
+        {
+            var now = DateTime.UtcNow;
+            return _keys
+                .Where(k => LicenseStateService.IsActiveCurrent(k, now) && k.Model == LicenseKeyModels.Term && k.PaidThrough != null)
+                .Select(k => k.PaidThrough!.Value)
+                .DefaultIfEmpty()
+                .Min() is { } d && d != default ? d : null;
         }
     }
 
