@@ -254,6 +254,8 @@ For multi-site deployments, each remote site runs a lightweight on-site agent th
 
 Install it with Docker or as a bare-metal systemd service. Per-site one-liners are generated in the web UI under **Settings > Multi-Site > (site) > Agents > Set up agent**. See the [Agent Deployment Guide](../src/NetworkOptimizer.Agent/README.md) for the full walkthrough, all options, and reverse-proxy configuration.
 
+**Licensing:** Personal use on up to 3 sites is free and never contacts a license server - nothing phones home. Running more than 3 sites requires a license key (entered under **Settings > Application > Licensing**); activating or renewing a key makes an outbound HTTPS request from the central server to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your egress firewall rules allow HTTPS (443) to that hostname. Entitlements are cached and verified locally, so a license server outage never disables your sites.
+
 ## Pre-Deployment Checklist
 
 - [ ] Docker and Docker Compose installed

@@ -15,9 +15,11 @@
 
 Genuinely, thank you so much to everybody for taking the time to use Network Optimizer and have it find a place on your network(s). It really means a lot to receive all of the bug reports, feature requests, feedback, support, and donations from everybody. Totally a whole new experience from writing code in a dayjob, and it greatly motivates me to keep on going!
 
-## Multi-Site Support Is in Developemnt
+## Multi-Site Support Is in Development
 
 Multi-site support is almost ready! Please see this thread if you'd like to help test it: https://github.com/Ozark-Connect/NetworkOptimizer/discussions/954
+
+**Licensing and firewalls:** Personal use on up to 3 sites is free and never contacts a license server - nothing to configure, nothing phones home. Running more than 3 sites requires a license key (Settings > Application > Licensing), and activating or renewing a key makes an outbound HTTPS request to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your outbound firewall rules allow HTTPS (443) to that hostname. A license server outage never disables your sites - entitlements are cached and verified locally, and perpetual licenses stop phoning home entirely after a one-time confirmation.
 
 ## New: ISP Health
 
