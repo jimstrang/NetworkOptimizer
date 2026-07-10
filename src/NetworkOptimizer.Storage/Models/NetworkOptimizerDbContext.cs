@@ -67,6 +67,8 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<Site> Sites { get; set; }
     public DbSet<WanContext> WanContexts { get; set; }
     public DbSet<SiteAgent> SiteAgents { get; set; }
+    public DbSet<LicenseKeyRecord> LicenseKeyRecords { get; set; }
+    public DbSet<SiteLicenseAssignment> SiteLicenseAssignments { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -84,6 +86,29 @@ public class NetworkOptimizerDbContext : DbContext
             entity.HasIndex(e => e.SiteId);
             entity.HasIndex(e => e.EnrollmentTokenHash);
             entity.HasIndex(e => e.AgentKeyHash);
+        });
+
+        modelBuilder.Entity<LicenseKeyRecord>(entity =>
+        {
+            entity.ToTable("LicenseKeyRecords");
+            entity.HasIndex(e => e.LicenseKey).IsUnique();
+            entity.HasIndex(e => e.Status);
+            entity.HasIndex(e => e.NextCheckAt);
+        });
+
+        modelBuilder.Entity<SiteLicenseAssignment>(entity =>
+        {
+            entity.ToTable("SiteLicenseAssignments");
+            entity.HasIndex(e => e.SiteId).IsUnique();
+            entity.HasIndex(e => e.LicenseKeyRecordId);
+            entity.HasOne<LicenseKeyRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.LicenseKeyRecordId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne<Site>()
+                .WithMany()
+                .HasForeignKey(e => e.SiteId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         // AuditResult configuration

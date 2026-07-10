@@ -40,6 +40,12 @@ public static class SystemSettingKeys
     // Multi-site management
     public const string MultiSiteEnabled = "multisite.enabled";
 
+    // Licensing: stable anonymous id this installation sends with license checks
+    // (created on first activation), and the license server base URL override
+    // (default https://licensing.ozarkconnect.net; editable for testing).
+    public const string LicensingInstallationId = "licensing.installation_id";
+    public const string LicensingServerUrl = "licensing.server_url";
+
     // Per-site Client Speed Test target override (agent sites only): an IP/host or a
     // full URL the browser should hit for the LAN speed test, used when the agent's
     // auto-detected LAN IP isn't its client-facing address (e.g. behind a reverse
