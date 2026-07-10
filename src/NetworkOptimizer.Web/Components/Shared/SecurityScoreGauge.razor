@@ -2,7 +2,7 @@
     <div class="gauge-container">
         <svg viewBox="0 0 200 120" class="gauge-svg">
             @* Flat origin, rounded leading end: butt caps with a cap dot at each arc's tip *@
-            <path d="M 20.62 109.97 A 80 80 0 1 1 180 100"
+            <path d="@ArcPath"
                   fill="none"
                   stroke="#232326"
                   stroke-width="20"
@@ -10,7 +10,7 @@
             <circle cx="180" cy="100" r="10" fill="#232326"/>
 
             <!-- Score arc -->
-            <path d="M 20.62 109.97 A 80 80 0 1 1 180 100"
+            <path d="@ArcPath"
                   fill="none"
                   stroke="@GetScoreColor()"
                   stroke-width="20"
@@ -37,9 +37,15 @@
     [Parameter]
     public int Score { get; set; } = 0;
 
-    // The butt origin wraps CCW past 180 degrees by the cap-radius angle so its span mirrors
-    // the rounded leading end's reach (both ends dip equally below the baseline).
-    private const double Delta = 10.0 / 80.0;
+    // The butt origin wraps CCW past 180 degrees toward the cap-radius angle so its span
+    // approaches the rounded leading end's reach. Dialed to 75% of a full mirror by taste.
+    private const double Delta = 0.75 * 10.0 / 80.0;
+
+    private string ArcStartX => (100 - 80 * Math.Cos(Delta)).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+
+    private string ArcStartY => (100 + 80 * Math.Sin(Delta)).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+
+    private string ArcPath => $"M {ArcStartX} {ArcStartY} A 80 80 0 1 1 180 100";
 
     private double TipPhi => -Delta + Score / 100.0 * (Math.PI + Delta);
 

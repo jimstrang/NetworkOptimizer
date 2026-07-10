@@ -38,9 +38,9 @@
 
     private string CapRadius => (StrokeWidth / 2.0).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
 
-    // The butt origin wraps CCW past 180 degrees by the cap-radius angle so its span mirrors
-    // the rounded leading end's reach (both ends dip equally below the baseline).
-    private double Delta => StrokeWidth / 160.0;
+    // The butt origin wraps CCW past 180 degrees toward the cap-radius angle so its span
+    // approaches the rounded leading end's reach. Dialed to 75% of a full mirror by taste.
+    private double Delta => 0.75 * StrokeWidth / 160.0;
 
     private string ArcStartX => (100 - 80 * Math.Cos(Delta)).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 
