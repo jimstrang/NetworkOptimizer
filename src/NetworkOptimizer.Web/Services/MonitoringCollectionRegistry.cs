@@ -6,10 +6,11 @@ namespace NetworkOptimizer.Web.Services;
 
 /// <summary>
 /// Owns all per-site <see cref="MonitoringCollectionAgent"/> instances and their
-/// lifecycles. The default site's instance starts with the app, exactly as the
-/// old single hosted service did; non-default instances start and stop on a
-/// reconcile cadence against the site registry, so adding, enabling, or
-/// disabling a site takes effect without a restart. Scoped resolution of
+/// lifecycles. The default site's instance starts with the app (like the old
+/// single hosted service) unless license enforcement has restricted the site;
+/// non-default instances start and stop on a reconcile cadence against the
+/// site registry and per-site license state, so adding, enabling, disabling,
+/// or re-licensing a site takes effect without a restart. Scoped resolution of
 /// MonitoringCollectionAgent forwards to the current site's instance (the
 /// Monitoring page's SNMP status panel reads whichever site it is showing).
 /// Same ownership pattern as SiteConnectionRegistry / MonitoringInfluxRegistry.
@@ -20,6 +21,7 @@ public class MonitoringCollectionRegistry : BackgroundService
 
     private readonly IServiceProvider _serviceProvider;
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _mainDbFactory;
+    private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<MonitoringCollectionRegistry> _logger;
     private readonly ConcurrentDictionary<string, MonitoringCollectionAgent> _instances = new(StringComparer.OrdinalIgnoreCase);
     // Slugs whose instance's collection loops are currently running. Guarded by
@@ -30,10 +32,12 @@ public class MonitoringCollectionRegistry : BackgroundService
     public MonitoringCollectionRegistry(
         IServiceProvider serviceProvider,
         IDbContextFactory<NetworkOptimizerDbContext> mainDbFactory,
+        Licensing.LicenseStateService licenseState,
         ILogger<MonitoringCollectionRegistry> logger)
     {
         _serviceProvider = serviceProvider;
         _mainDbFactory = mainDbFactory;
+        _licenseState = licenseState;
         _logger = logger;
     }
 
@@ -51,9 +55,11 @@ public class MonitoringCollectionRegistry : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // The default site collects from startup, unconditionally - identical to the
-        // pre-multi-site behavior where the agent itself was the hosted service.
-        await StartInstanceAsync(SiteManagementService.DefaultSiteSlug, stoppingToken);
+        // The default site collects from startup (pre-multi-site behavior) unless
+        // license enforcement has restricted it. Pre-compute the gate reads
+        // operational, so startup is never blocked on licensing.
+        if (_licenseState.IsSiteOperational(SiteManagementService.DefaultSiteSlug))
+            await StartInstanceAsync(SiteManagementService.DefaultSiteSlug, stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -92,10 +98,9 @@ public class MonitoringCollectionRegistry : BackgroundService
 
     private async Task ReconcileAsync(CancellationToken ct)
     {
-        var desired = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            SiteManagementService.DefaultSiteSlug
-        };
+        var desired = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_licenseState.IsSiteOperational(SiteManagementService.DefaultSiteSlug))
+            desired.Add(SiteManagementService.DefaultSiteSlug);
 
         await using (var db = await _mainDbFactory.CreateDbContextAsync(ct))
         {
@@ -107,7 +112,7 @@ public class MonitoringCollectionRegistry : BackgroundService
                     .Where(s => s.Enabled && !s.IsDefault)
                     .Select(s => s.Slug)
                     .ToListAsync(ct);
-                foreach (var slug in slugs)
+                foreach (var slug in slugs.Where(_licenseState.IsSiteOperational))
                     desired.Add(slug);
             }
         }

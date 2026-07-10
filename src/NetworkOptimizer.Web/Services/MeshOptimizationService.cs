@@ -13,6 +13,8 @@ namespace NetworkOptimizer.Web.Services;
 public class MeshOptimizationService
 {
     private readonly UniFiSshService _ssh;
+    private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<MeshOptimizationService> _logger;
 
     /// <summary>
@@ -31,9 +33,15 @@ public class MeshOptimizationService
     /// </summary>
     private static readonly Regex ValidStaIface = new(@"^vwiresta\d+$", RegexOptions.Compiled);
 
-    public MeshOptimizationService(UniFiSshService ssh, ILogger<MeshOptimizationService> logger)
+    public MeshOptimizationService(
+        UniFiSshService ssh,
+        SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState,
+        ILogger<MeshOptimizationService> logger)
     {
         _ssh = ssh;
+        _siteContext = siteContext;
+        _licenseState = licenseState;
         _logger = logger;
     }
 
@@ -47,6 +55,12 @@ public class MeshOptimizationService
     public async Task<MeshOptimizationResult> OptimizeAsync(
         string? host, string? iface, string? apName, CancellationToken cancellationToken = default)
     {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("Mesh optimization refused: site {Site} is license-restricted", _siteContext.Slug);
+            return MeshOptimizationResult.NoOp(iface, Licensing.LicenseGuard.RestrictedMessage);
+        }
+
         if (string.IsNullOrWhiteSpace(host))
             return MeshOptimizationResult.NoOp(iface, "This AP has no reachable address.");
 

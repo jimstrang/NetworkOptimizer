@@ -69,9 +69,11 @@ public class GatewayWanSpeedTestService
         NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         INetworkPathAnalyzer pathAnalyzer,
         IServiceProvider serviceProvider,
+        Licensing.LicenseStateService? licenseState = null,
         IAlertEventBus? alertEventBus = null,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _licenseState = licenseState;
         _logger = logger;
         _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
         _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
@@ -83,6 +85,8 @@ public class GatewayWanSpeedTestService
         _alertEventBus = alertEventBus;
         _serviceProvider = serviceProvider;
     }
+
+    private readonly Licensing.LicenseStateService? _licenseState;
 
     /// <summary>Context for the database holding this instance's site data.</summary>
     private NetworkOptimizerDbContext CreateSiteDb()
@@ -216,6 +220,14 @@ public class GatewayWanSpeedTestService
         bool maxMode = false,
         CancellationToken cancellationToken = default)
     {
+        if (_licenseState != null && !_licenseState.IsSiteOperational(_siteSlug))
+        {
+            _logger.LogWarning("Gateway WAN speed test refused: site {Site} is license-restricted", _siteSlug);
+            lock (_lock) { _currentPhase = "Error"; _currentPercent = 0; _currentStatus = Licensing.LicenseGuard.RestrictedMessage; }
+            onProgress?.Invoke(("Error", 0, Licensing.LicenseGuard.RestrictedMessage));
+            return null;
+        }
+
         lock (_lock)
         {
             if (_isRunning)

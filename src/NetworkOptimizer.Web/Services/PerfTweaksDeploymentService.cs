@@ -60,14 +60,18 @@ public class PerfTweaksDeploymentService
         IGatewaySshService gatewaySsh,
         NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         SiteContextService siteContext,
-        SqmDeploymentService sqmDeployment)
+        SqmDeploymentService sqmDeployment,
+        Licensing.LicenseStateService licenseState)
     {
         _logger = logger;
         _gatewaySsh = gatewaySsh;
         _siteDbFactory = siteDbFactory;
         _siteContext = siteContext;
         _sqmDeployment = sqmDeployment;
+        _licenseState = licenseState;
     }
+
+    private readonly Licensing.LicenseStateService _licenseState;
 
     /// <summary>
     /// Context for the current site's database. Performance Tweaks deployment state
@@ -440,6 +444,12 @@ public class PerfTweaksDeploymentService
     {
         var steps = new List<string>();
         void Report(string step) { steps.Add(step); progress?.Report(step); }
+
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("Performance tweak deploy refused: site {Site} is license-restricted", _siteContext.Slug);
+            return (false, Licensing.LicenseGuard.RestrictedMessage, steps);
+        }
 
         try
         {

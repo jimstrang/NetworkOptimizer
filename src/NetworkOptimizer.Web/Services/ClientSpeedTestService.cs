@@ -25,9 +25,20 @@ public class ClientSpeedTestService
     private readonly IAlertEventBus? _alertEventBus;
 
     private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
+    private readonly Licensing.LicenseStateService? _licenseState;
     private readonly string _siteSlug;
     private readonly bool _isDefault;
     private readonly string _siteSuffix;
+
+    /// <summary>
+    /// Throws when this site is license-restricted. New client speed test
+    /// results count as new operations; historic result reads stay open.
+    /// </summary>
+    private void EnsureLicenseOperational()
+    {
+        if (_licenseState != null)
+            Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteSlug);
+    }
 
     public ClientSpeedTestService(
         ILogger<ClientSpeedTestService> logger,
@@ -37,9 +48,11 @@ public class ClientSpeedTestService
         ITopologySnapshotService snapshotService,
         IConfiguration configuration,
         NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        Licensing.LicenseStateService? licenseState = null,
         IAlertEventBus? alertEventBus = null,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _licenseState = licenseState;
         _logger = logger;
         _dbFactory = dbFactory;
         _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
@@ -112,6 +125,8 @@ public class ClientSpeedTestService
         int? durationSeconds = null,
         string? externalServerId = null)
     {
+        EnsureLicenseOperational();
+
         // Determine direction based on whether this came from an external server
         var isWan = !string.IsNullOrWhiteSpace(externalServerId);
 
@@ -184,6 +199,8 @@ public class ClientSpeedTestService
         string? rawJson,
         string? serverLocalIp = null)
     {
+        EnsureLicenseOperational();
+
         var now = DateTime.UtcNow;
         // Use the actual server IP from iperf3, else the local endpoint the client hit
         // (agent LAN IP on agent sites, HOST_IP on the default site).

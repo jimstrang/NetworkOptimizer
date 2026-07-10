@@ -29,6 +29,7 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
     // Track running tests
     private bool _isTestRunning = false;
     private GatewaySpeedTestResult? _lastResult;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     public GatewaySpeedTestService(
         ILogger<GatewaySpeedTestService> logger,
@@ -38,8 +39,10 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
         SiteDbContextFactory siteDbFactory,
         SiteContextService siteContext,
         SiteTunnelRouting tunnelRouting,
-        AgentIperf3Service agentIperf3)
+        AgentIperf3Service agentIperf3,
+        Licensing.LicenseStateService licenseState)
     {
+        _licenseState = licenseState;
         _logger = logger;
         _gatewaySsh = gatewaySsh;
         _systemSettings = systemSettings;
@@ -244,6 +247,16 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
     /// </summary>
     public async Task<GatewaySpeedTestResult> RunSpeedTestAsync(int durationSeconds, int parallelStreams)
     {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("Gateway speed test refused: site {Site} is license-restricted", _siteContext.Slug);
+            return new GatewaySpeedTestResult
+            {
+                Success = false,
+                Error = Licensing.LicenseGuard.RestrictedMessage
+            };
+        }
+
         if (_isTestRunning)
         {
             return new GatewaySpeedTestResult

@@ -284,6 +284,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<LicenseStateServic
 builder.Services.AddSingleton<LicenseActivationService>();
 builder.Services.AddSingleton<LicensePhoneHomeService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<LicensePhoneHomeService>());
+builder.Services.AddHostedService<LicenseEnforcementCoordinator>();
 
 // Shared site-local speed-test target resolution (Client Dashboard, LAN Speed
 // Test page, WAN speed test link) - scoped, follows the current site context.

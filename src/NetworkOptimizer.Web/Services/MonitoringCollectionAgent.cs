@@ -52,6 +52,7 @@ public class MonitoringCollectionAgent : BackgroundService
     private readonly NetworkOptimizer.Web.Services.Monitoring.DeviceHealthAlertEvaluator _deviceHealthAlertEvaluator;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<MonitoringCollectionAgent> _logger;
+    private readonly Licensing.LicenseStateService _licenseState;
     private readonly string _siteSlug;
     private readonly bool _isDefault;
 
@@ -86,6 +87,7 @@ public class MonitoringCollectionAgent : BackgroundService
         ICredentialProtectionService credentialProtection,
         LocalProbeExecutor localProbe,
         MonitoringAlertRegistry alertRegistry,
+        Licensing.LicenseStateService licenseState,
         ILoggerFactory loggerFactory,
         ILogger<MonitoringCollectionAgent> logger,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
@@ -93,6 +95,7 @@ public class MonitoringCollectionAgent : BackgroundService
         _dbFactory = dbFactory;
         _siteDbFactory = siteDbFactory;
         _tunnelRegistry = tunnelRegistry;
+        _licenseState = licenseState;
         _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
         _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
         _connectionService = siteConnections.GetFor(_siteSlug);
@@ -303,6 +306,9 @@ public class MonitoringCollectionAgent : BackgroundService
 
     private async Task<bool> ShouldRunNowAsync(MonitoringSettings settings, CancellationToken ct)
     {
+        // License enforcement: restricted sites collect nothing. The registry
+        // stops this instance within a reconcile cycle; this closes the window.
+        if (!_licenseState.IsSiteOperational(_siteSlug)) return false;
         if (!settings.Enabled) return false;
         if (settings.SnmpDetectionState != SnmpDetectionState.EnabledV2c
             && settings.SnmpDetectionState != SnmpDetectionState.EnabledV3Only

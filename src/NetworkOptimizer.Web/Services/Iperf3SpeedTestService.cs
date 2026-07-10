@@ -41,6 +41,8 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     private readonly HashSet<string> _runningTests = new();
     private readonly object _lock = new();
 
+    private readonly Licensing.LicenseStateService? _licenseState;
+
     // Default iperf3 port
     private const int Iperf3Port = 5201;
 
@@ -62,9 +64,11 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         ITopologySnapshotService snapshotService,
         SiteTunnelRouting tunnelRouting,
         AgentIperf3Service agentIperf3,
+        Licensing.LicenseStateService? licenseState = null,
         IAlertEventBus? alertEventBus = null,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _licenseState = licenseState;
         _logger = logger;
         _serviceProvider = serviceProvider;
         _dbFactory = dbFactory;
@@ -339,6 +343,19 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     public async Task<Iperf3Result> RunSpeedTestAsync(DeviceSshConfiguration device, int durationSeconds, int parallelStreams)
     {
         var host = device.Host;
+
+        if (_licenseState != null && !_licenseState.IsSiteOperational(_siteSlug))
+        {
+            _logger.LogWarning("LAN speed test refused: site {Site} is license-restricted", _siteSlug);
+            return new Iperf3Result
+            {
+                DeviceHost = host,
+                DeviceName = device.Name,
+                DeviceType = device.DeviceType.ToString(),
+                Success = false,
+                ErrorMessage = Licensing.LicenseGuard.RestrictedMessage
+            };
+        }
 
         // Check if test is already running for this host
         lock (_lock)

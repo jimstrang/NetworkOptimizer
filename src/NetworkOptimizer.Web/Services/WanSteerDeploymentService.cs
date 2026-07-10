@@ -44,7 +44,8 @@ public class WanSteerDeploymentService
         NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         SiteContextService siteContext,
         ISqmService sqmService,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        Licensing.LicenseStateService licenseState)
     {
         _logger = logger;
         _gatewaySsh = gatewaySsh;
@@ -53,7 +54,10 @@ public class WanSteerDeploymentService
         _siteContext = siteContext;
         _sqmService = sqmService;
         _serviceProvider = serviceProvider;
+        _licenseState = licenseState;
     }
+
+    private readonly Licensing.LicenseStateService _licenseState;
 
     /// <summary>
     /// Context for the current site's database. WanSteerTrafficClasses are per-site
@@ -168,6 +172,12 @@ public class WanSteerDeploymentService
     public async Task<(bool Success, string? Error)> DeployAsync(
         IProgress<string>? progress, CancellationToken ct = default)
     {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("WAN steering deploy refused: site {Site} is license-restricted", _siteContext.Slug);
+            return (false, Licensing.LicenseGuard.RestrictedMessage);
+        }
+
         try
         {
             // Stop existing daemon before binary upload (can't overwrite a running executable)

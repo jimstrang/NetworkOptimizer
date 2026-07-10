@@ -30,6 +30,7 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
     private readonly AgentUwnService _uwn;
     private readonly AgentProbeService _probe;
     private readonly AgentSnmpQueryService _snmpQuery;
+    private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<AgentTunnelService> _logger;
 
     public AgentTunnelService(
@@ -41,6 +42,7 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
         AgentUwnService uwn,
         AgentProbeService probe,
         AgentSnmpQueryService snmpQuery,
+        Licensing.LicenseStateService licenseState,
         ILogger<AgentTunnelService> logger)
     {
         _enrollment = enrollment;
@@ -51,6 +53,7 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
         _uwn = uwn;
         _probe = probe;
         _snmpQuery = snmpQuery;
+        _licenseState = licenseState;
         _logger = logger;
     }
 
@@ -69,6 +72,16 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
             throw new RpcException(new Status(StatusCode.Unauthenticated, "Invalid agent key"));
 
         var (agent, siteSlug) = auth.Value;
+
+        // License enforcement: a restricted site's agent stays paused. The agent's
+        // own dial-out backoff keeps retrying, so re-licensing resumes it without
+        // any agent-side changes.
+        if (!_licenseState.IsSiteOperational(siteSlug))
+        {
+            _logger.LogDebug("Agent {Name} rejected: site {Slug} is license-restricted", agent.Name, siteSlug);
+            throw new RpcException(new Status(StatusCode.PermissionDenied, "Site license restricted"));
+        }
+
         await _enrollment.HeartbeatAsync(hello.AgentKey, hello.Version, hello.LanIp);
 
         var connection = _registry.Register(agent.Id, siteSlug, agent.Name);
@@ -76,8 +89,10 @@ public class AgentTunnelService : AgentTunnel.AgentTunnelBase
 
         // The pump and refresh loops must stop when the read loop ends for any
         // reason, including a graceful agent close (which does not cancel the
-        // call's own token).
-        using var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // call's own token). The connection's drop token lets the server force
+        // the whole call down (license enforcement).
+        using var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct, connection.DropToken);
+        ct = streamCts.Token;
         Task? pumpTask = null;
         Task? refreshTask = null;
         try

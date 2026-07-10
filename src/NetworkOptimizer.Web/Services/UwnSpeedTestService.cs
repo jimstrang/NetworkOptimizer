@@ -55,9 +55,10 @@ public class UwnSpeedTestService : WanSpeedTestServiceBase
         AgentUwnService agentUwn,
         AgentEnrollmentService agentEnrollment,
         NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        Licensing.LicenseStateService licenseState,
         IAlertEventBus? alertEventBus = null,
         string siteSlug = SiteManagementService.DefaultSiteSlug)
-        : base(dbFactory, pathAnalyzer, logger, iperf3ServerService, alertEventBus, siteDbFactory, siteSlug)
+        : base(dbFactory, pathAnalyzer, logger, iperf3ServerService, alertEventBus, siteDbFactory, siteSlug, licenseState)
     {
         _configuration = configuration;
         _connectionService = siteConnections.GetFor(SiteSlug);

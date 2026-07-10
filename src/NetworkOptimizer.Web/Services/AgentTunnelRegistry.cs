@@ -91,6 +91,22 @@ public sealed class AgentTunnelConnection
     public DateTime ConnectedAt { get; }
     public DateTime LastMessageAt { get; internal set; }
 
+    private readonly CancellationTokenSource _dropCts = new();
+
+    /// <summary>Cancelled when the server force-drops this connection (license enforcement).</summary>
+    internal CancellationToken DropToken => _dropCts.Token;
+
+    /// <summary>
+    /// Force-terminates the tunnel from the server side: cancels the handler's
+    /// read/write loops and completes the outbound channel. The agent's own
+    /// dial-out backoff governs reconnect attempts.
+    /// </summary>
+    internal void Drop()
+    {
+        try { _dropCts.Cancel(); } catch (ObjectDisposedException) { }
+        Complete();
+    }
+
     /// <summary>Server-to-agent messages awaiting the stream pump.</summary>
     internal ChannelReader<ServerMessage> Outbound => _outbound.Reader;
 

@@ -36,6 +36,7 @@ public class WiFiOptimizerService
     // ambient HTTP context is gone, or inside a pinned background scope whose pin a
     // fresh scope would not inherit.
     private readonly string _siteSlug;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     // Cached data (refreshed on demand)
     private List<AccessPointSnapshot>? _cachedAps;
@@ -58,9 +59,11 @@ public class WiFiOptimizerService
         ChannelRecommendationService channelRecommendationService,
         NetworkOptimizer.Storage.Interfaces.IChannelMemoryRepository channelMemoryRepository,
         SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState,
         ILogger<WiFiOptimizerService> logger,
         ILoggerFactory loggerFactory)
     {
+        _licenseState = licenseState;
         _siteSlug = siteContext.Slug;
         _connectionService = connectionService;
         _optimizerEngine = optimizerEngine;
@@ -678,6 +681,8 @@ public class WiFiOptimizerService
         IProgress<int>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteSlug);
+
         var list = targets.ToList();
         if (list.Count == 0 || !_connectionService.IsConnected || _connectionService.Client == null)
             return;

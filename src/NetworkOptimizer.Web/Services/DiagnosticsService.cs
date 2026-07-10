@@ -23,6 +23,7 @@ public class DiagnosticsService
     private readonly IMemoryCache _cache;
     private readonly ILoggerFactory _loggerFactory;
     private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     public DiagnosticsService(
         ILogger<DiagnosticsService> logger,
@@ -31,9 +32,11 @@ public class DiagnosticsService
         IeeeOuiDatabase ieeeOuiDb,
         IMemoryCache cache,
         ILoggerFactory loggerFactory,
-        SiteContextService siteContext)
+        SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState)
     {
         _siteContext = siteContext;
+        _licenseState = licenseState;
         _logger = logger;
         _connectionService = connectionService;
         _fingerprintService = fingerprintService;
@@ -74,6 +77,8 @@ public class DiagnosticsService
     /// <returns>Diagnostics result</returns>
     public async Task<DiagnosticsResult> RunDiagnosticsAsync(DiagnosticsOptions? options = null)
     {
+        Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteContext.Slug);
+
         if (IsRunning)
         {
             _logger.LogWarning("Diagnostics already running, returning last result");

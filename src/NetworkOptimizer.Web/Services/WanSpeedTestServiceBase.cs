@@ -88,7 +88,8 @@ public abstract class WanSpeedTestServiceBase
         Iperf3ServerService iperf3Server,
         IAlertEventBus? alertEventBus = null,
         NetworkOptimizer.Storage.Services.SiteDbContextFactory? siteDbFactory = null,
-        string siteSlug = SiteManagementService.DefaultSiteSlug)
+        string siteSlug = SiteManagementService.DefaultSiteSlug,
+        Licensing.LicenseStateService? licenseState = null)
     {
         DbFactory = dbFactory;
         PathAnalyzer = pathAnalyzer;
@@ -96,9 +97,15 @@ public abstract class WanSpeedTestServiceBase
         Iperf3Server = iperf3Server;
         _alertEventBus = alertEventBus;
         _siteDbFactory = siteDbFactory;
+        _licenseState = licenseState;
         SiteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
         IsDefaultSite = SiteSlug == SiteManagementService.DefaultSiteSlug;
     }
+
+    private readonly Licensing.LicenseStateService? _licenseState;
+
+    /// <summary>False when license enforcement blocks operations for this instance's site.</summary>
+    protected bool IsSiteLicenseOperational => _licenseState?.IsSiteOperational(SiteSlug) ?? true;
 
     /// <summary>Context for the database holding this instance's site data.</summary>
     protected async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct = default)
@@ -118,6 +125,14 @@ public abstract class WanSpeedTestServiceBase
         bool maxMode = false,
         CancellationToken cancellationToken = default)
     {
+        if (!IsSiteLicenseOperational)
+        {
+            Logger.LogWarning("WAN speed test refused: site {Site} is license-restricted", SiteSlug);
+            lock (_lock) { _currentPhase = "Error"; _currentPercent = 0; _currentStatus = Licensing.LicenseGuard.RestrictedMessage; }
+            onProgress?.Invoke(("Error", 0, Licensing.LicenseGuard.RestrictedMessage));
+            return null;
+        }
+
         if (!await CanRunForSiteAsync())
         {
             // The test binary runs on this host, so it measures this server's own

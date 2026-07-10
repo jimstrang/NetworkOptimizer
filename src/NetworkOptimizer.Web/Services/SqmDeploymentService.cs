@@ -17,6 +17,8 @@ public class SqmDeploymentService : ISqmDeploymentService
     private readonly IGatewaySshService _gatewaySsh;
     private readonly IUdmBootService _udmBoot;
     private readonly IServiceProvider _serviceProvider;
+    private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     // Gateway paths
     private const string OnBootDir = "/data/on_boot.d";
@@ -26,12 +28,16 @@ public class SqmDeploymentService : ISqmDeploymentService
         ILogger<SqmDeploymentService> logger,
         IGatewaySshService gatewaySsh,
         IUdmBootService udmBoot,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState)
     {
         _logger = logger;
         _gatewaySsh = gatewaySsh;
         _udmBoot = udmBoot;
         _serviceProvider = serviceProvider;
+        _siteContext = siteContext;
+        _licenseState = licenseState;
     }
 
     /// <summary>
@@ -286,6 +292,14 @@ public class SqmDeploymentService : ISqmDeploymentService
         var result = new SqmDeploymentResult();
         var steps = new List<string>();
 
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("SQM deploy refused: site {Site} is license-restricted", _siteContext.Slug);
+            result.Success = false;
+            result.Error = Licensing.LicenseGuard.RestrictedMessage;
+            return result;
+        }
+
         var settings = await GetGatewaySettingsAsync();
         if (settings == null || string.IsNullOrEmpty(settings.Host))
         {
@@ -492,6 +506,12 @@ public class SqmDeploymentService : ISqmDeploymentService
     /// </summary>
     public async Task<(bool success, string? warning)> DeploySqmMonitorAsync(string wan1Interface, string wan1Name, string wan2Interface, string wan2Name)
     {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("SQM monitor deploy refused: site {Site} is license-restricted", _siteContext.Slug);
+            return (false, Licensing.LicenseGuard.RestrictedMessage);
+        }
+
         var settings = await GetGatewaySettingsAsync();
         if (settings == null || string.IsNullOrEmpty(settings.Host))
         {

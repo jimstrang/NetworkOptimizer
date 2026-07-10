@@ -26,9 +26,18 @@ public static class ScheduleExecutorRegistration
             ExecuteLanSpeedTestAsync(app.Services, siteKey, targetId, ct);
     }
 
+    /// <summary>Scheduled operations record a clean failure for license-restricted sites.</summary>
+    private static bool IsLicenseRestricted(IServiceProvider services, string siteKey) =>
+        !services.GetRequiredService<Licensing.LicenseStateService>().IsSiteOperational(siteKey);
+
+    private const string LicenseRestrictedError = "Site is restricted by licensing";
+
     private static async Task<(bool Success, string? Summary, string? Error)> ExecuteAuditAsync(
         IServiceProvider services, string siteKey, CancellationToken ct)
     {
+        if (IsLicenseRestricted(services, siteKey))
+            return (false, null, LicenseRestrictedError);
+
         // Ensure the site's console connection is fresh for scheduled audits
         // (fingerprint cache expires after 24h)
         var connService = services.GetRequiredService<SiteConnectionRegistry>().GetFor(siteKey);
@@ -68,6 +77,9 @@ public static class ScheduleExecutorRegistration
     private static async Task<(bool Success, string? Summary, string? Error)> ExecuteWanSpeedTestAsync(
         IServiceProvider services, string siteKey, int taskId, string? targetId, string? targetConfig, CancellationToken ct)
     {
+        if (IsLicenseRestricted(services, siteKey))
+            return (false, null, LicenseRestrictedError);
+
         try
         {
             // Parse config for test type, max mode, multi-WAN
@@ -179,6 +191,9 @@ public static class ScheduleExecutorRegistration
     private static async Task<(bool Success, string? Summary, string? Error)> ExecuteLanSpeedTestAsync(
         IServiceProvider services, string siteKey, string? targetId, CancellationToken ct)
     {
+        if (IsLicenseRestricted(services, siteKey))
+            return (false, null, LicenseRestrictedError);
+
         if (string.IsNullOrEmpty(targetId))
             return (false, null, "No target device specified");
 

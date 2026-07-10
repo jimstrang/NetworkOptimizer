@@ -56,6 +56,7 @@ public class AuditService
     private readonly IAlertEventBus? _alertEventBus;
     private readonly IThreatRepository? _threatRepository;
     private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     public AuditService(
         ILogger<AuditService> logger,
@@ -68,10 +69,12 @@ public class AuditService
         IMemoryCache cache,
         Audit.Analyzers.FirewallRuleParser firewallParser,
         SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState,
         IAlertEventBus? alertEventBus = null,
         IThreatRepository? threatRepository = null)
     {
         _siteContext = siteContext;
+        _licenseState = licenseState;
         _logger = logger;
         _connectionService = connectionService;
         _auditEngine = auditEngine;
@@ -1128,6 +1131,7 @@ public class AuditService
 
     public async Task<AuditResult> RunAuditAsync(AuditOptions options)
     {
+        Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteContext.Slug);
         IsRunning = true;
         try
         {

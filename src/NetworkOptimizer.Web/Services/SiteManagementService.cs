@@ -19,17 +19,20 @@ public class SiteManagementService
     private readonly ISiteRepository _siteRepository;
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _mainDbFactory;
     private readonly SiteDatabasePaths _dbPaths;
+    private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<SiteManagementService> _logger;
 
     public SiteManagementService(
         ISiteRepository siteRepository,
         IDbContextFactory<NetworkOptimizerDbContext> mainDbFactory,
         SiteDatabasePaths dbPaths,
+        Licensing.LicenseStateService licenseState,
         ILogger<SiteManagementService> logger)
     {
         _siteRepository = siteRepository;
         _mainDbFactory = mainDbFactory;
         _dbPaths = dbPaths;
+        _licenseState = licenseState;
         _logger = logger;
     }
 
@@ -72,17 +75,20 @@ public class SiteManagementService
 
     /// <summary>
     /// Sites permitted under the BSL Additional Use Grant (personal,
-    /// non-commercial use on up to three sites). A future licensing / unlock-key
-    /// scheme will raise this - <see cref="GetSiteLimitAsync"/> is the single
-    /// place that decision hooks into.
+    /// non-commercial use on up to three sites). License keys raise the
+    /// effective limit through <see cref="GetSiteLimitAsync"/>.
     /// </summary>
     public const int FreeSiteLimit = 3;
 
     /// <summary>
-    /// The effective maximum number of sites for this instance. Today it is
-    /// always <see cref="FreeSiteLimit"/>; the future unlock key raises it here.
+    /// The effective maximum number of sites for this instance: the free-tier
+    /// limit with no active licensing, otherwise the summed allowance of the
+    /// active license keys. Keys in their post-expiry grace period grant no
+    /// headroom for creating new sites (their already-assigned sites keep
+    /// working through grace).
     /// </summary>
-    public Task<int> GetSiteLimitAsync() => Task.FromResult(FreeSiteLimit);
+    public Task<int> GetSiteLimitAsync() => Task.FromResult(
+        _licenseState.AnyKeysActive ? _licenseState.TotalAllowance : FreeSiteLimit);
 
     /// <summary>How many more sites may be created before hitting the limit.</summary>
     public async Task<int> RemainingSiteSlotsAsync()
@@ -124,13 +130,14 @@ public class SiteManagementService
         if ((await _siteRepository.GetAllAsync()).Count >= limit)
             throw new InvalidOperationException(
                 $"This instance is limited to {limit} sites under the current license. " +
-                "Remove a site, or unlock more, to add another.");
+                "Add a license key under Settings > Application > Licensing to unlock more sites.");
 
         var slug = await GenerateUniqueSlugAsync(name);
         var site = new Site { Slug = slug, Name = name.Trim() };
 
         await ProvisionSiteDatabaseAsync(slug);
         await _siteRepository.AddAsync(site);
+        await _licenseState.RecomputeAsync();
         return site;
     }
 
