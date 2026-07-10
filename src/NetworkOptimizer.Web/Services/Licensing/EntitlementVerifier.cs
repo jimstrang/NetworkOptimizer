@@ -19,7 +19,12 @@ public static class EntitlementVerifier
     /// </summary>
     private static readonly IReadOnlyDictionary<string, string> TrustedKeys = new Dictionary<string, string>
     {
-        // Populated with the production license server key during initial deployment.
+        ["ea9df970"] = """
+            -----BEGIN PUBLIC KEY-----
+            MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8HmQQGiZJvc3y82MxskSJocXqm/Q
+            HR1BfNsG6DQDriL43KPNYvHnNUS3u34VdmPKCFVNHeNiIzFrD8FWImkpEQ==
+            -----END PUBLIC KEY-----
+            """,
     };
 
     /// <summary>
