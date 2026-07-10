@@ -288,17 +288,30 @@ public class IspHealthScorer
     }
 
     /// <summary>
-    /// Picks the WAN speed tests to grade: those inside the score window, else the
-    /// most recent within SpeedTestFallbackDays (marked stale).
+    /// Picks the WAN speed tests to grade. Prefers those inside the score window; when the
+    /// window holds fewer than <see cref="IspHealthOptions.SpeedTestMinSamples"/>, tops up with
+    /// the most recent tests from before the window (reaching back no further than
+    /// SpeedTestFallbackDays) so a sparse window still grades on a stable sample. Marked stale
+    /// only when the window itself is empty - the newest graded test then predates it.
     /// </summary>
     private (List<SpeedTestSample> Tests, bool Stale) SelectSpeedTests(IspHealthInputs inputs)
     {
-        var inWindow = inputs.WanSpeedTests.Where(t => t.Time >= inputs.WindowStart && t.Time <= inputs.WindowEnd).ToList();
-        if (inWindow.Count > 0) return (inWindow, false);
+        var inWindow = inputs.WanSpeedTests
+            .Where(t => t.Time >= inputs.WindowStart && t.Time <= inputs.WindowEnd)
+            .OrderByDescending(t => t.Time)
+            .ToList();
+        if (inWindow.Count >= _options.SpeedTestMinSamples) return (inWindow, false);
 
         var fallbackStart = inputs.WindowEnd.AddDays(-_options.SpeedTestFallbackDays);
-        var latest = inputs.WanSpeedTests.Where(t => t.Time >= fallbackStart).OrderByDescending(t => t.Time).FirstOrDefault();
-        return latest == null ? (new List<SpeedTestSample>(), false) : (new List<SpeedTestSample> { latest }, true);
+        var borrowed = inputs.WanSpeedTests
+            .Where(t => t.Time >= fallbackStart && t.Time < inputs.WindowStart)
+            .OrderByDescending(t => t.Time)
+            .Take(_options.SpeedTestMinSamples - inWindow.Count)
+            .ToList();
+
+        var combined = inWindow.Concat(borrowed).ToList();
+        if (combined.Count == 0) return (new List<SpeedTestSample>(), false);
+        return (combined, inWindow.Count == 0);
     }
 
     /// <summary>

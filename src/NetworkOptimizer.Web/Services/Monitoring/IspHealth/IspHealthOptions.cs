@@ -76,6 +76,13 @@ public class IspHealthOptions
     /// <summary>How far back to fall when no WAN speed test ran inside the score window.</summary>
     public int SpeedTestFallbackDays { get; set; } = 7;
 
+    /// <summary>
+    /// Target number of WAN speed tests to grade. When the score window holds fewer than this,
+    /// selection tops up with the most recent tests from before the window (bounded by
+    /// <see cref="SpeedTestFallbackDays"/>) so a sparse window still grades on a stable sample.
+    /// </summary>
+    public int SpeedTestMinSamples { get; set; } = 4;
+
     /// <summary>Fraction of the lowest WAN speed test results discarded as outliers (broken servers, flukes).</summary>
     public double SpeedTestOutlierTrimFraction { get; set; } = 0.15;
 

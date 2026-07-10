@@ -509,6 +509,27 @@ public class IspHealthScorerTests
     }
 
     [Fact]
+    public void Sparse_window_tops_up_to_min_samples_from_before_window()
+    {
+        // Two tests inside the 24 h window plus older tests within the 7-day fallback:
+        // selection reaches back to reach SpeedTestMinSamples (4) and grades all four.
+        // The newest graded test is in-window, so the factor is not marked stale.
+        var report = new IspHealthScorer(Options).Score(BuildInputs(
+            speedTests: new List<SpeedTestSample>
+            {
+                new(TestSeries.Start.AddHours(3), 980, 490),
+                new(TestSeries.Start.AddHours(6), 970, 485),
+                new(TestSeries.Start.AddDays(-1), 960, 480),
+                new(TestSeries.Start.AddDays(-2), 950, 475),
+                new(TestSeries.Start.AddDays(-4), 940, 470)
+            }), Gpon);
+
+        var factor = report.AccessDimension.Factors.Single(f => f.Name == "Speed vs Plan");
+        factor.Description.Should().Contain("Fastest of 4 WAN tests");
+        factor.Description.Should().NotContain("older than");
+    }
+
+    [Fact]
     public void Loaded_latency_falls_back_to_speed_test_measurements()
     {
         // No passive load (line idle all day), but a WAN speed test measured its own
