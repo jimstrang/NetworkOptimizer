@@ -20,7 +20,7 @@
         @if (LicenseState.AnyKeysActive)
         {
             <p class="section-description">
-                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used.@(ActiveKeyOrgs is { Length: > 0 } orgs ? $" Keys: {orgs}." : "")
+                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used.
             </p>
         }
         else
@@ -197,19 +197,6 @@
         }
     }
 
-    private string ActiveKeyOrgs
-    {
-        get
-        {
-            var now = DateTime.UtcNow;
-            var orgs = _keys
-                .Where(k => LicenseStateService.IsActiveCurrent(k, now) && !string.IsNullOrEmpty(k.Org))
-                .Select(k => k.Org!)
-                .Distinct()
-                .ToList();
-            return string.Join(", ", orgs);
-        }
-    }
 
     private DateTime? NewestCheckAt => _keys
         .Where(k => k.LastCheckAt != null)
