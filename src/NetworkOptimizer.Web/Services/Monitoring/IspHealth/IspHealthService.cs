@@ -75,6 +75,14 @@ public class IspHealthService
         _logger = logger;
     }
 
+    /// <summary>
+    /// Every site (the home site included) reads its expected ISP plan speeds from the UniFi
+    /// Console, so computing ISP Health before that connection is up would cache a report with
+    /// an unscored Speed vs Plan factor. Gates every compute entry point; a managed site's
+    /// connection simply comes up later (over its agent tunnel) than the home site's.
+    /// </summary>
+    private bool CanCompute => _connectionService.IsConnected;
+
     /// <summary>Context for the database holding this instance's site data.</summary>
     private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct)
     {
@@ -194,6 +202,13 @@ public class IspHealthService
         if (report != null && DateTime.UtcNow - report.ComputedAt < _options.DashboardScoreTtl)
             return new IspHealthSnapshot(IspHealthStatus.Ready, report.OverallScore, report.ComputedAt);
 
+        // Managed site whose console isn't up yet: serve any stale report, but don't kick a
+        // compute until the connection lands (expected ISP speeds come from the console).
+        if (!CanCompute)
+            return report != null
+                ? new IspHealthSnapshot(IspHealthStatus.Ready, report.OverallScore, report.ComputedAt)
+                : new IspHealthSnapshot(IspHealthStatus.AwaitingConnection, null, null);
+
         if (!_computing)
         {
             _ = Task.Run(async () =>
@@ -214,6 +229,15 @@ public class IspHealthService
         var cached = _cached?.Report;
         if (!forceRefresh && cached != null && DateTime.UtcNow - cached.ComputedAt < _options.CacheTtl)
             return cached;
+
+        // Defer computing until the console connection is up (expected ISP speeds come from
+        // it). Serve any existing report; otherwise publish AwaitingConnection for the funnels.
+        if (!CanCompute)
+        {
+            if (cached == null)
+                _status = IspHealthStatus.AwaitingConnection;
+            return cached;
+        }
 
         await _computeLock.WaitAsync(ct);
         try
@@ -388,6 +412,11 @@ public class IspHealthService
     public async Task<(IspHealthReport? Report, List<AsnSeries> ChartClusters)> ComputeForWindowAsync(
         DateTime windowStart, DateTime windowEnd, bool forceRefresh = false, CancellationToken ct = default)
     {
+        // No console connection means no expected ISP speeds to score against; skip the heavy
+        // compute rather than cache a plan-less custom-window report.
+        if (!CanCompute)
+            return (null, new List<AsnSeries>());
+
         // Enforce the filter's window bounds on the real data path. The UI clamps too, but this is the
         // single chokepoint every custom-window caller (report and chart endpoint) funnels through, so a
         // sub-minimum (or over-max) request can't slip past into an empty result. Pin the end and expand

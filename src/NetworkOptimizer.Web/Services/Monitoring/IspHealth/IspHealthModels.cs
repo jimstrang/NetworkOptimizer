@@ -15,6 +15,9 @@ public enum IspHealthStatus
     InsufficientData,
     /// <summary>Prerequisites met; first computation has not finished yet.</summary>
     Computing,
+    /// <summary>The site's console connection is not up yet, so the expected ISP plan speeds
+    /// can't be read; the compute is deferred until it connects.</summary>
+    AwaitingConnection,
     /// <summary>A report is available.</summary>
     Ready
 }
@@ -686,7 +689,7 @@ public record IspHealthSnapshot(IspHealthStatus Status, int? Score, DateTime? Co
     public string TileText => Status switch
     {
         IspHealthStatus.Ready when Score.HasValue => Score.Value.ToString(),
-        IspHealthStatus.Computing or IspHealthStatus.InsufficientData => "...",
+        IspHealthStatus.Computing or IspHealthStatus.InsufficientData or IspHealthStatus.AwaitingConnection => "...",
         _ => "Set up"
     };
 
@@ -695,6 +698,7 @@ public record IspHealthSnapshot(IspHealthStatus Status, int? Score, DateTime? Co
     {
         IspHealthStatus.Ready when Score.HasValue => $"ISP Health: {IspHealthReport.GradeLabel(Score.Value)}",
         IspHealthStatus.Computing => "Analyzing recent ISP data",
+        IspHealthStatus.AwaitingConnection => "Waiting for the console connection to read your ISP plan speeds",
         IspHealthStatus.InsufficientData => "Collecting data - ISP Health needs a few hours of monitoring",
         IspHealthStatus.NeedsDiscovery => "Run Upstream Discovery to enable ISP Health",
         IspHealthStatus.NeedsTechnology => "Select your access technology to enable ISP Health",

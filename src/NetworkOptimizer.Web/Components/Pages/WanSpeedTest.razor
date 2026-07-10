@@ -29,18 +29,15 @@
 <div class="speedtest-container wan-speedtest">
     <div class="page-header wan-speedtest-header">
         <h1>WAN Speed Test</h1>
-        @if (_ispHealthQueryable)
-        {
-            var ispHealth = IspHealthService.GetCachedScore();
-            <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=isp-health"))">
-                <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
-                <div class="stat-label">ISP Health</div>
-                @if (ispHealth.Status == IspHealthStatus.Ready && ispHealth.Score.HasValue)
-                {
-                    <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
-                }
-            </div>
-        }
+        @{ var ispHealth = IspHealthService.GetCachedScore(); }
+        <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=isp-health"))">
+            <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
+            <div class="stat-label">ISP Health</div>
+            @if (ispHealth.Status == IspHealthStatus.Ready && ispHealth.Score.HasValue)
+            {
+                <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
+            }
+        </div>
     </div>
 
     @if (!_wanScheduleBannerDismissed)
@@ -835,20 +832,14 @@
         StartIspHealthRefresh();
     }
 
-    // External managed sites lack the console-provided expected ISP speeds until their
-    // connection is up, so an ISP Health compute before then caches a report with an
-    // unscored Speed vs Plan. The default (local) site is always queryable.
-    private bool _ispHealthQueryable => SiteContext.IsDefault || ConnectionService.IsConnected;
-
-    // The header ISP Health tile computes its score in the background on first view;
-    // poll until it lands so the value appears without navigating away and back.
+    // The header ISP Health tile computes its score in the background; poll until it lands so
+    // the value appears without navigating away and back. Only polls while a compute is in
+    // flight - other states (Ready, awaiting the console connection, setup funnels) won't
+    // resolve on their own here; the console-up hook re-arms it once the connection lands.
     private void StartIspHealthRefresh()
     {
-        if (!_ispHealthQueryable)
-            return;
-
         var snapshot = IspHealthService.GetCachedScore();
-        if (snapshot.Status == IspHealthStatus.Ready)
+        if (snapshot.Status != IspHealthStatus.Computing)
             return;
 
         var lastText = snapshot.TileText;

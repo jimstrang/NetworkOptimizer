@@ -127,6 +127,17 @@ else if (_report == null)
             </div>
         </div>
     }
+    else if (IspHealth.Status == IspHealthStatus.AwaitingConnection)
+    {
+        <div class="alert alert-info" style="margin-bottom: 1rem;">
+            <div class="banner-content">
+                <span class="banner-icon banner-icon-info">i</span>
+                <div class="banner-text" style="flex: 1;">
+                    Waiting for this site's console connection. ISP Health reads your expected ISP speeds from the console; it will compute once the connection is up.
+                </div>
+            </div>
+        </div>
+    }
     else
     {
         <div class="alert alert-warning" style="margin-bottom: 1rem;">
