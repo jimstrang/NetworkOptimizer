@@ -203,7 +203,26 @@ else
         await LoadDataAsync();
         _refreshTimer = new System.Threading.Timer(async _ =>
         {
-            try { await InvokeAsync(StateHasChanged); }
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    // The dashboard renders this panel eagerly, before an external site's console
+                    // connection (which establishes in the background) is up - so the first
+                    // LoadDataAsync gets no devices and the gateway identity stays null, blanking
+                    // WAN rates, gateway CPU/Mem/Temp/RTT and the map until a manual nav away and
+                    // back. Once the connection lands, re-load to resolve the gateway, and remount
+                    // the map so it repopulates with live data.
+                    if (ConnectionService.IsConnected && (!_ready || _gatewayMac == null))
+                    {
+                        var hadGateway = _gatewayMac != null;
+                        await LoadDataAsync();
+                        if (_gatewayMac != null && !hadGateway && _mapMounted)
+                            await UnmountMap();
+                    }
+                    StateHasChanged();
+                });
+            }
             catch { }
         }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
     }
