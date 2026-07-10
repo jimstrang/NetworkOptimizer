@@ -5,6 +5,7 @@
 @inject SiteConnectionRegistry SiteConnections
 @inject AgentEnrollmentService AgentEnrollment
 @inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 
@@ -39,9 +40,24 @@
         @if (_remainingSlots <= 0)
         {
             <p class="section-description">
-                You've reached the @SiteManagementService.FreeSiteLimit-site limit for this license
-                (personal, non-commercial use). Remove a site to add another, or contact
-                <a href="mailto:tj@ozarkconnect.net">tj@@ozarkconnect.net</a> about licensing for more sites.
+                @if (LicenseState.AnyKeysActive)
+                {
+                    <text>
+                        You've used all of your licensed site slots. Add or assign a license key in
+                        <a href="/settings?tab=application#licensing">Licensing settings</a>, remove a site to free a slot,
+                        or contact <a href="mailto:tj@ozarkconnect.net">tj@@ozarkconnect.net</a> about more sites.
+                    </text>
+                }
+                else
+                {
+                    <text>
+                        You've reached the @SiteManagementService.FreeSiteLimit-site limit for personal, non-commercial use.
+                        If you have a license key, add it in
+                        <a href="/settings?tab=application#licensing">Licensing settings</a> to unlock more sites.
+                        Otherwise remove a site to add another, or contact
+                        <a href="mailto:tj@ozarkconnect.net">tj@@ozarkconnect.net</a> about licensing.
+                    </text>
+                }
             </p>
         }
         else

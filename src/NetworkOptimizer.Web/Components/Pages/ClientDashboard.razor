@@ -300,12 +300,12 @@
                             <div class="speed-hero-results">
                                 <div class="speed-metric download">
                                     <span class="speed-label">From Device</span>
-                                    <span class="speed-value speed-down">@_latestSpeedResult.DownloadMbps.ToString("F1")</span>
+                                    <span class="speed-value speed-down">@FormatSpeed(_latestSpeedResult.DownloadMbps, "F1")</span>
                                     <span class="speed-unit">Mbps</span>
                                 </div>
                                 <div class="speed-metric upload">
                                     <span class="speed-label">To Device</span>
-                                    <span class="speed-value speed-up">@_latestSpeedResult.UploadMbps.ToString("F1")</span>
+                                    <span class="speed-value speed-up">@FormatSpeed(_latestSpeedResult.UploadMbps, "F1")</span>
                                     <span class="speed-unit">Mbps</span>
                                 </div>
                                 @if (_latestSpeedResult.PingMs.HasValue)
@@ -447,9 +447,9 @@
                                             <tr class="result-row @(_expandedResultId == r.Id ? "expanded" : "")"
                                                 @onclick="() => ToggleResultExpand(r.Id)">
                                                 <td>@FormatTimeShort(r.TestTime)</td>
-                                                <td class="hide-mobile"><span class="speed-down">@r.DownloadMbps.ToString("F1")</span> Mbps</td>
-                                                <td class="hide-mobile"><span class="speed-up">@r.UploadMbps.ToString("F1")</span> Mbps</td>
-                                                <td class="show-mobile"><span class="speed-down">@r.DownloadMbps.ToString("F0")</span> / <span class="speed-up">@r.UploadMbps.ToString("F0")</span></td>
+                                                <td class="hide-mobile"><span class="speed-down">@FormatSpeed(r.DownloadMbps, "F1")</span> Mbps</td>
+                                                <td class="hide-mobile"><span class="speed-up">@FormatSpeed(r.UploadMbps, "F1")</span> Mbps</td>
+                                                <td class="show-mobile"><span class="speed-down">@FormatSpeed(r.DownloadMbps, "F0")</span> / <span class="speed-up">@FormatSpeed(r.UploadMbps, "F0")</span></td>
                                                 @if (!(_client?.IsWired == true))
                                                 {
                                                     <td class="hide-mobile">@RenderRate(r.WifiRxRateKbps, "wifi-speed-rx")</td>
@@ -2373,6 +2373,13 @@
             ? local.ToString("HH:mm")
             : local.ToString("MMM dd HH:mm");
     }
+
+    /// <summary>
+    /// Formats a speed value, showing a dash for a missing direction (a
+    /// one-directional test leaves the other direction at zero) rather than "0".
+    /// </summary>
+    private static string FormatSpeed(double mbps, string format) =>
+        mbps > 0 ? mbps.ToString(format) : "-";
 
     private static MarkupString RenderRate(long? rateKbps, string colorClass)
     {

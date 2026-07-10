@@ -2324,6 +2324,10 @@ a.btn-lg {
         flex-wrap: wrap;
         justify-content: center;
     }
+
+    .site-switcher ~ .logout-btn span {
+        display: none;
+    }
 }
 
 .action-buttons .btn {
