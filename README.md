@@ -17,7 +17,7 @@ Genuinely, thank you so much to everybody for taking the time to use Network Opt
 
 ## Multi-Site Support Is in Development
 
-Multi-site support is almost ready! Please see this thread if you'd like to help test it: https://github.com/Ozark-Connect/NetworkOptimizer/discussions/954
+Multi-site support is almost ready! Please see this thread if you'd like to help test it or need a trial license for multiple sites: https://github.com/Ozark-Connect/NetworkOptimizer/discussions/954
 
 ## New: ISP Health
 
