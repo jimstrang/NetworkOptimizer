@@ -6,7 +6,6 @@
 @inject LicenseActivationService Activation
 @inject LicensePhoneHomeService PhoneHome
 @inject SiteManagementService SiteManagement
-@inject SystemSettingsService SystemSettings
 @inject IJSRuntime JS
 
 <div class="card settings-tab-application" id="licensing">
@@ -172,16 +171,6 @@
             </div>
         }
 
-        <details style="margin-top: 1rem;">
-            <summary style="cursor: pointer;">Advanced</summary>
-            <div class="form-group" style="margin-top: 0.75rem;">
-                <label class="form-label">License server URL</label>
-                <input type="text" class="form-control" @bind="_serverUrl" @bind:after="SaveServerUrlAsync"
-                       placeholder="@LicenseServerClient.DefaultServerUrl"
-                       autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
-                <small class="form-help">For testing only. Leave empty for the default server.</small>
-            </div>
-        </details>
     </div>
 </div>
 
@@ -197,7 +186,6 @@
     private int _removingKeyId;
     private string? _assignError;
     private bool _refreshing;
-    private string? _serverUrl;
 
     private int UsedSlots
     {
@@ -233,7 +221,6 @@
     {
         LicenseState.OnStateChanged += HandleStateChanged;
         _multiSiteEnabled = await SiteManagement.IsMultiSiteEnabledAsync();
-        _serverUrl = await SystemSettings.GetGlobalAsync(SystemSettingKeys.LicensingServerUrl);
         await LoadDataAsync();
     }
 
@@ -328,12 +315,6 @@
         {
             _refreshing = false;
         }
-    }
-
-    private async Task SaveServerUrlAsync()
-    {
-        var value = string.IsNullOrWhiteSpace(_serverUrl) ? null : _serverUrl.Trim();
-        await SystemSettings.SetGlobalAsync(SystemSettingKeys.LicensingServerUrl, value);
     }
 
     private int AssignedCount(int keyId) => _assignments.Count(a => a.LicenseKeyRecordId == keyId);
