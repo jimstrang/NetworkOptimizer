@@ -28,7 +28,10 @@
 
 <div class="speedtest-container wan-speedtest">
     <div class="page-header wan-speedtest-header">
-        <h1>WAN Speed Test</h1>
+        <div class="wan-header-titles">
+            <h1>WAN Speed Test</h1>
+            <p class="page-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
+        </div>
         @{ var ispHealth = IspHealthService.GetCachedScore(); }
         <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=isp-health"))">
             <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
@@ -38,7 +41,6 @@
                 <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
             }
         </div>
-        <p class="page-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
     </div>
 
     @if (!_wanScheduleBannerDismissed)
@@ -606,8 +608,14 @@
 </div>
 
 <style>
-    .wan-speedtest-header h1 {
-        margin-right: auto;
+    .page-header.wan-speedtest-header {
+        align-items: flex-start;
+        justify-content: space-between;
+        flex-wrap: nowrap;
+    }
+    .wan-speedtest-header .wan-header-titles {
+        flex: 1 1 auto;
+        min-width: 0;
     }
     .wan-speedtest-header .monitoring-stat-card.wan-header-isp-tile {
         flex: 0 0 auto;
