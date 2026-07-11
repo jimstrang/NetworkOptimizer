@@ -65,7 +65,12 @@ var version = Assembly.GetExecutingAssembly()
 // The agent's primary LAN IPv4 on the site network. The central server points
 // site clients at this address for LAN speed tests, since its own address is
 // unreachable from a remote site's LAN. Reported on enrollment and each heartbeat.
-var lanIp = NetworkOptimizer.Core.Helpers.NetworkUtilities.DetectLocalIpFromInterfaces();
+// NO_AGENT_LAN_IP overrides auto-detection for deployments where it can't see the
+// real LAN address (e.g. Docker bridge mode instead of host, or multi-NIC hosts).
+var lanIpOverride = Environment.GetEnvironmentVariable("NO_AGENT_LAN_IP");
+var lanIp = !string.IsNullOrWhiteSpace(lanIpOverride)
+    ? lanIpOverride.Trim()
+    : NetworkOptimizer.Core.Helpers.NetworkUtilities.DetectLocalIpFromInterfaces();
 
 var handler = new HttpClientHandler();
 if (config.IgnoreSslErrors)

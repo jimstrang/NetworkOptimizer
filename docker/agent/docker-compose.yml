@@ -23,6 +23,9 @@ services:
       # default self-signed TLS (then set the site's speed test URL override
       # to the matching http:// address - see the agent README).
       #- AGENT_SPEEDTEST_TLS=0
+      # Uncomment to override the agent's auto-detected LAN IP (e.g. when running
+      # in Docker bridge mode instead of host networking, or on a multi-NIC host).
+      #- NO_AGENT_LAN_IP=192.168.1.50
     logging:
       driver: "json-file"
       options:
