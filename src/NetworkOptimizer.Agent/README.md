@@ -274,6 +274,12 @@ they land in the site's own database with no CORS or exposure of the central
 server to browsers. If an `iperf3` binary is on the agent's PATH, an iperf3 server
 (port 5201) runs alongside for wired/CLI throughput tests.
 
+The address the central server hands to site clients for these tests is the
+agent's auto-detected LAN IPv4 (`DetectLocalIpFromInterfaces`). With the default
+host networking that is correct; if the agent can't see the real LAN address
+(Docker bridge mode, or a multi-NIC host picks the wrong interface), set
+`NO_AGENT_LAN_IP=<ip>` in its environment to override it.
+
 ## Probe-only mode for multi-WAN monitoring
 
 To monitor a secondary WAN, run an additional agent instance with its own IP
