@@ -1398,7 +1398,9 @@
         if (string.IsNullOrEmpty(text))
             return new MarkupString("");
 
-        var formatted = text;
+        // Encode first so controller-derived names (SSIDs, network/VLAN and firewall-rule
+        // names) can't inject HTML; the trusted link substitutions below are added after.
+        var formatted = System.Text.Encodings.Web.HtmlEncoder.Default.Encode(text);
 
         // Convert "UPnP Inspector" to a link
         formatted = formatted.Replace(
