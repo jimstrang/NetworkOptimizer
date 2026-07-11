@@ -20,6 +20,7 @@ public class SiteManagementService
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _mainDbFactory;
     private readonly SiteDatabasePaths _dbPaths;
     private readonly Licensing.LicenseStateService _licenseState;
+    private readonly Licensing.LicenseActivationService _activation;
     private readonly ILogger<SiteManagementService> _logger;
 
     public SiteManagementService(
@@ -27,12 +28,14 @@ public class SiteManagementService
         IDbContextFactory<NetworkOptimizerDbContext> mainDbFactory,
         SiteDatabasePaths dbPaths,
         Licensing.LicenseStateService licenseState,
+        Licensing.LicenseActivationService activation,
         ILogger<SiteManagementService> logger)
     {
         _siteRepository = siteRepository;
         _mainDbFactory = mainDbFactory;
         _dbPaths = dbPaths;
         _licenseState = licenseState;
+        _activation = activation;
         _logger = logger;
     }
 
@@ -69,7 +72,14 @@ public class SiteManagementService
         await db.SaveChangesAsync();
 
         if (enabled)
+        {
             await EnsureDefaultSiteAsync();
+            // The implicit main site now has a real registry row. Assign it (and any
+            // other existing sites) to active keys so the consumed/available seat
+            // counts carry over seamlessly from the single-site view.
+            await _activation.AutoAssignAsync();
+            await _licenseState.RecomputeAsync();
+        }
         _logger.LogInformation("Multi-site management {State}", enabled ? "enabled" : "disabled");
     }
 

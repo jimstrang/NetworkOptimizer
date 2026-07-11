@@ -124,7 +124,9 @@ public class LicenseActivationService
         int siteCount;
         await using (var db = await _mainDbFactory.CreateDbContextAsync())
         {
-            siteCount = await db.Sites.CountAsync();
+            // A single-site (non-multi-site) instance has no Site row, but the implicit
+            // main site still counts as one licensed site.
+            siteCount = Math.Max(1, await db.Sites.CountAsync());
         }
 
         var result = await _client.CheckAsync(canonicalKey, installationId, AppVersionInfo.Informational, siteCount);

@@ -187,13 +187,33 @@
     private string? _assignError;
     private bool _refreshing;
 
+    /// <summary>
+    /// On a single-site (non-multi-site) instance there is no Site row to assign,
+    /// but adding a key declares commercial use, so the implicit main site consumes
+    /// one seat from the oldest active key. On multi-site instances real Site rows
+    /// and assignments drive the counts, so this is null.
+    /// </summary>
+    private int? ImplicitCoverKeyId
+    {
+        get
+        {
+            if (_multiSiteEnabled)
+                return null;
+            var now = DateTime.UtcNow;
+            return _keys.Where(k => LicenseStateService.IsActiveCurrent(k, now))
+                .OrderBy(k => k.CreatedAt).ThenBy(k => k.Id)
+                .Select(k => (int?)k.Id).FirstOrDefault();
+        }
+    }
+
     private int UsedSlots
     {
         get
         {
             var now = DateTime.UtcNow;
             var activeKeyIds = _keys.Where(k => LicenseStateService.IsActiveCurrent(k, now)).Select(k => k.Id).ToHashSet();
-            return _assignments.Count(a => activeKeyIds.Contains(a.LicenseKeyRecordId));
+            var assigned = _assignments.Count(a => activeKeyIds.Contains(a.LicenseKeyRecordId));
+            return assigned + (ImplicitCoverKeyId != null ? 1 : 0);
         }
     }
 
@@ -320,7 +340,8 @@
         }
     }
 
-    private int AssignedCount(int keyId) => _assignments.Count(a => a.LicenseKeyRecordId == keyId);
+    private int AssignedCount(int keyId) =>
+        _assignments.Count(a => a.LicenseKeyRecordId == keyId) + (ImplicitCoverKeyId == keyId ? 1 : 0);
 
     private int? AssignedKeyId(int siteId) =>
         _assignments.FirstOrDefault(a => a.SiteId == siteId)?.LicenseKeyRecordId;
