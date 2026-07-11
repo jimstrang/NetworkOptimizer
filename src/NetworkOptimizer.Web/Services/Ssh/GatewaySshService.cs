@@ -57,6 +57,18 @@ public class GatewaySshService : IGatewaySshService
     /// are reached via agent: SSH.NET then dials a loopback proxy port that the
     /// agent forwards to the real host inside the site's network.
     /// </summary>
+    /// <remarks>
+    /// The proxied SSH is end-to-end between SSH.NET and the real gateway (the agent
+    /// only pipes bytes), but we intentionally do NOT pin the gateway's SSH host key.
+    /// Hard pinning is impractical: UniFi regenerates host keys on firmware upgrades
+    /// (and adoption/factory reset), so a strict pin would break SSH after routine
+    /// updates and train operators to click through warnings. The residual risk -
+    /// a rogue agent or leaked agentKey presenting a fake gateway to harvest
+    /// credentials - is addressed at the tunnel instead (guard the agentKey,
+    /// IP-allowlist the tunnel endpoint to site IPs, and the planned one-tunnel-
+    /// per-key + source-IP alert), not by host-key pinning here. See the agent
+    /// README "Security and hardening" section and TODO.md.
+    /// </remarks>
     private async Task<SshConnectionInfo> MaybeRouteViaAgentAsync(SshConnectionInfo connection)
     {
         var routing = _serviceProvider.GetService<SiteTunnelRouting>();

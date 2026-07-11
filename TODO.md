@@ -371,6 +371,45 @@ Suggested order: congestion / path-shift / outage navigation first (cheap, consi
   - Site selector/switcher in UI
   - Aggregate dashboard views across sites (optional)
 
+### Agent Tunnel Security Hardening
+
+The on-site agent gives the central server SSH reach into each site's gateway, and a
+gateway is the LAN router, so that reach is effectively LAN-wide. That makes the
+**central server the highest-value target** and its hardening the priority. A
+compromised central server is inherent game-over for the gateways it manages - the
+shadow of centralized gateway management, not a tunnel flaw - so protocol-level
+controls can't fix it; protecting the server is what matters. (See the agent README
+"Security and hardening" section, and the comments on `ProxyHandler` and
+`GatewaySshService.MaybeRouteViaAgentAsync`.)
+
+Worth doing - defends the one risk that does NOT already require owning the server
+(a leaked `agentKey` used standalone):
+- [ ] One live tunnel per `agentKey`: reject a second concurrent connection and alert
+  rather than silently accepting it. First step: confirm whether `AgentTunnelRegistry`
+  already enforces this.
+- [ ] Alert on a new public source IP for an existing agent (the tunnel already sees it
+  on connect). This is the anomaly signal for a stolen key.
+- [ ] Surface each agent's public source IP in the UI, so IP-allowlist maintenance is a
+  one-line firewall edit when a site's WAN IP changes.
+- [ ] (lower priority) Soft host-key tripwire: record the last-seen gateway SSH host key
+  and alert on change, but never block. Turns a silent MITM into a logged event while
+  tolerating UniFi's key cycling.
+
+Deployment guidance (now documented in the agent README + `docker/DEPLOYMENT.md`):
+IP-allowlist BOTH the admin plane and the agent tunnel endpoint to your sites' public
+IPs. Commercial and even residential sites are stable enough in practice; a stolen key
+from a random IP then dies at the firewall before the bearer key is presented. Bearer
+key + rate-limiting stay as defense-in-depth behind it.
+
+Considered and deliberately NOT implemented (rationale on record so it isn't re-litigated):
+- **Agent-side proxy dial allowlist** (restrict `ProxyOpen` targets to the gateway/known
+  devices): not an effective control. Gateway SSH already reaches the whole LAN, so
+  anything with gateway access pivots through it regardless; restricting the agent's dial
+  targets contains nothing against a compromised server. Pure complexity.
+- **Hard SSH host-key pinning**: impractical. UniFi regenerates SSH host keys on firmware
+  upgrades (and adoption/factory reset), so a strict pin breaks SSH after routine updates
+  and trains operators to click through warnings - worse than the soft tripwire above.
+
 ### Federated Authentication & Identity
 - External IdP integration for enterprise/MSP deployments
 - Protocol support:

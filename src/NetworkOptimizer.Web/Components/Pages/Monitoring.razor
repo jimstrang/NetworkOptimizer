@@ -466,14 +466,12 @@ else
             <LatencyTargetsCard Targets="_targets" WanContexts="_wanContexts" OnTargetsChanged="OnTargetsChanged" />
         </div>
 
-        @* Multi-WAN contexts management card hidden for now (GA). Re-enable when the
-           multi-WAN UX is ready; the rest of the page already tolerates empty contexts. *@
-        @if (false)
-        {
-            <div style="margin-top: 1.5rem;">
-                <WanContextsCard WanContexts="_wanContexts" OnChanged="OnTargetsChanged" />
-            </div>
-        }
+        @* Multi-WAN contexts management card hidden for now (GA). Re-enable by
+           uncommenting; the rest of the page already tolerates empty contexts.
+        <div style="margin-top: 1.5rem;">
+            <WanContextsCard WanContexts="_wanContexts" OnChanged="OnTargetsChanged" />
+        </div>
+        *@
     }
 
     @* ──────────────── Tab: Device Stats ──────────────── *@

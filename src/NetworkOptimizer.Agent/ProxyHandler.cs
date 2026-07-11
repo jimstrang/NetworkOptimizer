@@ -11,6 +11,19 @@ namespace NetworkOptimizer.Agent;
 /// pumps bytes both ways under the server-assigned connection id. Lives and
 /// dies with its tunnel connection, like the probe runner.
 /// </summary>
+/// <remarks>
+/// Security model: the agent dials whatever host:port the server names, with no
+/// agent-side allowlist, and that is deliberate. The tunnel's legitimate job
+/// includes SSH to the site gateway, and the gateway is the LAN router - anything
+/// that can reach it already reaches the whole LAN - so an allowlist restricting
+/// proxy targets to "just the gateway" would contain nothing against a compromised
+/// central server (it would simply pivot through the gateway). The trust boundary
+/// is therefore the central server and the agentKey, not this dial path: harden
+/// the server (IP-allowlist the admin plane and this tunnel endpoint to your
+/// sites' IPs, strong auth, guard key material), and treat a server compromise as
+/// game-over for managed gateways, which is inherent to centralized gateway
+/// management. See the agent README "Security and hardening" section and TODO.md.
+/// </remarks>
 public sealed class ProxyHandler
 {
     private const int FrameBytes = 32 * 1024;

@@ -119,6 +119,12 @@ address as reachable from the site - over a site-to-site VPN or a public
 address. The agent refuses anything but HTTPS. Self-signed certificates work
 with `"ignoreSslErrors": true`; plain `http://` never does.
 
+> **Only enable `ignoreSslErrors` for a self-signed server.** It disables TLS
+> certificate validation on the tunnel and result post-back entirely, which
+> opens the whole channel to a man-in-the-middle. If your central server has a
+> valid (CA-signed) certificate - which it should in production - leave this
+> `false` (the default).
+
 3. Run the binary (optionally pass a config path, default `agent.json`; or set
    `NO_AGENT_CONFIG`):
 
@@ -233,6 +239,45 @@ with `"ignoreSslErrors": true` if its certificate does not match that address.
 Everything rides that one TLS session: heartbeats, probe and SNMP traffic
 (including SNMP credentials pushed to the agent), and proxied UniFi Console
 connections - which are additionally HTTPS end-to-end inside the tunnel.
+
+## Security and hardening
+
+The agent dials out only, so the site never exposes an inbound port - a real
+posture win. The flip side is that the central server it dials into can SSH into
+this site's gateway, and a gateway is the LAN router, so that reach is
+effectively LAN-wide. That makes the **central server the highest-value target**
+in the whole setup, and hardening it the priority:
+
+- **IP-allowlist both planes.** Restrict the admin/management surface *and* the
+  agent tunnel endpoint to your sites' public IPs. Commercial sites are stable,
+  and residential WAN IPs are sticky enough in practice (often unchanged for a
+  year) that this stays maintainable - you touch it only when a site's IP
+  actually changes. A stolen `agentKey` used from a random address then dies at
+  the firewall before the bearer key is ever presented; the key and
+  rate-limiting stay as defense-in-depth behind it.
+- **Guard the `agentKey`.** It lives in `agent.json` (file permissions matter)
+  and is revocable server-side. Treat it like a credential.
+- **Keep TLS real.** Leave `ignoreSslErrors` at its default `false`; only enable
+  it for a self-signed server, and know it opens the whole channel to a MITM.
+
+A compromised central server is game-over for the gateways it manages, and that
+is inherent to centralized gateway management, not a flaw of the tunnel - no
+protocol trick changes it, which is exactly why protecting the server is the
+whole ballgame.
+
+Two controls we deliberately did **not** build, so the reasoning is on record:
+
+- **An agent-side allowlist on proxy dial targets** would contain nothing.
+  Gateway SSH already reaches the entire LAN, so anything with gateway access
+  pivots through it; restricting what the agent may dial doesn't limit a
+  compromised server, it just adds complexity.
+- **Pinning the gateway's SSH host key** is impractical here: UniFi regenerates
+  host keys on firmware upgrades (and adoption/factory reset), so a strict pin
+  would break SSH after routine updates and train operators to click through
+  warnings. The residual risk it would guard - a rogue agent presenting a fake
+  gateway - is better addressed at the tunnel (guard the key, IP-allowlist, and
+  one-tunnel-per-key), with at most a soft "host key changed" alert that never
+  blocks.
 
 ## Local dev / testing
 
