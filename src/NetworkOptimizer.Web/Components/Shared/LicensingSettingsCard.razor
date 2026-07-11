@@ -188,16 +188,18 @@
     private bool _refreshing;
 
     /// <summary>
-    /// On a single-site (non-multi-site) instance there is no Site row to assign,
-    /// but adding a key declares commercial use, so the implicit main site consumes
-    /// one seat from the oldest active key. On multi-site instances real Site rows
-    /// and assignments drive the counts, so this is null.
+    /// On a single-site instance there is no Site row to assign, but adding a key
+    /// declares commercial use, so the implicit main site consumes one seat from the
+    /// oldest active key. Once any Site row exists (multi-site enabled now, or enabled
+    /// before and since disabled - the row and its assignment are preserved) the main
+    /// site is a real row counted by its assignment, so this is null; otherwise the
+    /// assignment and the implicit seat would double-count.
     /// </summary>
     private int? ImplicitCoverKeyId
     {
         get
         {
-            if (_multiSiteEnabled)
+            if (_sites.Count > 0)
                 return null;
             var now = DateTime.UtcNow;
             return _keys.Where(k => LicenseStateService.IsActiveCurrent(k, now))
@@ -249,6 +251,7 @@
 
     private async Task LoadDataAsync()
     {
+        _multiSiteEnabled = await SiteManagement.IsMultiSiteEnabledAsync();
         _keys = await Activation.GetKeysAsync();
         _assignments = await Activation.GetAssignmentsAsync();
         _sites = await SiteManagement.GetSitesAsync();
