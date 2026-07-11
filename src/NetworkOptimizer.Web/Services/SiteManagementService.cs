@@ -147,6 +147,9 @@ public class SiteManagementService
 
         await ProvisionSiteDatabaseAsync(slug);
         await _siteRepository.AddAsync(site);
+        // Cover the new site with a spare seat if one is available, then recompute so the
+        // Licensing card reflects the new site immediately (no manual license refresh needed).
+        await _activation.AutoAssignAsync();
         await _licenseState.RecomputeAsync();
         return site;
     }
