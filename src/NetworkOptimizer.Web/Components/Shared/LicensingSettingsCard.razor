@@ -36,7 +36,7 @@
                    placeholder="NO-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
                    autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
         </div>
-        <div class="action-buttons">
+        <div class="action-buttons license-activate-actions">
             <button class="btn btn-primary" @onclick="ActivateKeyAsync" disabled="@(string.IsNullOrWhiteSpace(_enteredKey) || _activating)">
                 @if (_activating)
                 {

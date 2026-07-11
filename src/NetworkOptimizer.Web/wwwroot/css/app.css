@@ -18144,3 +18144,8 @@ body.kiosk-mode .status-indicators {
     width: 100%;
     max-width: 600px;
 }
+
+.license-activate-actions {
+    margin-top: -0.5rem;
+    margin-bottom: 1.5rem;
+}
