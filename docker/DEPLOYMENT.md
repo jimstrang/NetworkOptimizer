@@ -257,7 +257,6 @@ Install it with Docker or as a bare-metal systemd service. Per-site one-liners a
 **Licensing:** Personal use on up to 3 sites is free and never contacts a license server - nothing phones home. Running more than 3 sites requires a license key (entered under **Settings > Application > Licensing**); activating or renewing a key makes an outbound HTTPS request from the central server to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your egress firewall rules allow HTTPS (443) to that hostname. Entitlements are cached and verified locally, so a license server outage never disables your sites.
 
 **Networking:** The agent runs with host networking by default so its probes see the site's real network position and site clients can reach the LAN speed test on the agent host's address. It auto-detects that LAN IPv4; if it picks the wrong one (Docker bridge mode instead of host, or a multi-NIC host), set `NO_AGENT_LAN_IP=<ip>` in the agent's environment to override it.
-
 ## Pre-Deployment Checklist
 
 - [ ] Docker and Docker Compose installed

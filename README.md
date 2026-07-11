@@ -5,7 +5,7 @@
 # Network Optimizer for UniFi
 
 [![GitHub Release](https://img.shields.io/github/v/release/Ozark-Connect/NetworkOptimizer)](https://github.com/Ozark-Connect/NetworkOptimizer/releases)
-[![Docker Pulls](https://img.shields.io/badge/docker_pulls-367k-blue?logo=docker)](https://github.com/orgs/Ozark-Connect/packages?repo_name=NetworkOptimizer)
+[![Docker Pulls](https://img.shields.io/badge/docker_pulls-392k-blue?logo=docker)](https://github.com/orgs/Ozark-Connect/packages?repo_name=NetworkOptimizer)
 [![Windows Downloads](https://img.shields.io/github/downloads/Ozark-Connect/NetworkOptimizer/total?label=windows%20downloads)](https://github.com/Ozark-Connect/NetworkOptimizer/releases)
 [![GitHub last commit](https://img.shields.io/github/last-commit/Ozark-Connect/NetworkOptimizer)](https://github.com/Ozark-Connect/NetworkOptimizer/commits)
 [![GitHub Stars](https://img.shields.io/github/stars/Ozark-Connect/NetworkOptimizer)](https://github.com/Ozark-Connect/NetworkOptimizer/stargazers)
@@ -17,7 +17,7 @@ Genuinely, thank you so much to everybody for taking the time to use Network Opt
 
 ## Multi-Site Support Is in Development
 
-Multi-site support is almost ready! Please see this thread if you'd like to help test it: https://github.com/Ozark-Connect/NetworkOptimizer/discussions/954
+Multi-site support is almost ready! Please see this thread if you'd like to help test it or need a trial license for multiple sites: https://github.com/Ozark-Connect/NetworkOptimizer/discussions/954
 
 **Licensing and firewalls:** Personal use on up to 3 sites is free and never contacts a license server - nothing to configure, nothing phones home. Running more than 3 sites requires a license key (Settings > Application > Licensing), and activating or renewing a key makes an outbound HTTPS request to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your outbound firewall rules allow HTTPS (443) to that hostname. A license server outage never disables your sites - entitlements are cached and verified locally, and perpetual licenses stop phoning home entirely after a one-time confirmation.
 
