@@ -410,6 +410,26 @@ Considered and deliberately NOT implemented (rationale on record so it isn't re-
   upgrades (and adoption/factory reset), so a strict pin breaks SSH after routine updates
   and trains operators to click through warnings - worse than the soft tripwire above.
 
+### Credential Key: Hardening Follow-ups
+
+Self-hosted project, so keep this proportional. The at-rest credential key is a random
+file (`.credential_key`). `NO_CREDENTIAL_KEY_FILE` (implemented) + a Docker secret is the
+pragmatic answer and probably enough: it keeps the key off the data volume, which is the
+main win. DEPLOYMENT.md documents that and warns that the data volume - and `.nopt`
+config exports, which bundle the key - are secret material.
+
+Optional, only if there's real demand (don't gold-plate a self-hosted tool):
+- [ ] Envelope encryption against an external secret manager (Vault / cloud KMS) for the
+  rare operator already running one - master key never on disk, rotation + audit for free.
+  Nice-to-have, not a priority.
+- [ ] `.nopt` export wrapper uses a hardcoded obfuscation key (`ConfigTransferService`),
+  and the archive includes `.credential_key`. Fine as long as exports are treated as
+  secret (documented), but a passphrase-encrypted export option would let users share/store
+  them less carefully. Low priority.
+- [ ] The ASP.NET Data Protection keyring (`Program.cs` `PersistKeysToFileSystem`, no
+  `ProtectKeysWith`) sits unencrypted in the data region too - antiforgery/cookies, not
+  credentials, same co-location. Fold in only if the KMS path ever happens.
+
 ### Federated Authentication & Identity
 - External IdP integration for enterprise/MSP deployments
 - Protocol support:

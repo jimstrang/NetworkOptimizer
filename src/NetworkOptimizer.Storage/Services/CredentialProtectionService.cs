@@ -119,16 +119,26 @@ public class CredentialProtectionService : ICredentialProtectionService
 
     private byte[] GetKeyMaterial()
     {
-        // Try to get machine-specific key material
-        // In Docker, use /app/data; otherwise use LocalApplicationData
+        // Operators can supply the key out-of-band via NO_CREDENTIAL_KEY_FILE - e.g.
+        // a Docker secret mounted at /run/secrets/... or any path OUTSIDE the data
+        // volume - so a leak or backup of the data volume does not also hand over the
+        // key. When unset, the key lives beside the database in the data directory,
+        // which then must be treated as secret material (see DEPLOYMENT.md).
+        // WARNING: pointing an EXISTING install at a new/empty path generates a fresh
+        // key and makes previously-stored secrets undecryptable; move the existing
+        // .credential_key contents to the new path first.
+        var overridePath = Environment.GetEnvironmentVariable("NO_CREDENTIAL_KEY_FILE");
+        // In Docker, default to /app/data; otherwise use LocalApplicationData.
         var isDocker = string.Equals(Environment.GetEnvironmentVariable("DOTNET_RUNNING_IN_CONTAINER"), "true", StringComparison.OrdinalIgnoreCase);
-        var keyFilePath = isDocker
-            ? "/app/data/.credential_key"
-            : Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "NetworkOptimizer",
-                ".credential_key"
-            );
+        var keyFilePath = !string.IsNullOrWhiteSpace(overridePath)
+            ? overridePath.Trim()
+            : isDocker
+                ? "/app/data/.credential_key"
+                : Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "NetworkOptimizer",
+                    ".credential_key"
+                );
 
         try
         {

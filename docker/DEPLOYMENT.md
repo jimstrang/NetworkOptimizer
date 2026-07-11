@@ -863,6 +863,35 @@ chmod 600 .env
 chmod 700 data/
 ```
 
+### Credential encryption key
+
+Network Optimizer encrypts stored secrets (UniFi credentials, gateway SSH passwords, alert-channel secrets) at rest with a per-install key. By default that key lives in the data directory next to the database (`data/.credential_key`), so **a copy of the data volume - including any backup - can decrypt everything.** Treat the data volume accordingly: back it up encrypted, restrict access, and don't sync it to plain cloud storage.
+
+To keep the key off the data volume, point `NO_CREDENTIAL_KEY_FILE` at a path outside it - most cleanly a Docker secret:
+
+```yaml
+# docker-compose.yml
+services:
+  network-optimizer:
+    environment:
+      - NO_CREDENTIAL_KEY_FILE=/run/secrets/credential_key
+    secrets:
+      - credential_key
+secrets:
+  credential_key:
+    file: ./credential_key   # created once, kept out of the repo and out of data backups
+```
+
+Create the key once, out of band, before first start:
+
+```bash
+head -c 64 /dev/urandom > credential_key && chmod 600 credential_key
+```
+
+Now a leak of the data volume no longer includes the key. **Migration note:** to switch an *existing* install to `NO_CREDENTIAL_KEY_FILE`, copy the current `data/.credential_key` bytes into the new location first - a fresh key cannot decrypt already-stored secrets.
+
+**Config exports are secret too.** A `.nopt` config export bundles the credential key so the imported backup can decrypt its own secrets, and its file-level encryption is light obfuscation rather than a real barrier. So treat `.nopt` files exactly like the data volume - they effectively contain your stored credentials. Store and transfer them accordingly.
+
 ### Network Access
 
 Network Optimizer stores UniFi controller credentials and SSH passwords. Limit access to the web UI:
