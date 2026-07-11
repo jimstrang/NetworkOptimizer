@@ -18147,5 +18147,10 @@ body.kiosk-mode .status-indicators {
 
 .license-activate-actions {
     margin-top: -0.5rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.license-refresh-actions {
+    margin-top: 1rem;
+    margin-bottom: 0.5rem;
 }

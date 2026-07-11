@@ -59,7 +59,7 @@
 
         @if (_keys.Count > 0)
         {
-            <div class="table-responsive" style="margin-top: 1rem;">
+            <div class="table-responsive" style="padding-top: 1rem;">
                 <table class="data-table">
                     <thead>
                         <tr>
@@ -152,7 +152,7 @@
 
         @if (_keys.Count > 0)
         {
-            <div class="action-buttons" style="margin-top: 1rem;">
+            <div class="action-buttons license-refresh-actions">
                 <button class="btn btn-secondary" @onclick="RefreshLicensesAsync" disabled="@_refreshing">
                     @if (_refreshing)
                     {
