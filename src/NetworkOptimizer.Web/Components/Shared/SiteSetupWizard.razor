@@ -8,6 +8,7 @@
 @inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
+@implements IDisposable
 
 <div class="site-wizard">
     <div class="site-wizard-steps">
@@ -234,9 +235,23 @@
 
     private int _remainingSlots = int.MaxValue;
 
-    protected override async Task OnInitializedAsync() => await RefreshLimitAsync();
+    protected override async Task OnInitializedAsync()
+    {
+        LicenseState.OnStateChanged += HandleLicenseStateChanged;
+        await RefreshLimitAsync();
+    }
 
     private async Task RefreshLimitAsync() => _remainingSlots = await SiteManagement.RemainingSiteSlotsAsync();
+
+    // The Add Site gate depends on the license-derived site limit, so re-evaluate it
+    // when license state changes (e.g. a key is added or removed).
+    private void HandleLicenseStateChanged() => _ = InvokeAsync(async () =>
+    {
+        await RefreshLimitAsync();
+        StateHasChanged();
+    });
+
+    public void Dispose() => LicenseState.OnStateChanged -= HandleLicenseStateChanged;
 
     private int _step = 1;
     private bool _busy;
