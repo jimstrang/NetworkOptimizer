@@ -3,9 +3,9 @@
 Runs at a remote site and reports back to a central Network Optimizer server.
 Capabilities: enrollment, a persistent outbound gRPC tunnel with REST
 heartbeat fallback, latency/loss probing (with per-WAN source IP binding),
-SNMP monitoring relay, UniFi Console proxying over the tunnel, and LAN speed
-test serving (OpenSpeedTest page + iperf3). Planned: SSH proxying over the
-tunnel.
+SNMP monitoring relay, TCP proxying into the site over the tunnel (SSH to the
+gateway and devices, and the UniFi Console), and LAN speed test serving
+(OpenSpeedTest page + iperf3).
 
 The agent connects to a **single URL** - the central server's reverse-proxied
 HTTPS address (the same host you open the app at, derived from the server's

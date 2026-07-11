@@ -2919,7 +2919,7 @@
                                                                             <text>Online@(TunnelRegistry.IsConnected(agent.Id) ? " (tunnel)" : "")@(agent.LastVersion != null ? $" - v{agent.LastVersion}" : "")</text>
                                                                             @if (AgentVersionOutdated(agent))
                                                                             {
-                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.LatestAgentVersion)) is available. During the 2.0 beta, please update agents whenever a release calls for it.">
+                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.LatestAgentVersion)) is available. Update agents whenever a release calls for it.">
                                                                                     Update agent
                                                                                 </span>
                                                                                 <button class="btn btn-sm btn-secondary"
