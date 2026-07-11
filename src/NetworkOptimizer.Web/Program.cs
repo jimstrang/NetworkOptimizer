@@ -16,6 +16,7 @@ using NetworkOptimizer.Web;
 using NetworkOptimizer.Web.Endpoints;
 using NetworkOptimizer.Web.Services;
 using NetworkOptimizer.Web.Services.CableModemProviders;
+using NetworkOptimizer.Web.Services.Licensing;
 using NetworkOptimizer.Web.Services.CellularModemProviders;
 using NetworkOptimizer.Web.Services.OntProviders;
 using NetworkOptimizer.Web.Services.Ssh;
@@ -105,12 +106,22 @@ builder.Services.AddSingleton<IFileVersionProvider, NetworkOptimizer.Web.Service
 // Register credential protection service (singleton - shared encryption key)
 builder.Services.AddSingleton<NetworkOptimizer.Storage.Services.ICredentialProtectionService, NetworkOptimizer.Storage.Services.CredentialProtectionService>();
 
-// Register UniFi connection service (singleton - maintains connection state)
-builder.Services.AddSingleton<UniFiConnectionService>();
-builder.Services.AddSingleton<IUniFiClientProvider>(sp => sp.GetRequiredService<UniFiConnectionService>());
+// All UniFi console connections live in SiteConnectionRegistry, one long-lived
+// instance per site. Scoped resolution (components, request handlers, per-site
+// scopes) forwards to the current site's instance; singletons and background
+// code inject the registry directly.
+builder.Services.AddSingleton<SiteConnectionRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<SiteConnectionRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
+builder.Services.AddSingleton<IUniFiClientProvider>(sp => sp.GetRequiredService<SiteConnectionRegistry>().GetDefault());
 
 // Register Network Path Analyzer (singleton - uses caching)
-builder.Services.AddSingleton<INetworkPathAnalyzer, NetworkPathAnalyzer>();
+// Default site's path analyzer, owned by the speed test registry so the whole
+// enrichment family (analyzer, snapshots, client speed test) shares one topology
+// cache per site. Singleton consumers keep injecting the interface and get the
+// default site's instance; per-site consumers resolve through the registry.
+builder.Services.AddSingleton<INetworkPathAnalyzer>(sp =>
+    sp.GetRequiredService<SpeedTestServiceRegistry>().GetDefault().PathAnalyzer);
 
 // Register audit engine and analyzers
 builder.Services.AddTransient<VlanAnalyzer>();
@@ -143,8 +154,10 @@ else
     dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NetworkOptimizer", "network_optimizer.db");
 }
 Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
-builder.Services.AddDbContext<NetworkOptimizerDbContext>(options =>
-    options.UseSqlite($"Data Source={dbPath}")
+// Scoped DbContext routes to the current site's database via SiteContextService
+// (cookie-driven; scopes without an HTTP context resolve to the default site's main DB).
+builder.Services.AddDbContext<NetworkOptimizerDbContext>((sp, options) =>
+    options.UseSqlite($"Data Source={sp.GetRequiredService<SiteContextService>().DbPath}")
            .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning)));
 
 // Register DbContextFactory for singleton services (ClientSpeedTestService, Iperf3ServerService)
@@ -161,6 +174,85 @@ var factoryOptions = new DbContextOptionsBuilder<NetworkOptimizerDbContext>()
 builder.Services.AddSingleton<IDbContextFactory<NetworkOptimizerDbContext>>(
     new NetworkOptimizer.Storage.Models.NetworkOptimizerDbContextFactory(factoryOptions));
 
+// Per-site database path resolution (main db doubles as the site registry and default site data)
+builder.Services.AddSingleton(new NetworkOptimizer.Storage.Services.SiteDatabasePaths(dbPath));
+builder.Services.AddSingleton<NetworkOptimizer.Storage.Services.SiteDbContextFactory>();
+
+// ---- Multi-site agent tunnel listener ----
+// The agent tunnel is gRPC, which needs HTTP/2. The main port stays HTTP/1.1
+// (reverse proxies, browsers), so the tunnel gets its own HTTP/2 listener,
+// served over TLS with an ephemeral self-signed cert (see
+// CreateSelfSignedTunnelCert) so the reverse-proxy-to-app hop is encrypted even
+// across a box boundary. Explicit Kestrel Listen calls override URL-based configuration,
+// so when the tunnel is active the main HTTP port(s) are re-bound explicitly
+// alongside it. Single-site installs never take this branch: no new port, no
+// binding changes. The flag is read with raw SQLite because Kestrel must be
+// configured before the service provider (and EF) exist.
+var agentTunnelPort = builder.Configuration.GetValue("AgentTunnel:Port", 8043);
+var agentTunnelEnabled = false;
+try
+{
+    if (File.Exists(dbPath))
+    {
+        using var flagConnection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={dbPath};Mode=ReadOnly");
+        flagConnection.Open();
+        using var flagCommand = flagConnection.CreateCommand();
+        flagCommand.CommandText = "SELECT Value FROM SystemSettings WHERE Key = @key";
+        flagCommand.Parameters.AddWithValue("@key", NetworkOptimizer.Storage.Models.SystemSettingKeys.MultiSiteEnabled);
+        agentTunnelEnabled = bool.TryParse(flagCommand.ExecuteScalar() as string, out var multiSiteFlag) && multiSiteFlag;
+    }
+}
+catch
+{
+    // Fresh install or pre-multi-site schema: tunnel stays off until enabled + restart.
+}
+
+if (agentTunnelEnabled)
+{
+    var mainBindings = StartupHelpers.ResolveHttpBindings();
+    if (mainBindings == null)
+    {
+        // Custom HTTPS or non-port URL configuration we can't safely re-bind.
+        Console.WriteLine("Agent tunnel disabled: ASPNETCORE_URLS contains bindings the tunnel listener cannot co-exist with (HTTPS or non-port URLs)");
+        agentTunnelEnabled = false;
+    }
+    else
+    {
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            foreach (var (host, port) in mainBindings)
+            {
+                if (host == "localhost")
+                    options.ListenLocalhost(port);
+                else if (System.Net.IPAddress.TryParse(host, out var ip))
+                    options.Listen(ip, port);
+                else
+                    options.ListenAnyIP(port);
+            }
+            options.ListenAnyIP(agentTunnelPort, listen =>
+            {
+                listen.Protocols = Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2;
+                // TLS on the tunnel port so the reverse-proxy-to-app hop is
+                // encrypted even when the proxy runs on a separate box (the
+                // agent key and pushed SNMP credentials would otherwise cross
+                // that LAN segment in cleartext h2c). The proxy is configured to
+                // skip verification, so an ephemeral self-signed cert suffices.
+                listen.UseHttps(StartupHelpers.CreateSelfSignedTunnelCert());
+            });
+        });
+    }
+}
+builder.Services.AddSingleton(new AgentTunnelOptions(agentTunnelEnabled, agentTunnelPort));
+builder.Services.AddGrpc();
+builder.Services.AddSingleton<AgentTunnelRegistry>();
+builder.Services.AddSingleton<AgentProbeResultSink>();
+builder.Services.AddSingleton<AgentTunnelProxyService>();
+builder.Services.AddSingleton<AgentIperf3Service>();
+builder.Services.AddSingleton<AgentUwnService>();
+builder.Services.AddSingleton<AgentProbeService>();
+builder.Services.AddSingleton<AgentSnmpQueryService>();
+builder.Services.AddSingleton<AgentServerUrlProvider>();
+
 // Register repository pattern (scoped - same lifetime as DbContext)
 builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IAuditRepository, NetworkOptimizer.Storage.Repositories.AuditRepository>();
 builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.ISettingsRepository, NetworkOptimizer.Storage.Repositories.SettingsRepository>();
@@ -171,68 +263,137 @@ builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IOntRepository, N
 builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IMonitoringInterfaceRepository, NetworkOptimizer.Storage.Repositories.MonitoringInterfaceRepository>();
 builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.ISpeedTestRepository, NetworkOptimizer.Storage.Repositories.SpeedTestRepository>();
 builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.ISqmRepository, NetworkOptimizer.Storage.Repositories.SqmRepository>();
-builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IAgentRepository, NetworkOptimizer.Storage.Repositories.AgentRepository>();
 builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertRepository, NetworkOptimizer.Storage.Repositories.AlertRepository>();
+builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.ISiteRepository, NetworkOptimizer.Storage.Repositories.SiteRepository>();
+builder.Services.AddScoped<SiteManagementService>();
+builder.Services.AddScoped<SiteContextService>();
+// The alert pipeline pins its scope to an event's originating site through this seam.
+builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IAlertSiteScope>(sp =>
+    sp.GetRequiredService<SiteContextService>());
+// Resolves a site's display name so delivered alerts name their originating site.
+builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.IAlertSiteNameResolver, AlertSiteNameResolver>();
+builder.Services.AddSingleton<AgentEnrollmentService>();
+
+// Licensing: singleton state machine, activation and phone-home loop. All
+// licensing data is instance-wide registry data in the main database.
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddHttpClient("LicenseServer", client => client.Timeout = TimeSpan.FromSeconds(10));
+builder.Services.AddSingleton<LicenseServerClient>();
+builder.Services.AddSingleton<LicenseStateService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<LicenseStateService>());
+builder.Services.AddSingleton<LicenseActivationService>();
+builder.Services.AddSingleton<LicensePhoneHomeService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<LicensePhoneHomeService>());
+builder.Services.AddHostedService<LicenseEnforcementCoordinator>();
+
+// Shared site-local speed-test target resolution (Client Dashboard, LAN Speed
+// Test page, WAN speed test link) - scoped, follows the current site context.
+builder.Services.AddScoped<SiteSpeedTestTargetResolver>();
 
 // Register SSH client service (singleton - cross-platform SSH.NET wrapper)
 builder.Services.AddSingleton<SshClientService>();
 
-// Register Gateway SSH service (singleton - SSH access to UniFi gateway/UDM)
-builder.Services.AddSingleton<IGatewaySshService, GatewaySshService>();
+// Gateway SSH per site: the registry owns one GatewaySshService per site (settings
+// from that site's DB, host fallback from that site's console). Scoped resolution of
+// IGatewaySshService forwards to the current site's instance; singleton consumers
+// inject the registry and pin GetDefault() or GetFor(slug).
+// Shared per-site tunnel routing for device endpoints (SSH, modem/ONT status
+// pages): consults the site's devices.via_agent flag and rewrites host:port to
+// an agent tunnel proxy endpoint when enabled.
+builder.Services.AddSingleton<SiteTunnelRouting>();
+builder.Services.AddSingleton<GatewaySshRegistry>();
+builder.Services.AddScoped<IGatewaySshService>(sp => sp.GetRequiredService<GatewaySshRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 
-// Register udm-boot installer (singleton - shared gateway boot-script infrastructure
-// used by Adaptive SQM, Monitoring Interfaces, etc.)
-builder.Services.AddSingleton<IUdmBootService, UdmBootService>();
+// Register udm-boot installer (scoped - shared gateway boot-script infrastructure
+// used by Adaptive SQM, Monitoring Interfaces, etc.; follows the current site's
+// gateway SSH so deployments persist on the right gateway)
+builder.Services.AddScoped<IUdmBootService, UdmBootService>();
 
-// Register UniFi SSH service (singleton - shared SSH credentials for all UniFi devices)
-builder.Services.AddSingleton<UniFiSshService>();
+// Device SSH per site: the registry owns one UniFiSshService per site (shared
+// device credentials + per-device configs from that site's DB). Scoped resolution
+// forwards to the current site's instance; singleton consumers inject the
+// registry and pin GetDefault() or GetFor(slug).
+builder.Services.AddSingleton<UniFiSshRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<UniFiSshRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 
-// Register cellular modem providers (one per supported vendor transport).
-// CellularModemService resolves the right provider per ModemConfiguration.
-builder.Services.AddSingleton<ICellularModemProvider, QmicliModemProvider>();
-builder.Services.AddSingleton<ICellularModemProvider, NetgearNighthawkHotspotProvider>();
-builder.Services.AddSingleton<ICellularModemProvider, QuectelAtModemProvider>();
+// Cellular modem monitoring is per site through ModemMonitorRegistry, which
+// builds each site's provider set (qmicli with the site's device SSH; HTTP and
+// per-modem-SSH providers are context-driven). Scoped resolution forwards to
+// the current site's monitor.
+builder.Services.AddScoped(sp => sp.GetRequiredService<ModemMonitorRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).Cellular);
 
-// Register Cellular Modem service (singleton - maintains polling timer, uses UniFiSshService)
-builder.Services.AddSingleton<CellularModemService>();
-
-// Register Cable Modem providers and service
+// Register Cable Modem providers (stateless scrapers, shared across sites).
+// The monitor itself is per site through ModemMonitorRegistry: configurations,
+// stats, and alerts belong to each site's own database and buckets, and the
+// registry activates instances as sites are enabled. Scoped resolution
+// forwards to the current site's monitor.
 builder.Services.AddSingleton<ICableModemProvider, NetgearCmProvider>();
 builder.Services.AddSingleton<ICableModemProvider, ArrisSurfboardHttpProvider>();
 builder.Services.AddSingleton<ICableModemProvider, ArrisSurfboardHnapProvider>();
 builder.Services.AddSingleton<ICableModemProvider, MotorolaHnapProvider>();
 builder.Services.AddSingleton<ICableModemProvider, XfinityGatewayProvider>();
-builder.Services.AddSingleton<CableModemMonitorService>();
+builder.Services.AddSingleton<ModemMonitorRegistry>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ModemMonitorRegistry>());
+builder.Services.AddScoped(sp => sp.GetRequiredService<ModemMonitorRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).CableModem);
 
-// Register External ONT providers and service
+// Register External ONT providers (stateless scrapers, shared across sites).
+// The monitor itself is per site through ModemMonitorRegistry, like the cable
+// modem monitor above.
 builder.Services.AddSingleton<IOntProvider, AttGatewayOntProvider>();
 builder.Services.AddSingleton<IOntProvider, RealtekOntProvider>();
 builder.Services.AddSingleton<IOntProvider, Lantiq8311OntProvider>();
 builder.Services.AddSingleton<IOntProvider, QuantumQ1000kOntProvider>();
 builder.Services.AddSingleton<IOntProvider, GenericHttpOntProvider>();
-builder.Services.AddSingleton<OntMonitorService>();
+builder.Services.AddSingleton<IOntProvider, TelekomModem2OntProvider>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<ModemMonitorRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).Ont);
 
-// Register iperf3 Speed Test service (singleton - tracks running tests, uses UniFiSshService)
-builder.Services.AddSingleton<Iperf3SpeedTestService>();
+// LAN iperf3 speed test per site (registry-owned): devices, credentials, and
+// results live in that site's database; tests run against that site's devices.
+// Scoped resolution forwards to the current site's instance.
+builder.Services.AddScoped(sp => sp.GetRequiredService<SpeedTestServiceRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).LanSpeedTest);
 
-// Register Gateway Speed Test service (singleton - gateway iperf3 tests with separate SSH creds)
-builder.Services.AddSingleton<GatewaySpeedTestService>();
+// Register Gateway Speed Test service (scoped - forwards to the current site's
+// gateway SSH and database; gateway iperf3 tests with separate SSH creds)
+builder.Services.AddScoped<GatewaySpeedTestService>();
 
-// Register Client Speed Test service (singleton - receives browser/iperf3 client results)
-builder.Services.AddSingleton<ClientSpeedTestService>();
+// Client Speed Test per site: the registry owns one enrichment bundle per site
+// (path analyzer + topology snapshots + client speed test service). Scoped
+// resolution forwards to the current site's instance so pages show that site's
+// results; the public results endpoint routes by slug parameter.
+builder.Services.AddSingleton<SpeedTestServiceRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<SpeedTestServiceRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).ClientSpeedTest);
 
-// Register Client Dashboard service (singleton - signal polling, trace tracking)
-builder.Services.AddSingleton<ClientDashboardService>();
+// Register Client Dashboard service (scoped - forwards to the current site's
+// connection, speed test service, and database; signal polling, trace tracking)
+builder.Services.AddScoped<ClientDashboardService>();
 
-// Register WAN Speed Test services (singletons - server-side and gateway-direct WAN speed tests)
+// Register WAN Speed Test services. Cloudflare stays a default-site singleton
+// (legacy history only) - if reactivated it must be moved into SpeedTestServiceRegistry
+// and resolved per-site (see the note on CloudflareSpeedTestService). UWN is per site
+// through the registry: non-default instances serve that site's result history; runs
+// stay default-only (the local binary measures this server's own WAN).
 builder.Services.AddSingleton<CloudflareSpeedTestService>();
-builder.Services.AddSingleton<UwnSpeedTestService>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<SpeedTestServiceRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).Uwn);
 
-// Register Gateway WAN Speed Test service (singleton - gateway-direct WAN speed tests via SSH)
-builder.Services.AddSingleton<GatewayWanSpeedTestService>();
+// Gateway WAN Speed Test per site (registry-owned): the test runs on that site's
+// gateway via its own SSH settings and stores to that site's database. Scoped
+// resolution forwards to the current site's instance; the schedule executor
+// resolves by site key through the registry.
+builder.Services.AddScoped(sp => sp.GetRequiredService<SpeedTestServiceRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug).GatewayWan);
 
-// Register Topology Snapshot service (singleton - captures wireless rate snapshots during speed tests)
-builder.Services.AddSingleton<TopologySnapshotService>();
+// Topology Snapshot service: default site's instance comes from the speed test
+// registry (per-site instances capture against their own site's console).
+builder.Services.AddSingleton<TopologySnapshotService>(sp =>
+    sp.GetRequiredService<SpeedTestServiceRegistry>().GetDefault().Snapshots);
 builder.Services.AddSingleton<ITopologySnapshotService>(sp => sp.GetRequiredService<TopologySnapshotService>());
 
 // Register iperf3 Server service (hosted - runs iperf3 in server mode, monitors for client tests)
@@ -306,12 +467,20 @@ builder.Services.AddSingleton<NetworkOptimizer.Threats.Interfaces.IUniFiClientAc
 
 // Register Schedule services (scheduling engine for periodic audits, speed tests)
 builder.Services.AddScoped<NetworkOptimizer.Alerts.Interfaces.IScheduleRepository, NetworkOptimizer.Storage.Repositories.ScheduleRepository>();
+// Site fan-out for the schedule loop: each enabled site's schedules run in a
+// scope pinned to that site's database and console connection.
+builder.Services.AddSingleton<NetworkOptimizer.Alerts.Interfaces.IScheduleSiteContext, ScheduleSiteContext>();
 builder.Services.AddSingleton<NetworkOptimizer.Alerts.ScheduleService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<NetworkOptimizer.Alerts.ScheduleService>());
 
 // Register WAN Data Usage tracking service (singleton - polls WAN counters, calculates billing cycle usage)
-builder.Services.AddSingleton<WanDataUsageService>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<WanDataUsageService>());
+// WAN data usage tracking is per site: the registry owns one WanDataUsageService per
+// site (its console + its DB), the default starting with the app and non-default sites
+// reconciled in. Scoped resolution forwards to the current site's collector.
+builder.Services.AddSingleton<WanDataUsageRegistry>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<WanDataUsageRegistry>());
+builder.Services.AddScoped(sp => sp.GetRequiredService<WanDataUsageRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 
 // Register System Settings service (singleton - system-wide configuration)
 builder.Services.AddSingleton<SystemSettingsService>();
@@ -369,21 +538,43 @@ builder.Services.AddAuthorization();
 
 // Monitoring subsystem
 builder.Services.AddScoped<SnmpDetectionService>();
-builder.Services.AddSingleton<MonitoringInfluxClient>();
-builder.Services.AddSingleton<MonitoringLiveStats>();
+// Per-site Influx clients (D1: bucket-per-site) live in the registry - the
+// default site's included. Scoped resolution forwards to the current site's
+// client so chart endpoints and pages read that site's buckets; singleton
+// consumers inject the registry and pin GetDefault().
+builder.Services.AddSingleton<MonitoringInfluxRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<MonitoringInfluxRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
+// Per-site live monitoring caches, same forwarding shape: pages/endpoints get
+// the current site's instance, singleton collectors pin the default, and the
+// agent result sink records into the owning site's instance.
+builder.Services.AddSingleton<MonitoringLiveStatsRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<MonitoringLiveStatsRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.WanSummaryCache>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.IspHealth.PhysicalLinkResolver>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.IspHealth.IspHealthService>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.FlakyTargetService>();
+// ISP Health is per site: the registry owns one IspHealthService (with its own
+// PhysicalLinkResolver, report cache, and compute state) per site; scoped
+// resolution forwards to the current site's instance.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.IspHealth.IspHealthRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.IspHealth.IspHealthRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
+// Scoped - forwards to the current site's Influx client and database.
+builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.FlakyTargetService>();
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.MonitoringPathView>();
 builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.AsnResolutionService>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.MonitoringAlertEvaluator>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.SfpAlertEvaluator>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.DeviceHealthAlertEvaluator>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.CableModemAlertEvaluator>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.OntAlertEvaluator>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.CellularAlertEvaluator>();
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.UpstreamTracerService>();
+// Per-site monitoring alert evaluators (target offline / device health / SFP DDM):
+// in-memory state machines keyed by target id / MAC, which repeat across sites, so
+// each site gets its own bundle. Local collection loops and the agent tunnel sink
+// both evaluate through the owning site's instances.
+builder.Services.AddSingleton<MonitoringAlertRegistry>();
+// (The cable modem, ONT, and cellular alert evaluators are per site via
+// MonitoringAlertRegistry.)
+// Upstream tracer is per site (isolated discovery state in each site's DB, traceroute
+// from the site's own vantage). Scoped resolution forwards to the current site's tracer;
+// the background re-discovery iterates sites via the registry.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.Monitoring.UpstreamTracerRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.Monitoring.UpstreamTracerRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 builder.Services.AddScoped<InfluxDbProvisioningService>();
 // Probe-execution layer: the server-side LocalProbeExecutor is the default vantage. SSH
 // vantages (gateway/switch/AP) are constructed per-device via SshProbeExecutor later.
@@ -391,17 +582,26 @@ builder.Services.AddSingleton<NetworkOptimizer.Monitoring.Probes.LocalProbeExecu
 builder.Services.AddSingleton<NetworkOptimizer.Monitoring.Probes.IProbeExecutor>(
     sp => sp.GetRequiredService<NetworkOptimizer.Monitoring.Probes.LocalProbeExecutor>());
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.Monitoring.ProbeExecutorFactory>();
-// Collection agent — drives SNMP polling on the three-tier cadence, writes to InfluxDB.
-// Idle while monitoring is disabled or unconfigured; activates once both SNMP detection
-// succeeds and InfluxDB is reachable. Registered as a singleton (not just a hosted
-// service) so the Setup dashboard can read per-device SNMP status off the same instance.
-builder.Services.AddSingleton<MonitoringCollectionAgent>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<MonitoringCollectionAgent>());
+// Collection agents — drive SNMP polling on the three-tier cadence, write to InfluxDB.
+// Idle while monitoring is disabled or unconfigured; activate once both SNMP detection
+// succeeds and InfluxDB is reachable. One instance per site, owned by the registry
+// (default always runs; non-default sites start/stop on site enable/disable). Scoped
+// resolution forwards to the current site's instance so the Setup dashboard reads
+// per-device SNMP status for the site it is showing.
+builder.Services.AddSingleton<MonitoringCollectionRegistry>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<MonitoringCollectionRegistry>());
+builder.Services.AddScoped(sp => sp.GetRequiredService<MonitoringCollectionRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 // Re-runs upstream tracer discovery every 7 days; flips a review flag on diff.
 builder.Services.AddHostedService<NetworkOptimizer.Web.Services.Monitoring.UpstreamRediscoveryService>();
 // 3D LAN flow map (spec 5.7) - composes topology + live + historic feeds for the JS layer.
-// Cache is Singleton (TTL-based topology); service is Scoped so it can consume scoped deps.
-builder.Services.AddSingleton<NetworkOptimizer.Web.Services.LanFlowMap.LanFlowMapCache>();
+// Per-site map cache: the registry owns one LanFlowMapCache per site and scoped
+// forwarding hands each request the current site's instance, so a secondary
+// site's rebuild can no longer overwrite the main site's map snapshot. Service
+// is Scoped so it can consume scoped deps.
+builder.Services.AddSingleton<NetworkOptimizer.Web.Services.LanFlowMap.LanFlowMapCacheRegistry>();
+builder.Services.AddScoped(sp => sp.GetRequiredService<NetworkOptimizer.Web.Services.LanFlowMap.LanFlowMapCacheRegistry>()
+    .GetFor(sp.GetRequiredService<SiteContextService>().Slug));
 builder.Services.AddScoped<NetworkOptimizer.Web.Services.LanFlowMap.LanFlowMapService>();
 
 // Register application services (scoped per request/circuit)
@@ -410,16 +610,18 @@ builder.Services.AddScoped<DashboardLayoutService>();
 builder.Services.AddScoped<PullToRefreshState>();
 builder.Services.AddSingleton<FingerprintDatabaseService>(); // Singleton to cache fingerprint data
 builder.Services.AddSingleton<IeeeOuiDatabase>(); // IEEE OUI database for MAC vendor lookup
-builder.Services.AddSingleton<PdfStorageService>(); // Singleton - manages PDF report file storage
+builder.Services.AddScoped<PdfStorageService>(); // Scoped - namespaces PDF storage by the current site's slug
 builder.Services.AddScoped<AuditService>(); // Scoped - uses IMemoryCache for cross-request state
 builder.Services.AddScoped<DiagnosticsService>(); // Scoped - network diagnostics (trunk consistency, AP lock, etc.)
 builder.Services.AddScoped<ISqmService, SqmService>();
 builder.Services.AddScoped<SqmDeploymentService>();
 builder.Services.AddScoped<WanSteerDeploymentService>();
 builder.Services.AddScoped<PerfTweaksDeploymentService>();
-builder.Services.AddSingleton<ModuleUpdateNotificationService>(); // caches module update state, computed once per startup post-connect
+// Per site: the update banner reflects the current site's gateway module deployment
+// state. Scoped so each site's Perf Tweaks / WAN Steering status is its own; a circuit
+// is session-lived, so the compute still runs about once per session.
+builder.Services.AddScoped<ModuleUpdateNotificationService>();
 builder.Services.AddScoped<MonitoringInterfaceDeploymentService>();
-builder.Services.AddScoped<AgentService>();
 
 // Register WiFi Optimizer rules and engine
 builder.Services.AddSingleton<NetworkOptimizer.WiFi.Rules.IWiFiOptimizerRule, NetworkOptimizer.WiFi.Rules.IoTSsidSeparationRule>();
@@ -445,12 +647,16 @@ builder.Services.AddSingleton<NetworkOptimizer.WiFi.Rules.IWiFiOptimizerRule, Ne
 builder.Services.AddSingleton<NetworkOptimizer.WiFi.Rules.IWiFiOptimizerRule, NetworkOptimizer.WiFi.Rules.WideChannelWidthRule>();
 builder.Services.AddSingleton<NetworkOptimizer.WiFi.Rules.WiFiOptimizerEngine>();
 builder.Services.AddScoped<WiFiOptimizerService>();
-// Mesh backhaul re-scan (Optimize Mesh button); stateless, uses UniFiSshService singleton.
-builder.Services.AddSingleton<MeshOptimizationService>();
+// Mesh backhaul re-scan (Optimize Mesh button); scoped - forwards to the current
+// site's UniFiSshService.
+builder.Services.AddScoped<MeshOptimizationService>();
 builder.Services.AddScoped<ApMapService>();
-builder.Services.AddSingleton<FloorPlanService>();
-builder.Services.AddSingleton<HeatmapDataCache>();
-builder.Services.AddSingleton<PlannedApService>();
+// Per-site: buildings, floor plans, planned APs, and their heatmap cache are
+// per-site data. Scoped so each site's WiFi optimizer / floor plan / heatmap reads
+// its own data (consumers - WiFiOptimizerService, floor-plan endpoints - are scoped).
+builder.Services.AddScoped<FloorPlanService>();
+builder.Services.AddScoped<HeatmapDataCache>();
+builder.Services.AddScoped<PlannedApService>();
 builder.Services.AddSingleton<ConfigTransferService>();
 builder.Services.AddSingleton<NetworkOptimizer.WiFi.Data.AntennaPatternLoader>();
 builder.Services.AddSingleton<NetworkOptimizer.WiFi.Services.PropagationService>();
@@ -459,9 +665,16 @@ builder.Services.AddSingleton<NetworkOptimizer.WiFi.Services.ChannelRecommendati
 // Channel recommendation outcome memory: persistent store (factory-based, shared by the
 // singleton collector and scoped services) + background collector that attributes UniFi
 // radio metrics to the channel config that was live and maintains the change log.
-builder.Services.AddSingleton<NetworkOptimizer.Storage.Interfaces.IChannelMemoryRepository, NetworkOptimizer.Storage.Repositories.ChannelMemoryRepository>();
-builder.Services.AddSingleton<ChannelMemoryCollectionService>();
-builder.Services.AddHostedService(sp => sp.GetRequiredService<ChannelMemoryCollectionService>());
+// Channel memory (channel history + neighbor sightings) is per site. The repository is
+// scoped so web consumers (WiFiOptimizerService) read the current site's data; the
+// collector runs one per-site instance via ChannelMemoryRegistry.
+builder.Services.AddScoped<NetworkOptimizer.Storage.Interfaces.IChannelMemoryRepository>(sp =>
+    ActivatorUtilities.CreateInstance<NetworkOptimizer.Storage.Repositories.ChannelMemoryRepository>(
+        sp,
+        sp.GetRequiredService<SiteContextService>().Slug,
+        sp.GetRequiredService<SiteContextService>().IsDefault));
+builder.Services.AddSingleton<ChannelMemoryRegistry>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ChannelMemoryRegistry>());
 
 // Add ApexCharts for Wi-Fi Optimizer visualizations
 builder.Services.AddApexCharts();
@@ -531,6 +744,23 @@ builder.Services.AddCors(options =>
         // If no origins configured, CORS is effectively disabled (no origins allowed)
         // Configure HOST_IP or HOST_NAME in .env to enable OpenSpeedTest result reporting
     });
+});
+
+// Basic anti-flood limiter for the anonymous public speed-test result endpoints (OpenSpeedTest
+// and agent-relayed iperf3). Partitioned by remote address; a real speed test takes ~30s, so a
+// generous per-minute cap never affects legitimate use but stops a flood of forged posts.
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy("PublicSpeedTest", httpContext =>
+        System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 60,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+            }));
 });
 
 var app = builder.Build();
@@ -608,6 +838,63 @@ using (var scope = app.Services.CreateScope())
     app.Logger.LogInformation("Applying database migrations...");
     db.Database.Migrate();
     app.Logger.LogInformation("Database migrations complete");
+
+    // Migrate every provisioned non-default site database: app upgrades can add
+    // migrations after a site DB was provisioned. This scope has no HTTP context,
+    // so `db` above is always the main database holding the site registry.
+    try
+    {
+        var sitePaths = scope.ServiceProvider.GetRequiredService<NetworkOptimizer.Storage.Services.SiteDatabasePaths>();
+        var siteRows = db.Sites.Where(s => !s.IsDefault).ToList();
+        foreach (var site in siteRows)
+        {
+            var siteDbPath = sitePaths.GetSiteDbPath(site.Slug, isDefault: false);
+            if (!File.Exists(siteDbPath))
+            {
+                app.Logger.LogWarning("Site {Slug} database missing at {Path}, skipping migration", site.Slug, siteDbPath);
+                continue;
+            }
+            var siteOptions = new DbContextOptionsBuilder<NetworkOptimizerDbContext>()
+                .UseSqlite($"Data Source={siteDbPath}")
+                .Options;
+            using var siteDb = new NetworkOptimizerDbContext(siteOptions);
+            siteDb.Database.Migrate();
+
+            // Seed the Alerts & Schedule defaults into each site's DB too, so secondary
+            // sites match the main site instead of showing blank lists. The main-DB seed
+            // below only covers the default site.
+            var siteMissingRules = NetworkOptimizer.Alerts.DefaultAlertRules.GetDefaults()
+                .Where(r => !siteDb.AlertRules.Select(x => x.EventTypePattern).Contains(r.EventTypePattern))
+                .ToList();
+            if (siteMissingRules.Count > 0)
+            {
+                siteDb.AlertRules.AddRange(siteMissingRules);
+                siteDb.SaveChanges();
+                app.Logger.LogInformation("Seeded {Count} alert rule(s) for site {Slug}", siteMissingRules.Count, site.Slug);
+            }
+
+            if (NetworkOptimizer.Core.FeatureFlags.SchedulingEnabled && !siteDb.ScheduledTasks.Any())
+            {
+                siteDb.ScheduledTasks.Add(new NetworkOptimizer.Alerts.Models.ScheduledTask
+                {
+                    TaskType = "audit",
+                    Name = "Security Audit",
+                    Enabled = true,
+                    FrequencyMinutes = 720, // 12 hours
+                    NextRunAt = NetworkOptimizer.Alerts.ScheduleService.CalculateNextRun(720),
+                    CreatedAt = DateTime.UtcNow
+                });
+                siteDb.SaveChanges();
+                app.Logger.LogInformation("Seeded default scheduled tasks for site {Slug}", site.Slug);
+            }
+        }
+        if (siteRows.Count > 0)
+            app.Logger.LogInformation("Applied migrations to {Count} site database(s)", siteRows.Count);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "Failed to migrate site databases");
+    }
 
     // FUSE/network filesystems (Unraid shfs, mergerfs, NFS, SMB) don't support the shared-memory
     // mmap that WAL mode requires, causing silent database corruption. Use DELETE mode instead.
@@ -709,7 +996,7 @@ app.Services.GetRequiredService<NetworkOptimizer.Threats.Enrichment.GeoEnrichmen
 // Load CrowdSec daily quota from settings
 {
     var sysSettings = app.Services.GetRequiredService<ISystemSettingsService>();
-    var csQuota = await sysSettings.GetAsync("crowdsec.daily_quota");
+    var csQuota = await sysSettings.GetGlobalAsync("crowdsec.daily_quota");
     var dailyLimit = 30;
     if (!string.IsNullOrEmpty(csQuota) && int.TryParse(csQuota, out var q) && q >= 1)
         dailyLimit = q;
@@ -723,12 +1010,8 @@ app.RegisterScheduleExecutors();
 // Clean up any leftover config transfer temp files from previous sessions
 app.Services.GetRequiredService<ConfigTransferService>().CleanupTempFiles();
 
-// Eagerly resolve device monitor services so their poll timers start at app launch,
-// not on first page load. Without this, polling doesn't begin until a user visits
-// a page that injects the service.
-app.Services.GetRequiredService<CellularModemService>();
-app.Services.GetRequiredService<CableModemMonitorService>();
-app.Services.GetRequiredService<OntMonitorService>();
+// Device monitor poll timers (cable modem, ONT, cellular) start at app launch
+// via the ModemMonitorRegistry hosted service - no eager resolution needed.
 
 // Configure the HTTP request pipeline
 if (!app.Environment.IsDevelopment())
@@ -863,6 +1146,27 @@ app.Use(async (context, next) =>
     await next();
 });
 
+// Site selection via ?site=<slug>: alert "View" links carry the originating site so a
+// notification lands on the right site. Persist a valid value to the site cookie (same
+// attributes as the in-app switcher) so the whole session follows the link; validation
+// runs through the scoped site context, which checks the slug and its provisioned DB.
+app.Use(async (context, next) =>
+{
+    var siteParam = context.Request.Query[SiteContextService.SiteQueryParam].ToString();
+    if (!string.IsNullOrEmpty(siteParam)
+        && context.Request.Cookies[SiteContextService.CookieName] != siteParam
+        && context.RequestServices.GetRequiredService<SiteContextService>().IsSelectableSite(siteParam))
+    {
+        context.Response.Cookies.Append(SiteContextService.CookieName, siteParam, new CookieOptions
+        {
+            Path = "/",
+            MaxAge = TimeSpan.FromDays(365),
+            SameSite = SameSiteMode.Lax
+        });
+    }
+    await next();
+});
+
 // Configure static files with custom MIME types for package downloads
 var contentTypeProvider = new FileExtensionContentTypeProvider();
 contentTypeProvider.Mappings[".ipk"] = "application/octet-stream";
@@ -872,6 +1176,7 @@ app.UseStaticFiles(new StaticFileOptions
 });
 app.UseAntiforgery();
 app.UseCors(); // Required for OpenSpeedTest to POST results
+app.UseRateLimiter(); // Enforces the PublicSpeedTest policy on the anonymous result endpoints
 
 // Dynamic CORS for external speed test servers (configured via Settings UI, not env vars)
 // Adds Access-Control-Allow-Origin for the external server origin on public speed test endpoints
@@ -906,17 +1211,6 @@ app.MapRazorComponents<App>()
 
 // Alert Engine API endpoints
 app.MapAlertEndpoints();
-
-// API endpoints for agent metrics ingestion
-app.MapPost("/api/metrics", async (HttpContext context) =>
-{
-    // TODO(agent-infrastructure): Implement metrics ingestion from agents.
-    // Requires: NetworkOptimizer.Agents package with gateway agent that pushes
-    // latency, bandwidth, and SQM stats. Metrics should be stored in SQLite
-    // time-series tables or optionally forwarded to external TSDB.
-    var metrics = await context.Request.ReadFromJsonAsync<Dictionary<string, object>>();
-    return Results.Ok(new { status = "accepted" });
-});
 
 app.MapGet("/api/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }));
 
@@ -1663,6 +1957,10 @@ app.MapDelete("/api/config/backups/pending", (ConfigTransferService service) =>
 
 // New API endpoints go in Endpoints/*.cs, not inline here.
 LanFlowMapEndpoints.Map(app);
+SiteAgentEndpoints.Map(app);
+// Agent tunnel (gRPC). Mapped unconditionally; it is only reachable when the
+// dedicated HTTP/2 listener is bound (multi-site enabled at startup).
+app.MapGrpcService<AgentTunnelService>();
 MonitoringChartEndpoints.Map(app);
 IspHealthEndpoints.Map(app);
 MonitoringInvestigateEndpoints.Map(app);
@@ -1809,6 +2107,96 @@ class DigestStateStoreAdapter(NetworkOptimizer.Storage.Interfaces.ISettingsRepos
 
 static partial class StartupHelpers
 {
+    /// <summary>
+    /// Resolves the plain-HTTP bindings the app would use today from
+    /// ASPNETCORE_URLS / ASPNETCORE_HTTP_PORTS (default http://*:8042), so the
+    /// agent tunnel listener can re-bind them explicitly alongside its own
+    /// HTTP/2 port. Returns null when the configuration contains anything we
+    /// cannot faithfully reproduce with Kestrel Listen calls (HTTPS, unix
+    /// sockets, malformed entries) - callers then leave binding untouched.
+    /// </summary>
+    internal static List<(string Host, int Port)>? ResolveHttpBindings()
+    {
+        var bindings = new List<(string Host, int Port)>();
+        var urls = Environment.GetEnvironmentVariable("ASPNETCORE_URLS");
+        var httpPorts = Environment.GetEnvironmentVariable("ASPNETCORE_HTTP_PORTS");
+
+        if (!string.IsNullOrWhiteSpace(urls))
+        {
+            foreach (var url in urls.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                    return null;
+                var hostPort = url["http://".Length..].TrimEnd('/');
+                var colon = hostPort.LastIndexOf(':');
+                if (colon < 0 || !int.TryParse(hostPort[(colon + 1)..], out var port))
+                    return null;
+                var host = hostPort[..colon];
+                bindings.Add((host is "*" or "+" or "0.0.0.0" ? "*" : host, port));
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(httpPorts))
+        {
+            foreach (var part in httpPorts.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (!int.TryParse(part, out var port))
+                    return null;
+                bindings.Add(("*", port));
+            }
+        }
+        else
+        {
+            bindings.Add(("*", 8042));
+        }
+
+        return bindings.Count > 0 ? bindings : null;
+    }
+
+    /// <summary>
+    /// Builds an ephemeral self-signed certificate for the agent-tunnel TLS
+    /// listener. The tunnel port sits behind the reverse proxy fronting the
+    /// server, which is configured to skip verification, so this cert only
+    /// provides transport encryption for the proxy-to-app hop - it is never
+    /// validated, never persisted, and regenerated on every start. Encrypting
+    /// that hop matters when the proxy is a separate box: the agent enrollment
+    /// key and the SNMP credentials pushed over the tunnel would otherwise
+    /// traverse the LAN in cleartext. On Linux the freshly created cert holds an
+    /// ephemeral key handle Kestrel cannot use directly, so it is round-tripped
+    /// through PKCS#12 to bind the private key to the returned instance.
+    /// </summary>
+    internal static System.Security.Cryptography.X509Certificates.X509Certificate2 CreateSelfSignedTunnelCert()
+    {
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        var request = new System.Security.Cryptography.X509Certificates.CertificateRequest(
+            "CN=networkoptimizer-agent-tunnel",
+            rsa,
+            System.Security.Cryptography.HashAlgorithmName.SHA256,
+            System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+
+        request.CertificateExtensions.Add(
+            new System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension(false, false, 0, false));
+        request.CertificateExtensions.Add(
+            new System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension(
+                new System.Security.Cryptography.OidCollection
+                {
+                    new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1"), // serverAuth
+                },
+                false));
+
+        var san = new System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder();
+        san.AddDnsName("localhost");
+        san.AddIpAddress(System.Net.IPAddress.Loopback);
+        request.CertificateExtensions.Add(san.Build());
+
+        using var certificate = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1),
+            DateTimeOffset.UtcNow.AddYears(100));
+
+        return System.Security.Cryptography.X509Certificates.X509CertificateLoader.LoadPkcs12(
+            certificate.Export(System.Security.Cryptography.X509Certificates.X509ContentType.Pfx),
+            password: null);
+    }
+
     internal static (bool isFuse, string filesystemType) DetectFilesystem(string filePath)
     {
         if (!OperatingSystem.IsLinux())

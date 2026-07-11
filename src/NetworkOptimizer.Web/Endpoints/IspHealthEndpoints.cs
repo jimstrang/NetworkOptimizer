@@ -68,14 +68,23 @@ public static class IspHealthEndpoints
                     label = e.IsShared ? "Shared congestion" : "Congestion",
                     shared = e.IsShared
                 }));
-                events.AddRange(report.PathShifts.Select(e => (object)new
-                {
-                    type = "path-shift",
-                    start = e.Time.ToString("o"),
-                    end = (string?)null,
-                    label = $"Path shift {(e.DeltaMs >= 0 ? "+" : "")}{e.DeltaMs:0.#} ms",
-                    shared = false
-                }));
+                events.AddRange(report.PathShifts.Select(e => (object)(e.IsUnreachable
+                    ? new
+                    {
+                        type = "unreachable",
+                        start = e.Time.ToString("o"),
+                        end = e.UnreachableEnd?.ToString("o"),
+                        label = $"{(string.IsNullOrEmpty(e.AsnName) ? "Transit" : e.AsnName)} unreachable",
+                        shared = false
+                    }
+                    : new
+                    {
+                        type = "path-shift",
+                        start = e.Time.ToString("o"),
+                        end = (string?)null,
+                        label = $"Path shift {(e.DeltaMs >= 0 ? "+" : "")}{e.DeltaMs:0.#} ms",
+                        shared = false
+                    })));
             }
 
             return Results.Ok(new { asns, events });

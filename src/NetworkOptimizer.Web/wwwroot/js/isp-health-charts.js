@@ -76,6 +76,30 @@ function buildOpts() {
             theme: 'dark',
             shared: true,
             x: { format: 'MMM dd, HH:mm' },
+            // Rows ordered by RTT desc so the tooltip's vertical order matches the
+            // chart lines at the hovered instant (highest line = first row).
+            custom({ series, dataPointIndex, w }) {
+                const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+                const fmt = v => v.toFixed(1) + ' ms';
+                const rows = [];
+                let ts = null;
+                for (let i = 0; i < series.length; i++) {
+                    const v = series[i]?.[dataPointIndex];
+                    if (v == null) continue;
+                    ts ??= w.globals.seriesX[i]?.[dataPointIndex];
+                    rows.push({ name: w.globals.seriesNames[i], color: w.globals.colors[i % w.globals.colors.length], v });
+                }
+                rows.sort((a, b) => b.v - a.v);
+                const when = ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+                return (when ? '<div class="apexcharts-tooltip-title" style="font-family:Helvetica, Arial, sans-serif;font-size:12px">' + esc(when) + '</div>' : '')
+                    + rows.map(r =>
+                        '<div class="apexcharts-tooltip-series-group apexcharts-active" style="display:flex">'
+                        + '<span class="apexcharts-tooltip-marker" style="background-color:' + r.color + ';border-radius:50%;width:12px;height:12px"></span>'
+                        + '<div class="apexcharts-tooltip-text" style="font-family:Helvetica, Arial, sans-serif;font-size:12px"><div class="apexcharts-tooltip-y-group">'
+                        + '<span class="apexcharts-tooltip-text-y-label">' + esc(r.name) + ': </span>'
+                        + '<span class="apexcharts-tooltip-text-y-value">' + esc(fmt(r.v)) + '</span>'
+                        + '</div></div></div>').join('');
+            },
         },
         noData: { text: 'No path data in the last 24 hours', style: { color: '#64748b' } },
     };
@@ -93,6 +117,17 @@ function buildAnnotations(events) {
                 label: {
                     text: e.label,
                     style: { color: '#ededef', background: e.shared ? '#7f1d1d' : '#78350f', fontSize: '10px' },
+                },
+            });
+        } else if (e.type === 'unreachable') {
+            xaxis.push({
+                x: new Date(e.start).getTime(),
+                x2: e.end ? new Date(e.end).getTime() : undefined,
+                fillColor: '#4797ff',
+                opacity: 0.12,
+                label: {
+                    text: e.label,
+                    style: { color: '#ededef', background: '#1e3a5f', fontSize: '10px' },
                 },
             });
         } else {

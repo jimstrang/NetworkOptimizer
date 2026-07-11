@@ -10,6 +10,9 @@ namespace NetworkOptimizer.Web.Services;
 /// <summary>
 /// Service for managing client-initiated speed tests (browser-based and iperf3 clients).
 /// Uses the unified Iperf3Result table with Direction field to distinguish test types.
+/// One instance exists per site, owned by <see cref="SpeedTestServiceRegistry"/>:
+/// results land in that site's database and enrichment (client lookup, path
+/// analysis, topology snapshots) runs against that site's console connection.
 /// </summary>
 public class ClientSpeedTestService
 {
@@ -21,22 +24,87 @@ public class ClientSpeedTestService
     private readonly IConfiguration _configuration;
     private readonly IAlertEventBus? _alertEventBus;
 
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
+    private readonly Licensing.LicenseStateService? _licenseState;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
+    private readonly string _siteSuffix;
+
+    /// <summary>
+    /// Throws when this site is license-restricted. New client speed test
+    /// results count as new operations; historic result reads stay open.
+    /// </summary>
+    private void EnsureLicenseOperational()
+    {
+        if (_licenseState != null)
+            Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteSlug);
+    }
+
     public ClientSpeedTestService(
         ILogger<ClientSpeedTestService> logger,
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
-        UniFiConnectionService connectionService,
+        SiteConnectionRegistry siteConnections,
         INetworkPathAnalyzer pathAnalyzer,
         ITopologySnapshotService snapshotService,
         IConfiguration configuration,
-        IAlertEventBus? alertEventBus = null)
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        Licensing.LicenseStateService? licenseState = null,
+        IAlertEventBus? alertEventBus = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _licenseState = licenseState;
         _logger = logger;
         _dbFactory = dbFactory;
-        _connectionService = connectionService;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _siteSuffix = _isDefault ? "" : $" (site {_siteSlug})";
+        _connectionService = siteConnections.GetFor(_siteSlug);
         _pathAnalyzer = pathAnalyzer;
         _snapshotService = snapshotService;
         _configuration = configuration;
         _alertEventBus = alertEventBus;
+        _siteDbFactory = siteDbFactory;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct = default)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
+    }
+
+    /// <summary>
+    /// The local endpoint the client actually connected to, for path analysis. On a
+    /// secondary (agent) site that's the on-site agent's LAN IP - the client hit the
+    /// agent's nginx / iperf3, not this central server - so the trace runs client to
+    /// agent on the site's own topology; the central server's HOST_IP is off-network
+    /// there and traces to nothing meaningful. The default site uses HOST_IP as before.
+    /// </summary>
+    private async Task<string?> ResolveServerIpAsync()
+    {
+        if (!_isDefault)
+        {
+            try
+            {
+                await using var db = await _dbFactory.CreateDbContextAsync();
+                var site = await db.Sites.AsNoTracking().FirstOrDefaultAsync(s => s.Slug == _siteSlug);
+                if (site != null)
+                {
+                    var agent = await db.SiteAgents.AsNoTracking()
+                        .Where(a => a.SiteId == site.Id && a.Enabled && a.EnrolledAt != null && a.LanIp != null)
+                        .OrderByDescending(a => a.LastSeenAt)
+                        .FirstOrDefaultAsync();
+                    if (agent != null && AgentEnrollmentService.IsOnline(agent.LastSeenAt))
+                        return agent.LanIp;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to resolve agent LAN IP for site {Site} path analysis", _siteSlug);
+            }
+        }
+        return _configuration["HOST_IP"];
     }
 
     /// <summary>
@@ -57,11 +125,13 @@ public class ClientSpeedTestService
         int? durationSeconds = null,
         string? externalServerId = null)
     {
+        EnsureLicenseOperational();
+
         // Determine direction based on whether this came from an external server
         var isWan = !string.IsNullOrWhiteSpace(externalServerId);
 
-        // Get server's local IP for path analysis
-        var serverIp = _configuration["HOST_IP"];
+        // Local endpoint the client hit, for path analysis (agent LAN IP on agent sites).
+        var serverIp = await ResolveServerIpAsync();
 
         // LAN (BrowserToServer): Store from SERVER's perspective (consistent with SSH-based tests):
         //   DownloadBitsPerSecond = data server received FROM client = client's upload
@@ -93,14 +163,14 @@ public class ClientSpeedTestService
         };
 
         // Save immediately so client doesn't wait
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         db.Iperf3Results.Add(result);
         await db.SaveChangesAsync();
         var resultId = result.Id;
 
         _logger.LogInformation(
-            "Recorded OpenSpeedTest{Wan} result: {ClientIp} - Down: {Download:F1} Mbps, Up: {Upload:F1} Mbps{Server}",
-            isWan ? " WAN" : "", result.DeviceHost, result.DownloadMbps, result.UploadMbps,
+            "Recorded OpenSpeedTest{Wan} result (site {Site}): {ClientIp} - Down: {Download:F1} Mbps, Up: {Upload:F1} Mbps{Server}",
+            isWan ? " WAN" : "", _siteSlug, result.DeviceHost, result.DownloadMbps, result.UploadMbps,
             isWan ? $" (server: {externalServerId})" : "");
 
         // Publish speed test alert event
@@ -129,11 +199,14 @@ public class ClientSpeedTestService
         string? rawJson,
         string? serverLocalIp = null)
     {
-        var now = DateTime.UtcNow;
-        // Use the actual server IP from iperf3, fall back to HOST_IP config
-        var serverIp = serverLocalIp ?? _configuration["HOST_IP"];
+        EnsureLicenseOperational();
 
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        var now = DateTime.UtcNow;
+        // Use the actual server IP from iperf3, else the local endpoint the client hit
+        // (agent LAN IP on agent sites, HOST_IP on the default site).
+        var serverIp = serverLocalIp ?? await ResolveServerIpAsync();
+
+        await using var db = await CreateSiteDbAsync();
 
         // Check for recent result from same client that we can merge with
         // (within 60 seconds, one has download but no upload, or vice versa)
@@ -242,7 +315,7 @@ public class ClientSpeedTestService
     /// <param name="hours">Filter to results within the last N hours (0 = all time)</param>
     public async Task<List<Iperf3Result>> GetResultsAsync(int count = 50, int hours = 0)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var query = db.Iperf3Results
             .Where(r => r.Direction == SpeedTestDirection.ClientToServer
                      || r.Direction == SpeedTestDirection.BrowserToServer);
@@ -293,7 +366,7 @@ public class ClientSpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> GetWanResultsAsync(int count = 50, int hours = 0)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var query = db.Iperf3Results
             .Where(r => r.Direction == SpeedTestDirection.OpenSpeedTestWan);
 
@@ -339,7 +412,7 @@ public class ClientSpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> GetResultsByIpAsync(string clientIp, int count = 20)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         return await db.Iperf3Results
             .Where(r => (r.Direction == SpeedTestDirection.ClientToServer
                       || r.Direction == SpeedTestDirection.BrowserToServer)
@@ -354,7 +427,7 @@ public class ClientSpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> GetResultsByMacAsync(string clientMac, int count = 20)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         return await db.Iperf3Results
             .Where(r => (r.Direction == SpeedTestDirection.ClientToServer
                       || r.Direction == SpeedTestDirection.BrowserToServer)
@@ -370,7 +443,7 @@ public class ClientSpeedTestService
     /// <returns>True if the result was deleted, false if not found.</returns>
     public async Task<bool> DeleteResultAsync(int id)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null)
         {
@@ -388,7 +461,7 @@ public class ClientSpeedTestService
     /// </summary>
     public async Task<bool> UpdateNotesAsync(int id, string? notes)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null)
         {
@@ -549,7 +622,7 @@ public class ClientSpeedTestService
             // Let WiFi link rates stabilize after the speed test
             await Task.Delay(TimeSpan.FromSeconds(2));
 
-            await using var db = await _dbFactory.CreateDbContextAsync();
+            await using var db = await CreateSiteDbAsync();
             var result = await db.Iperf3Results.FindAsync(resultId);
             if (result == null)
             {
@@ -608,7 +681,7 @@ public class ClientSpeedTestService
                 EventType = "speedtest.client_completed",
                 Severity = AlertSeverity.Info,
                 Source = "speedtest",
-                Title = $"Speed test: {downloadMbps:F0} / {uploadMbps:F0} Mbps",
+                Title = $"Speed test: {downloadMbps:F0} / {uploadMbps:F0} Mbps{_siteSuffix}",
                 Message = $"Client {result.DeviceHost}: Download {downloadMbps:F1} Mbps, Upload {uploadMbps:F1} Mbps",
                 DeviceIp = result.DeviceHost,
                 DeviceName = result.DeviceName,
@@ -624,7 +697,7 @@ public class ClientSpeedTestService
             // Check for regression vs recent average for same device
             try
             {
-                await using var db = _dbFactory.CreateDbContext();
+                await using var db = await CreateSiteDbAsync();
                 var recent = await db.Iperf3Results
                     .AsNoTracking()
                     .Where(r => r.DeviceHost == result.DeviceHost && r.Id != result.Id && r.Success
@@ -648,7 +721,7 @@ public class ClientSpeedTestService
                             Severity = dropPercent >= 50 ? AlertSeverity.Error
                                 : dropPercent >= 25 ? AlertSeverity.Warning : AlertSeverity.Info,
                             Source = "speedtest",
-                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average)",
+                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average){_siteSuffix}",
                             Message = $"{deviceLabel} download is {dropPercent:F0}% below the recent average of {avgDownload:F0} Mbps",
                             DeviceIp = result.DeviceHost,
                             DeviceName = result.DeviceName,

@@ -371,6 +371,65 @@ Suggested order: congestion / path-shift / outage navigation first (cheap, consi
   - Site selector/switcher in UI
   - Aggregate dashboard views across sites (optional)
 
+### Agent Tunnel Security Hardening
+
+The on-site agent gives the central server SSH reach into each site's gateway, and a
+gateway is the LAN router, so that reach is effectively LAN-wide. That makes the
+**central server the highest-value target** and its hardening the priority. A
+compromised central server is inherent game-over for the gateways it manages - the
+shadow of centralized gateway management, not a tunnel flaw - so protocol-level
+controls can't fix it; protecting the server is what matters. (See the agent README
+"Security and hardening" section, and the comments on `ProxyHandler` and
+`GatewaySshService.MaybeRouteViaAgentAsync`.)
+
+Worth doing - defends the one risk that does NOT already require owning the server
+(a leaked `agentKey` used standalone):
+- [ ] One live tunnel per `agentKey`: reject a second concurrent connection and alert
+  rather than silently accepting it. First step: confirm whether `AgentTunnelRegistry`
+  already enforces this.
+- [ ] Alert on a new public source IP for an existing agent (the tunnel already sees it
+  on connect). This is the anomaly signal for a stolen key.
+- [ ] Surface each agent's public source IP in the UI, so IP-allowlist maintenance is a
+  one-line firewall edit when a site's WAN IP changes.
+- [ ] (lower priority) Soft host-key tripwire: record the last-seen gateway SSH host key
+  and alert on change, but never block. Turns a silent MITM into a logged event while
+  tolerating UniFi's key cycling.
+
+Deployment guidance (now documented in the agent README + `docker/DEPLOYMENT.md`):
+IP-allowlist BOTH the admin plane and the agent tunnel endpoint to your sites' public
+IPs. Commercial and even residential sites are stable enough in practice; a stolen key
+from a random IP then dies at the firewall before the bearer key is presented. Bearer
+key + rate-limiting stay as defense-in-depth behind it.
+
+Considered and deliberately NOT implemented (rationale on record so it isn't re-litigated):
+- **Agent-side proxy dial allowlist** (restrict `ProxyOpen` targets to the gateway/known
+  devices): not an effective control. Gateway SSH already reaches the whole LAN, so
+  anything with gateway access pivots through it regardless; restricting the agent's dial
+  targets contains nothing against a compromised server. Pure complexity.
+- **Hard SSH host-key pinning**: impractical. UniFi regenerates SSH host keys on firmware
+  upgrades (and adoption/factory reset), so a strict pin breaks SSH after routine updates
+  and trains operators to click through warnings - worse than the soft tripwire above.
+
+### Credential Key: Hardening Follow-ups
+
+Self-hosted project, so keep this proportional. The at-rest credential key is a random
+file (`.credential_key`). `NO_CREDENTIAL_KEY_FILE` (implemented) + a Docker secret is the
+pragmatic answer and probably enough: it keeps the key off the data volume, which is the
+main win. DEPLOYMENT.md documents that and warns that the data volume - and `.nopt`
+config exports, which bundle the key - are secret material.
+
+Optional, only if there's real demand (don't gold-plate a self-hosted tool):
+- [ ] Envelope encryption against an external secret manager (Vault / cloud KMS) for the
+  rare operator already running one - master key never on disk, rotation + audit for free.
+  Nice-to-have, not a priority.
+- [ ] `.nopt` export wrapper uses a hardcoded obfuscation key (`ConfigTransferService`),
+  and the archive includes `.credential_key`. Fine as long as exports are treated as
+  secret (documented), but a passphrase-encrypted export option would let users share/store
+  them less carefully. Low priority.
+- [ ] The ASP.NET Data Protection keyring (`Program.cs` `PersistKeysToFileSystem`, no
+  `ProtectKeysWith`) sits unencrypted in the data region too - antiforgery/cookies, not
+  credentials, same co-location. Fold in only if the KMS path ever happens.
+
 ### Federated Authentication & Identity
 - External IdP integration for enterprise/MSP deployments
 - Protocol support:
@@ -391,6 +450,48 @@ Suggested order: congestion / path-shift / outage navigation first (cheap, consi
   - Just-in-time (JIT) user provisioning from IdP claims
   - Session management and token refresh across federated sessions
   - Fallback local auth for break-glass scenarios
+
+### Site Lifecycle Management (post-MVP, not essential for initial MVP)
+- **Deactivate a site:** stop its collection / agent coverage and hide it from the UI, but keep its
+  data, per-site DB, and InfluxDB buckets intact for later re-activation.
+- **Permanently remove a site:** delete its `Sites` + `SiteAgents` rows, its per-site DB
+  (`data/sites/<slug>/`), and its InfluxDB buckets (`<slug>-*`), behind a clear confirmation.
+  Today this requires manual DB row deletes + filesystem + bucket surgery (no in-app path).
+- Both should tear down / re-establish agent enrollment cleanly so a removed slug can be re-added
+  from scratch with no stale rows.
+
+### Agent LAN IP detection on Docker hosts (test / harden)
+The agent detects its LAN IP once at startup via `NetworkUtilities.DetectLocalIpFromInterfaces()`
+(physical Ethernet > WiFi > other, skipping loopback and virtual/container NICs by name) and reports
+it on enrollment, every heartbeat, and the tunnel hello; the server stores it on `SiteAgents.LanIp`.
+That IP is what site clients are pointed at for LAN speed tests and what path analysis uses as the
+agent's trace source (LAN and agent-run WAN tests).
+
+- **Host network mode:** container sees the real host NICs - should work as-is, but untested.
+- **Bridge mode (the gap):** inside the container, `eth0` is a plain-looking Ethernet NIC with the
+  container-internal address (e.g. 172.17.x) - the docker/veth skip-list only matches host-side
+  names, so detection happily reports an IP that is unreachable from the site LAN and absent from
+  the site's UniFi topology. Speed-test targets and traces would silently break.
+- Likely fix: an explicit override in `agent.json` (e.g. `lanIp`) and/or an `AGENT_LAN_IP` env var
+  that wins over detection, plus a docs note that bridge-mode agents require it (or host mode).
+- Test matrix: native (works today), Docker host mode, Docker bridge with override.
+
+### Site-specific alert channels (post-MVP)
+Today delivery channels are global: `DeliveryChannel` has no `SiteId`, `AlertProcessingService` is a
+singleton that dispatches against the main DB, and alert events/rules aren't site-tagged. Alerts are
+evaluated per-site but every one fans out to the single global channel set.
+
+Goal: keep global channels applying everywhere, but let a site add its OWN additional channels.
+- **Model:** nullable `DeliveryChannel.SiteId` (null = global, set = site-specific). Additive
+  migration, fully backward-compatible - existing channels stay global.
+- **Dispatch (the real work):** thread the originating site through the alert event -> incident ->
+  dispatch so the processor can select channels `WHERE SiteId IS NULL OR SiteId = <firing site>`.
+  The alert pipeline is currently main-DB/global-scoped and carries no site identity; adding that
+  end-to-end is the bulk of the effort (and is the same plumbing per-site alert RULES would need).
+- **UI:** per-site channel view - inherited global channels (read-only) plus this site's own
+  additions, mirroring the external-site InfluxDB pattern (Settings > Monitoring).
+- Low-risk and incremental: nullable `SiteId` defaults to global, so nothing changes until a site
+  adds its first channel. Best landed alongside making alert rules site-aware.
 
 ## Distribution
 

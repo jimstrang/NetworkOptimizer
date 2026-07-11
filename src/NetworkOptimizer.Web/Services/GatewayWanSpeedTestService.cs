@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.EntityFrameworkCore;
-using NetworkOptimizer.Storage;
+using NetworkOptimizer.Alerts.Events;
 using NetworkOptimizer.Storage.Models;
 using NetworkOptimizer.UniFi;
 using NetworkOptimizer.Web.Services.Ssh;
@@ -13,6 +13,11 @@ namespace NetworkOptimizer.Web.Services;
 /// Deploys the uwnspeedtest binary to the gateway and runs it on a specific WAN interface,
 /// using UWN's distributed HTTP speed test network for accurate measurement.
 /// This measures true WAN throughput without LAN traversal overhead.
+/// One instance exists per site, owned by <see cref="SpeedTestServiceRegistry"/>:
+/// the test runs on that site's gateway (its own SSH settings) and results land in
+/// that site's database. This is how a remote site's WAN gets speed tested - the
+/// binary runs on the site's gateway, so the measurement never traverses the
+/// path back to this server.
 /// </summary>
 public class GatewayWanSpeedTestService
 {
@@ -23,8 +28,12 @@ public class GatewayWanSpeedTestService
     private readonly IGatewaySshService _gatewaySsh;
     private readonly SshClientService _sshClient;
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
     private readonly INetworkPathAnalyzer _pathAnalyzer;
+    private readonly IAlertEventBus? _alertEventBus;
     private readonly IServiceProvider _serviceProvider;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
 
     // Observable test state (polled by UI components)
     private readonly object _lock = new();
@@ -54,18 +63,37 @@ public class GatewayWanSpeedTestService
 
     public GatewayWanSpeedTestService(
         ILogger<GatewayWanSpeedTestService> logger,
-        IGatewaySshService gatewaySsh,
+        GatewaySshRegistry gatewaySshRegistry,
         SshClientService sshClient,
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         INetworkPathAnalyzer pathAnalyzer,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        Licensing.LicenseStateService? licenseState = null,
+        IAlertEventBus? alertEventBus = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _licenseState = licenseState;
         _logger = logger;
-        _gatewaySsh = gatewaySsh;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _gatewaySsh = gatewaySshRegistry.GetFor(_siteSlug);
         _sshClient = sshClient;
         _dbFactory = dbFactory;
+        _siteDbFactory = siteDbFactory;
         _pathAnalyzer = pathAnalyzer;
+        _alertEventBus = alertEventBus;
         _serviceProvider = serviceProvider;
+    }
+
+    private readonly Licensing.LicenseStateService? _licenseState;
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private NetworkOptimizerDbContext CreateSiteDb()
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return _dbFactory.CreateDbContext();
     }
 
     /// <summary>
@@ -141,8 +169,11 @@ public class GatewayWanSpeedTestService
             if (string.IsNullOrEmpty(settings.Host) || !settings.HasCredentials)
                 return (false, "Gateway SSH not configured");
 
-            // Get connection info for SFTP upload
-            var connection = GetConnectionInfo(settings);
+            // Connection info for the SFTP upload, with decrypted credentials and any
+            // agent-tunnel routing applied by the site's gateway SSH service.
+            var connection = await _gatewaySsh.GetConnectionInfoAsync();
+            if (connection == null)
+                return (false, "Gateway SSH not configured");
 
             _logger.LogInformation("Deploying uwnspeedtest binary to gateway {Host}", settings.Host);
             await _sshClient.UploadBinaryAsync(connection, localPath, RemoteBinaryPath, ct);
@@ -189,6 +220,14 @@ public class GatewayWanSpeedTestService
         bool maxMode = false,
         CancellationToken cancellationToken = default)
     {
+        if (_licenseState != null && !_licenseState.IsSiteOperational(_siteSlug))
+        {
+            _logger.LogWarning("Gateway WAN speed test refused: site {Site} is license-restricted", _siteSlug);
+            lock (_lock) { _currentPhase = "Error"; _currentPercent = 0; _currentStatus = Licensing.LicenseGuard.RestrictedMessage; }
+            onProgress?.Invoke(("Error", 0, Licensing.LicenseGuard.RestrictedMessage));
+            return null;
+        }
+
         lock (_lock)
         {
             if (_isRunning)
@@ -277,7 +316,7 @@ public class GatewayWanSpeedTestService
         var sshTask = _gatewaySsh.RunCommandAsync(
             command, TimeSpan.FromSeconds(120), cancellationToken);
 
-        await AnimateProgress(sshTask, report, cancellationToken);
+        await WanSpeedTestProgressAnimator.AnimateStepsAsync(sshTask, report, cancellationToken);
 
         var result = await sshTask;
 
@@ -323,7 +362,7 @@ public class GatewayWanSpeedTestService
             (1, true) => (6, 24),
             (2, true) => (5, 20),
             (3, true) => (4, 16),
-            (<= 3, false) => (4, 20),
+            ( <= 3, false) => (4, 20),
             (4, _) => (3, 12),
             (5, true) => (3, 12),
             (5, false) => (2, 8),
@@ -341,7 +380,7 @@ public class GatewayWanSpeedTestService
         }).ToList();
 
         var allTask = Task.WhenAll(sshTasks);
-        await AnimateProgress(allTask, report, cancellationToken);
+        await WanSpeedTestProgressAnimator.AnimateStepsAsync(allTask, report, cancellationToken);
 
         var results = await allTask;
 
@@ -510,7 +549,7 @@ public class GatewayWanSpeedTestService
         CancellationToken cancellationToken)
     {
         report("Saving", 98, "Saving results...");
-        await using var db = await _dbFactory.CreateDbContextAsync(cancellationToken);
+        await using var db = CreateSiteDb();
         db.Iperf3Results.Add(testResult);
         await db.SaveChangesAsync(cancellationToken);
         var resultId = testResult.Id;
@@ -522,40 +561,15 @@ public class GatewayWanSpeedTestService
         report("Complete", 100, $"Down: {testResult.DownloadMbps:F1} / Up: {testResult.UploadMbps:F1} Mbps");
         lock (_lock) _lastCompletedResult = testResult;
 
+        // Publish alert event (same wan.speed_completed / wan.speed_degradation
+        // events the server-side WAN tests emit)
+        if (testResult.Success)
+            await WanSpeedAlertPublisher.PublishAsync(_alertEventBus, testResult, () => Task.FromResult(CreateSiteDb()), _logger);
+
         var resolvedWanGroup = testResult.WanNetworkGroup;
         _ = Task.Run(async () => await AnalyzePathInBackgroundAsync(resultId, resolvedWanGroup), CancellationToken.None);
 
         return testResult;
-    }
-
-    private static async Task AnimateProgress(Task sshTask, Action<string, int, string?> report, CancellationToken ct)
-    {
-        // Timeline: discovery/latency ~3.5s, download ~9s (2s warmup + 8s), upload ~9s (2s warmup + 8s)
-        // Total animation: ~21.5s to match actual test duration of ~25s minus overhead
-        var progressSteps = new (string Phase, int Percent, string Status, int DelayMs)[]
-        {
-            ("Discovering servers", 10, "Discovering servers...", 1500),
-            ("Testing latency", 15, "Measuring latency...", 1000),
-            ("Testing download", 22, "Testing download...", 1800),
-            ("Testing download", 30, "Testing download...", 1800),
-            ("Testing download", 38, "Testing download...", 1800),
-            ("Testing download", 44, "Testing download...", 1800),
-            ("Testing download", 50, "Testing download...", 1800),
-            ("Testing upload", 58, "Testing upload...", 1800),
-            ("Testing upload", 66, "Testing upload...", 1800),
-            ("Testing upload", 74, "Testing upload...", 1800),
-            ("Testing upload", 82, "Testing upload...", 1800),
-            ("Testing upload", 90, "Testing upload...", 1800),
-        };
-
-        foreach (var step in progressSteps)
-        {
-            if (sshTask.IsCompleted) break;
-            try { await Task.WhenAny(sshTask, Task.Delay(step.DelayMs, ct)); }
-            catch (OperationCanceledException) { break; }
-            if (!sshTask.IsCompleted)
-                report(step.Phase, step.Percent, step.Status);
-        }
     }
 
     private static void ValidateInterfaceName(string name)
@@ -569,7 +583,7 @@ public class GatewayWanSpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> GetResultsAsync(int count = 50, int hours = 0)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
         // Include historical Cloudflare gateway results alongside new UWN results
         var query = db.Iperf3Results
             .Where(r => r.Direction == SpeedTestDirection.UwnWanGateway
@@ -594,7 +608,7 @@ public class GatewayWanSpeedTestService
     /// </summary>
     public async Task<bool> DeleteResultAsync(int id)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null || (result.Direction != SpeedTestDirection.UwnWanGateway
                             && result.Direction != SpeedTestDirection.CloudflareWanGateway))
@@ -611,7 +625,7 @@ public class GatewayWanSpeedTestService
     /// </summary>
     public async Task<bool> UpdateNotesAsync(int id, string? notes)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null || (result.Direction != SpeedTestDirection.UwnWanGateway
                             && result.Direction != SpeedTestDirection.CloudflareWanGateway))
@@ -627,7 +641,7 @@ public class GatewayWanSpeedTestService
     /// </summary>
     public async Task<bool> UpdateWanAssignmentAsync(int id, string wanNetworkGroup, string? wanName)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null || (result.Direction != SpeedTestDirection.UwnWanGateway
                             && result.Direction != SpeedTestDirection.CloudflareWanGateway))
@@ -719,9 +733,7 @@ public class GatewayWanSpeedTestService
                 Success = false,
                 ErrorMessage = errorMessage,
             };
-            using var scope = _serviceProvider.CreateScope();
-            var db = scope.ServiceProvider.GetRequiredService<IDbContextFactory<NetworkOptimizerDbContext>>();
-            using var context = db.CreateDbContext();
+            using var context = CreateSiteDb();
             context.Iperf3Results.Add(failedResult);
             context.SaveChanges();
             return failedResult;
@@ -739,7 +751,7 @@ public class GatewayWanSpeedTestService
         {
             await Task.Delay(TimeSpan.FromSeconds(1));
 
-            await using var db = await _dbFactory.CreateDbContextAsync();
+            await using var db = CreateSiteDb();
             var result = await db.Iperf3Results.FindAsync(resultId);
             if (result == null) return;
 
@@ -766,19 +778,6 @@ public class GatewayWanSpeedTestService
         {
             _logger.LogWarning(ex, "Failed to analyze path for gateway WAN speed test result {Id}", resultId);
         }
-    }
-
-    private SshConnectionInfo GetConnectionInfo(GatewaySshSettings settings)
-    {
-        // Use the credential protection service to decrypt the password
-        using var scope = _serviceProvider.CreateScope();
-        var credProtection = scope.ServiceProvider.GetRequiredService<NetworkOptimizer.Storage.Services.ICredentialProtectionService>();
-
-        string? decryptedPassword = null;
-        if (!string.IsNullOrEmpty(settings.Password))
-            decryptedPassword = credProtection.Decrypt(settings.Password);
-
-        return SshConnectionInfo.FromGatewaySettings(settings, decryptedPassword);
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()

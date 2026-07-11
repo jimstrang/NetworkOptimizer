@@ -13,7 +13,10 @@
 @inject UniFiSshService SshService
 @inject UniFiConnectionService ConnectionService
 @inject GatewaySpeedTestService GatewaySpeedTestService
-@inject INetworkPathAnalyzer PathAnalyzer
+@inject SpeedTestServiceRegistry SpeedTestRegistry
+@inject SiteContextService SiteContext
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteTunnelRouting TunnelRouting
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject SystemSettingsService SettingsService
@@ -26,7 +29,9 @@
 <div class="page-header">
     <h1>LAN Speed Test</h1>
     <p class="page-description">Test network bandwidth using iperf3</p>
-    @if (localIperf3Status != null && localIperf3Status.IsAvailable)
+    @* Managed sites run LAN tests through their on-site agent, so the central server's
+       iperf3 version is meaningless there - and the agent doesn't report its own. Hide it. *@
+    @if (localIperf3Status != null && localIperf3Status.IsAvailable && SiteContext.IsDefault)
     {
         <div class="iperf3-version-badge">
             <span class="version-label">Server iperf3 version:</span>
@@ -35,13 +40,22 @@
     }
 </div>
 
+<RestrictedSiteNotice />
+
 @if (!_lanScheduleBannerDismissed)
 {
     <div class="alert alert-info" style="margin-bottom:1rem;">
         <div class="banner-content">
             <span class="banner-icon banner-icon-info">i</span>
             <div class="banner-text" style="flex:1;">
-                Schedule recurring LAN speed tests to track performance over time.
+                @if (SiteContext.IsDefault)
+                {
+                    <text>Schedule recurring LAN speed tests to track performance over time.</text>
+                }
+                else
+                {
+                    <text>Scheduled speed tests are per site. Schedule recurring LAN tests for this site to track its performance over time.</text>
+                }
             </div>
             <div class="banner-actions">
                 <a href="/alerts" class="btn btn-sm btn-primary">Set up schedule</a>
@@ -68,6 +82,34 @@
         </div>
     </div>
 </div>
+
+@if (_agentRequired)
+{
+    <div class="alert alert-warning iperf3-missing-alert">
+        <div class="iperf3-missing-content">
+            <div class="iperf3-missing-icon">!</div>
+            <div class="iperf3-missing-text">
+                @if (_siteAgentOffline)
+                {
+                    <strong>Site Agent Offline</strong>
+                    <p>
+                        This site's LAN speed tests run through its on-site agent, which isn't
+                        connected right now. Tests can resume when the agent reconnects.
+                    </p>
+                }
+                else
+                {
+                    <strong>No Site Agent</strong>
+                    <p>
+                        LAN speed tests on a managed site run from its on-site agent, and this
+                        site has none online. Set up the site's agent under
+                        <a href="/settings#multi-site">Settings</a> to enable them.
+                    </p>
+                }
+            </div>
+        </div>
+    </div>
+}
 
 @if (localIperf3Status != null && !localIperf3Status.IsAvailable)
 {
@@ -105,7 +147,7 @@
     </div>
 }
 
-<div class="speedtest-container @(localIperf3Status != null && !localIperf3Status.IsAvailable ? "locked-out" : "")">
+<div class="speedtest-container @((localIperf3Status != null && !localIperf3Status.IsAvailable) || _agentRequired ? "locked-out" : "")">
     <!-- Gateway Speed Test Section -->
     <div class="card" id="gateway-test">
         <div class="card-header">
@@ -124,6 +166,10 @@
                     <span class="spinner"></span>
                     <span>Loading...</span>
                 </div>
+            }
+            else if (!string.IsNullOrEmpty(gatewayLoadError))
+            {
+                <div class="alert alert-danger">@gatewayLoadError</div>
             }
             else if (!gatewayConfigured)
             {
@@ -203,7 +249,7 @@
 
                 <!-- Actions -->
                 <div class="gateway-actions">
-                    <button class="btn btn-primary test-button" style="width: 9.5rem;" @onclick="RunGatewaySpeedTest" disabled="@gatewayRunning">
+                    <button class="btn btn-primary test-button" style="width: 9.5rem;" @onclick="RunGatewaySpeedTest" disabled="@(gatewayRunning || IsLicenseRestricted)">
                         @if (gatewayRunning)
                         {
                             <div class="test-progress">
@@ -266,7 +312,7 @@
     </div>
 
     <!-- SSH Credentials Status -->
-    @if (!sshConfigured)
+    @if (_sshConfigLoaded && !sshConfigured)
     {
         <div class="alert alert-warning">
             <strong>SSH credentials not configured.</strong>
@@ -312,7 +358,7 @@
                     }
                     else
                     {
-                        <text>Connect to your UniFi controller in <a href="/settings">Settings</a> to discover devices.</text>
+                        <text>Connect to your UniFi controller in <a href="/settings#console-connection">Settings</a> to discover devices.</text>
                     }
                 </div>
             }
@@ -433,7 +479,7 @@
         </div>
         <div class="card-body">
             <p class="section-description">
-                Test speed to servers, desktops, and other devices. SSH credentials are configured in <a href="/settings">Settings</a>.
+                Test speed to servers, desktops, and other devices. SSH credentials are configured in <a href="/settings#device-ssh">Settings</a>.
             </p>
 
             @if (devices.Count > 0)
@@ -474,7 +520,7 @@
                                 <td>
                                     <div class="action-buttons">
                                         <button class="btn btn-primary btn-sm test-button" @onclick="() => RunSpeedTest(device)"
-                                                disabled="@(isRunningTest || !device.Enabled || (!sshConfigured && !device.HasOwnCredentials))">
+                                                disabled="@(isRunningTest || !device.Enabled || (!sshConfigured && !device.HasOwnCredentials) || IsLicenseRestricted)">
                                             @if (runningTestHost == device.Host)
                                             {
                                                 <div class="test-progress">
@@ -586,7 +632,7 @@
                     {
                         <div class="form-section-header" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border-color);">
                             <h5 style="margin: 0 0 0.5rem 0; font-size: 0.95rem;">SSH Credential Overrides <span style="font-weight: normal; color: var(--text-muted);">(optional)</span></h5>
-                            <span class="form-help">Leave blank to use global SSH settings from <a href="/settings">Settings</a>. Only fill in fields you want to override.</span>
+                            <span class="form-help">Leave blank to use global SSH settings from <a href="/settings#device-ssh">Settings</a>. Only fill in fields you want to override.</span>
                         </div>
 
                         <div class="form-group">
@@ -929,7 +975,7 @@
             <div class="info-section">
                 <p>This tool tests the network throughput between your Network Optimizer container and UniFi devices:</p>
                 <ol>
-                    <li><strong>SSH Connection:</strong> Connects to the device using the shared credentials from <a href="/settings">Settings</a></li>
+                    <li><strong>SSH Connection:</strong> Connects to the device using the shared credentials from <a href="/settings#device-ssh">Settings</a></li>
                     <li><strong>Start Server:</strong> Launches <code>iperf3 -s</code> on the UniFi device (all UniFi devices have iperf3 built-in)</li>
                     <li><strong>To Device:</strong> Runs <code>iperf3 -c &lt;device&gt; -P 3</code> from the container to measure throughput to the device</li>
                     <li><strong>From Device:</strong> Runs <code>iperf3 -c &lt;device&gt; -P 3 -R</code> to measure throughput from the device</li>
@@ -1169,9 +1215,14 @@
 
     /* Locked out state */
     .speedtest-container.locked-out {
-        opacity: 0.5;
         pointer-events: none;
         user-select: none;
+    }
+
+    .speedtest-container.locked-out > *:not(.alert):not(.card),
+    .speedtest-container.locked-out .card-header,
+    .speedtest-container.locked-out .card-body > *:not(.alert) {
+        opacity: 0.5;
     }
 
     .speedtest-container.locked-out::after {
@@ -1299,9 +1350,25 @@
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
+    // Resolve the current site's path analyzer (not the main-pinned singleton) so historical
+    // and fallback path re-computes trace against this site's topology.
+    private INetworkPathAnalyzer PathAnalyzer => SpeedTestRegistry.GetFor(SiteContext.Slug).PathAnalyzer;
+
     // Local iperf3 availability
     private LocalIperf3Status? localIperf3Status;
     private bool recheckingIperf3 = false;
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected.
+    // LAN tests run through that agent (SSH to devices + throughput at the site),
+    // so they're locked out until it reconnects; the poll re-enables them.
+    private bool _siteAgentOffline;
+    // A managed (non-default) site with no live agent at all - covers both the
+    // via-agent-but-disconnected case (_siteAgentOffline) and a site that has
+    // never set an agent up. LAN tests can't run either way, so the page locks out.
+    private bool _agentRequired;
+    private System.Threading.Timer? _agentStatusTimer;
 
     // Schedule banner
     private bool _lanScheduleBannerDismissed = true; // default hidden until loaded
@@ -1313,6 +1380,7 @@
     private List<ApMapMarker> apMapMarkers = new();
     private Iperf3Result? currentResult;
     private bool sshConfigured = false;
+    private bool _sshConfigLoaded;    // gates the "SSH not configured" warning so it doesn't flash before the check runs
 
     // Pagination
     private int historyPage = 1;
@@ -1323,6 +1391,7 @@
     // Discovered devices from UniFi controller (using unified discovery service)
     private List<DiscoveredDevice> discoveredDevices = new();
     private bool loadingDiscovered = false;
+    private bool _discoveredDevicesLoaded;    // set once the device list has loaded from a connected console; the agent-status poll retries the load when the console reconnects
 
     // Saved devices form state
     private bool showAddDevice = false;
@@ -1380,6 +1449,7 @@
     private bool gatewayExpanded = false;
     private string gatewayMessage = "";
     private string gatewayMessageClass = "";
+    private string? gatewayLoadError;    // set when the gateway SSH settings read fails, so we degrade instead of claiming "not configured"
     private GatewaySpeedTestResult? gatewayLastResult;
     private Iperf3Status? gatewayIperf3Status;
 
@@ -1407,6 +1477,61 @@
         await LoadHistory();
         await LoadDiscoveredDevices();
         await LoadApMarkers();
+
+        await RefreshAgentAvailabilityAsync();
+        StartAgentStatusPolling();
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline. LAN tests run
+    /// through the agent for an agent-backed secondary site, so an offline agent
+    /// locks them out; <see cref="StartAgentStatusPolling"/> re-enables them when
+    /// it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        // A managed site with no live agent can't run LAN tests, full stop: a site
+        // that is via-agent configured but momentarily disconnected gets the
+        // "resumes when it reconnects" message, a site with no agent set up at all
+        // gets pointed at agent setup instead of a runnable-but-wrong test.
+        var agentOnline = TunnelRouting.IsAgentOnline(SiteContext.Slug);
+        _agentRequired = !SiteContext.IsDefault && !agentOnline;
+        _siteAgentOffline = _agentRequired && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug);
+    }
+
+    /// <summary>
+    /// Polls the site's agent tunnel status so LAN tests re-enable on their own
+    /// once the agent reconnects. Only agent-backed secondary sites can go offline,
+    /// so the default site skips the timer entirely.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    var before = (_siteAgentOffline, _agentRequired);
+                    await RefreshAgentAvailabilityAsync();
+                    var changed = before != (_siteAgentOffline, _agentRequired);
+
+                    // The console comes back a moment after the agent tunnel does; once
+                    // it's connected, load the UniFi device list so it populates without
+                    // a manual Refresh.
+                    if (!_discoveredDevicesLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadDiscoveredDevices();
+                        changed = true;
+                    }
+
+                    if (changed)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
     }
 
     private async Task DismissLanScheduleBanner()
@@ -1434,11 +1559,17 @@
     private async Task LoadGatewayConfiguration()
     {
         gatewayLoading = true;
+        gatewayLoadError = null;
         try
         {
             var settings = await GatewaySpeedTestService.GetSettingsAsync();
             gatewayConfigured = settings.Enabled && settings.HasCredentials && !string.IsNullOrEmpty(settings.Host);
             gatewayLastResult = GatewaySpeedTestService.GetLastResult();
+        }
+        catch
+        {
+            gatewayConfigured = false;
+            gatewayLoadError = "Could not check gateway status";
         }
         finally
         {
@@ -1549,6 +1680,10 @@
         catch
         {
             sshConfigured = false;
+        }
+        finally
+        {
+            _sshConfigLoaded = true;
         }
     }
 
@@ -2037,6 +2172,7 @@
                 .Where(d => d.Type != DeviceType.Gateway && d.CanRunIperf3)
                 .OrderBy(d => d.Name)
                 .ToList();
+            _discoveredDevicesLoaded = true;
         }
         catch (Exception ex)
         {
@@ -2257,6 +2393,8 @@
     public void Dispose()
     {
         progressTimer?.Dispose();
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
     }
 
     /// <summary>

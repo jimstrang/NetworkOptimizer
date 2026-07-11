@@ -9,22 +9,42 @@
 @using NetworkOptimizer.Web.Services.Ssh
 @using NetworkOptimizer.UniFi
 @using NetworkOptimizer.Core.Helpers
+@using NetworkOptimizer.Web.Services.Monitoring.IspHealth
 @inject UwnSpeedTestService WanSpeedTestService
 @inject GatewayWanSpeedTestService GatewayWanTestService
 @inject ISqmService SqmService
 @inject IGatewaySshService GatewaySshService
-@inject INetworkPathAnalyzer PathAnalyzer
+@inject SpeedTestServiceRegistry SpeedTestRegistry
+@inject SiteContextService SiteContext
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteTunnelRouting TunnelRouting
 @inject UniFiConnectionService ConnectionService
 @inject IJSRuntime JS
 @inject SystemSettingsService SettingsService
 @inject PullToRefreshState PtrState
+@inject IspHealthService IspHealthService
+@inject NavigationManager NavigationManager
 
 <PageTitle>WAN Speed Test - Network Optimizer</PageTitle>
 
 <div class="speedtest-container wan-speedtest">
-    <div class="page-header">
-        <h1>WAN Speed Test</h1>
+    <div class="page-header wan-speedtest-header">
+        <div class="wan-header-titles">
+            <h1>WAN Speed Test</h1>
+            <p class="page-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
+        </div>
+        @{ var ispHealth = IspHealthService.GetCachedScore(); }
+        <div class="monitoring-stat-card clickable-stat-card isp-health-tile wan-header-isp-tile @ispHealth.TileCssClass" data-tooltip="@ispHealth.TileTooltip" data-tooltip-hover-only @onclick="@(() => NavigationManager.NavigateTo("/monitoring?tab=isp-health"))">
+            <div class="stat-value isp-tile-score">@ispHealth.TileText</div>
+            <div class="stat-label">ISP Health</div>
+            @if (ispHealth.Status == IspHealthStatus.Ready && ispHealth.Score.HasValue)
+            {
+                <div class="isp-tile-bar"><div class="isp-tile-bar-fill" style="width: @(ispHealth.Score)%"></div></div>
+            }
+        </div>
     </div>
+
+    <RestrictedSiteNotice />
 
     @if (!_wanScheduleBannerDismissed)
     {
@@ -32,7 +52,14 @@
             <div class="banner-content">
                 <span class="banner-icon banner-icon-info">i</span>
                 <div class="banner-text" style="flex:1;">
-                    Schedule recurring WAN speed tests to track performance over time.
+                    @if (SiteContext.IsDefault)
+                    {
+                        <text>Schedule recurring WAN speed tests to track performance over time.</text>
+                    }
+                    else
+                    {
+                        <text>Scheduled speed tests are per site. Schedule recurring WAN tests for this site to track its performance over time.</text>
+                    }
                 </div>
                 <div class="banner-actions">
                     <a href="/alerts" class="btn btn-sm btn-primary">Set up schedule</a>
@@ -44,8 +71,10 @@
 
     @* Run Test Card *@
     <div class="card" id="wan-run-test">
+        <div class="card-header">
+            <h2 class="card-title">Run a Speed Test</h2>
+        </div>
         <div class="card-body">
-            <p class="wan-test-description">Measures your internet speed using distributed HTTP servers with multiple concurrent connections.</p>
             <div class="wan-test-options">
                 @* Gateway (Direct) Option - Primary *@
                 <div class="wan-test-option @(_gatewayAvailable ? "" : "wan-test-option-unavailable")">
@@ -85,7 +114,7 @@
                         </label>
                         <button class="btn btn-primary test-button wan-test-button"
                                 @onclick="RunGatewayTest"
-                                disabled="@(_isRunning || !_gatewayAvailable)">
+                                disabled="@(_isRunning || !_gatewayAvailable || IsLicenseRestricted)">
                             @if (_isRunning && _activeTestType == "gateway")
                             {
                                 <div class="test-progress">
@@ -106,12 +135,33 @@
                     <div class="wan-test-option-hint">
                         Deploys a speed test binary to the gateway and runs it directly. Most accurate WAN measurement - no LAN overhead.
                     </div>
+                    @if (!_gatewayAvailable && !_isRunning && !string.IsNullOrEmpty(_gatewayUnavailableReason))
+                    {
+                        var reason = _gatewayUnavailableReason!;
+                        var linkIdx = string.IsNullOrEmpty(_gatewaySettingsHref)
+                            ? -1
+                            : reason.IndexOf("Settings", StringComparison.Ordinal);
+                        <div class="alert alert-warning">
+                            @if (linkIdx >= 0)
+                            {
+                                @reason.Substring(0, linkIdx)<a href="@_gatewaySettingsHref">Settings</a>@reason.Substring(linkIdx + "Settings".Length)
+                            }
+                            else
+                            {
+                                @reason
+                            }
+                        </div>
+                    }
                 </div>
 
                 @* Server Option - Secondary *@
-                <div class="wan-test-option">
+                <div class="wan-test-option @(_serverAvailable ? "" : "wan-test-option-unavailable")">
                     <div class="wan-test-option-header">
                         <span class="wan-test-option-label">Server</span>
+                        @if (!_serverAvailable && !_isRunning)
+                        {
+                            <span class="wan-test-option-badge" data-tooltip="@_serverUnavailableReason">Unavailable</span>
+                        }
                     </div>
                     <div class="wan-test-option-controls">
                         <label class="toggle-switch" data-tooltip="Normal: 4 servers, 20 connections, 8 s. Max Load: up to 12 servers, 48 connections, 8 s for saturating high-bandwidth or congested links." data-tooltip-hover-only>
@@ -121,7 +171,7 @@
                         </label>
                         <button class="btn btn-primary test-button wan-test-button"
                                 @onclick="RunServerTest"
-                                disabled="@_isRunning">
+                                disabled="@(_isRunning || !_serverAvailable || IsLicenseRestricted)">
                             @if (_isRunning && _activeTestType == "server")
                             {
                                 <div class="test-progress">
@@ -368,7 +418,7 @@
                 }
 
                 @* History Table *@
-                <div class="table-responsive" id="history-table">
+                <div class="table-responsive wan-history-table" id="history-table">
                     <table class="data-table">
                         <thead>
                             <tr>
@@ -560,7 +610,32 @@
     </div>
 </div>
 
+<style>
+    .page-header.wan-speedtest-header {
+        align-items: flex-start;
+        justify-content: space-between;
+        flex-wrap: nowrap;
+    }
+    .wan-speedtest-header .wan-header-titles {
+        flex: 1 1 auto;
+        min-width: 0;
+    }
+    .wan-speedtest-header .monitoring-stat-card.wan-header-isp-tile {
+        flex: 0 0 auto;
+        align-self: center;
+        min-width: 100px;
+        min-height: 0;
+        padding: 0.5rem 0.5rem;
+    }
+</style>
+
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
+    // Resolve the current site's path analyzer (not the main-pinned singleton) so historical
+    // path re-computes trace against this site's topology.
+    private INetworkPathAnalyzer PathAnalyzer => SpeedTestRegistry.GetFor(SiteContext.Slug).PathAnalyzer;
+
     // Test state
     private bool _isRunning;
     private bool _maxMode;
@@ -583,6 +658,24 @@
     private List<WanSelectorOption> _wanSelectorOptions = new();
     private bool _gatewayAvailable;
     private string? _gatewayUnavailableReason;
+    private bool _gatewaySshConfigured;      // gateway SSH host+creds present and enabled
+    private string? _gatewaySshUnavailableReason;
+    private string? _gatewaySettingsHref;    // deep link for the "Settings" word in the unavailable reason, when applicable
+    private bool _consoleDataLoaded;         // WAN list/interfaces loaded from a connected console
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected.
+    // Both WAN tests run through that agent, so they can't run until it reconnects.
+    private bool _siteAgentOffline;
+    private bool _serverAvailable = true;
+    private string? _serverUnavailableReason;
+    private System.Threading.Timer? _agentStatusTimer;
+
+    private const string AgentOfflineReason =
+        "This site connects through its on-site agent, which isn't online. WAN speed tests can resume when it reconnects.";
+
+    private const string NoAgentReason =
+        "WAN speed tests on a managed site run from its on-site agent, and this site has none online. " +
+        "Set up the site's agent under Settings > Multi-Site to enable them.";
 
     // Progress interpolation for smooth bar during long phases
     private DateTime _interpStart;
@@ -615,6 +708,7 @@
 
     // Poll timer for tracking in-progress test state
     private System.Threading.Timer? _pollTimer;
+    private System.Threading.Timer? _ispHealthRefreshTimer;
 
     // Chart state
     private ApexChart<WanChartDataPoint>? _chart;
@@ -707,49 +801,23 @@
         // Load WAN list, gateway status, and history in parallel
         var historyTask = LoadHistory(resetPage: true);
         Task? wanTask = null;
-        Task? gatewayTask = null;
 
         if (ConnectionService.IsConnected)
         {
-            wanTask = Task.Run(async () =>
-            {
-                try
-                {
-                    var networks = await ConnectionService.GetNetworksAsync();
-                    var wanNetworks = networks.Where(n => n.IsWan && n.Enabled).ToList();
-                    _hasMultipleWans = wanNetworks.Count > 1;
-                    _availableWans = wanNetworks
-                        .Select(n => new WanOption(
-                            n.WanNetworkgroup ?? "WAN",
-                            !string.IsNullOrEmpty(n.Name) ? n.Name : DisplayFormatters.NormalizeWanDisplay(n.WanNetworkgroup ?? "WAN")))
-                        .ToList();
-
-                    // Load WAN interfaces with physical names for gateway test
-                    _wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
-                }
-                catch { /* Non-critical */ }
-            });
-
-            gatewayTask = Task.Run(async () =>
-            {
-                try
-                {
-                    var gwSettings = await GatewaySshService.GetSettingsAsync();
-                    _gatewayAvailable = !string.IsNullOrEmpty(gwSettings.Host) && gwSettings.HasCredentials && gwSettings.Enabled;
-                    if (!_gatewayAvailable)
-                        _gatewayUnavailableReason = "Gateway SSH not configured. Set up SSH access in the Gateway page.";
-                }
-                catch
-                {
-                    _gatewayAvailable = false;
-                    _gatewayUnavailableReason = "Could not check gateway status";
-                }
-            });
+            wanTask = LoadWanDataAsync();
         }
+
+        // Gateway SSH availability is a DB read - determine it even when the console
+        // (and, on an agent-backed site, the agent) is offline, so the Gateway (Direct)
+        // option recovers on its own when the agent reconnects rather than needing a reload.
+        var gatewayTask = RefreshGatewaySshConfigAsync();
 
         await historyTask;
         if (wanTask != null) await wanTask;
-        if (gatewayTask != null) await gatewayTask;
+        await gatewayTask;
+
+        await RefreshAgentAvailabilityAsync();
+        StartAgentStatusPolling();
 
         BuildWanSelectorOptions();
 
@@ -777,6 +845,172 @@
         // Subscribe to path analysis completion to refresh UI
         WanSpeedTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
         GatewayWanTestService.OnPathAnalysisComplete += OnPathAnalysisComplete;
+
+        StartIspHealthRefresh();
+    }
+
+    // The header ISP Health tile computes its score in the background; poll until it lands so
+    // the value appears without navigating away and back. Only polls while a compute is in
+    // flight - other states (Ready, awaiting the console connection, setup funnels) won't
+    // resolve on their own here; the console-up hook re-arms it once the connection lands.
+    private void StartIspHealthRefresh()
+    {
+        var snapshot = IspHealthService.GetCachedScore();
+        if (snapshot.Status != IspHealthStatus.Computing)
+            return;
+
+        var lastText = snapshot.TileText;
+        var attempts = 0;
+        _ispHealthRefreshTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                var current = IspHealthService.GetCachedScore();
+                if (current.TileText != lastText)
+                {
+                    lastText = current.TileText;
+                    await InvokeAsync(StateHasChanged);
+                }
+                if (++attempts >= 30 || current.Status == IspHealthStatus.Ready)
+                {
+                    _ispHealthRefreshTimer?.Dispose();
+                    _ispHealthRefreshTimer = null;
+                }
+            }
+            catch { }
+        }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    }
+
+    /// <summary>
+    /// Reads gateway SSH availability from settings (a DB read, no console/agent
+    /// required) so the Gateway (Direct) option can be gated even before the console
+    /// connects, and recovers on its own once an offline agent reconnects.
+    /// </summary>
+    private async Task RefreshGatewaySshConfigAsync()
+    {
+        try
+        {
+            var gwSettings = await GatewaySshService.GetSettingsAsync();
+            _gatewaySshConfigured = !string.IsNullOrEmpty(gwSettings.Host) && gwSettings.HasCredentials && gwSettings.Enabled;
+            _gatewaySshUnavailableReason = _gatewaySshConfigured
+                ? null
+                : "Gateway SSH not configured. Set it up in Settings, under the Connection tab.";
+        }
+        catch
+        {
+            _gatewaySshConfigured = false;
+            _gatewaySshUnavailableReason = "Could not check gateway status";
+        }
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline and folds that into
+    /// both WAN test options. For an agent-backed secondary site, the Server (UWN)
+    /// and Gateway (Direct) tests both run through the agent, so an offline agent
+    /// makes them unavailable; <see cref="StartAgentStatusPolling"/> re-enables them
+    /// when it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        // A managed (non-default) site's WAN tests run FROM its on-site agent -
+        // running them from this central server would measure the central
+        // network's WAN and file the result under the managed site. So both
+        // options require a live agent on non-default sites, full stop: a site
+        // that is via-agent configured but momentarily disconnected gets the
+        // "resumes when it reconnects" message, a site with no agent set up at
+        // all gets pointed at agent setup instead of a runnable-but-wrong test.
+        var agentOnline = TunnelRouting.IsAgentOnline(SiteContext.Slug);
+        _siteAgentOffline = !SiteContext.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
+            && !agentOnline;
+        var agentRequired = !SiteContext.IsDefault && !agentOnline;
+        var agentReason = _siteAgentOffline ? AgentOfflineReason : NoAgentReason;
+
+        _serverAvailable = !agentRequired;
+        _serverUnavailableReason = agentRequired ? agentReason : null;
+
+        if (agentRequired)
+        {
+            _gatewayAvailable = false;
+            _gatewayUnavailableReason = agentReason;
+            // Only the "no agent set up" reason points at a settings page; the
+            // "agent offline, resumes when it reconnects" reason is not actionable.
+            _gatewaySettingsHref = _siteAgentOffline ? null : "/settings#multi-site";
+        }
+        else
+        {
+            _gatewayAvailable = _gatewaySshConfigured;
+            _gatewayUnavailableReason = _gatewaySshConfigured ? null : _gatewaySshUnavailableReason;
+            _gatewaySettingsHref = "/settings#gateway-ssh";
+        }
+    }
+
+    /// <summary>
+    /// Polls the site's agent tunnel status so the WAN test options re-enable on
+    /// their own once the agent reconnects. Only agent-backed secondary sites can
+    /// go offline, so the default site skips the timer entirely.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    // Compare on the rendered availability, not just the offline flag:
+                    // a site with no via-agent flag that gains its first agent flips
+                    // _serverAvailable without ever changing _siteAgentOffline.
+                    var before = (_siteAgentOffline, _serverAvailable, _gatewayAvailable);
+                    await RefreshAgentAvailabilityAsync();
+                    var changed = before != (_siteAgentOffline, _serverAvailable, _gatewayAvailable);
+
+                    // The console comes back a moment after the agent tunnel does; once it's
+                    // connected, load the WAN data the Gateway (Direct) test needs so the
+                    // button works on the first click without a manual page refresh.
+                    if (!_consoleDataLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadWanDataAsync();
+                        BuildWanSelectorOptions();
+                        // Expected ISP speeds are now readable, so the tile can compute a
+                        // Speed vs Plan score; kick its background load and value poll.
+                        StartIspHealthRefresh();
+                        changed = true;
+                    }
+
+                    if (changed)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>
+    /// Loads the WAN list and per-interface details from the connected console. These
+    /// feed the Gateway (Direct) selector and are required for a gateway test to run
+    /// (<see cref="RunGatewayTest"/> no-ops with no interfaces). On an agent-backed site
+    /// the console is offline until the agent connects, so this is retried from the poll.
+    /// </summary>
+    private async Task LoadWanDataAsync()
+    {
+        try
+        {
+            var networks = await ConnectionService.GetNetworksAsync();
+            var wanNetworks = networks.Where(n => n.IsWan && n.Enabled).ToList();
+            _hasMultipleWans = wanNetworks.Count > 1;
+            _availableWans = wanNetworks
+                .Select(n => new WanOption(
+                    n.WanNetworkgroup ?? "WAN",
+                    !string.IsNullOrEmpty(n.Name) ? n.Name : DisplayFormatters.NormalizeWanDisplay(n.WanNetworkgroup ?? "WAN")))
+                .ToList();
+
+            // Load WAN interfaces with physical names for gateway test
+            _wanInterfaces = await SqmService.GetWanInterfacesFromControllerAsync();
+            _consoleDataLoaded = true;
+        }
+        catch { /* Non-critical */ }
     }
 
     private void BuildWanSelectorOptions()
@@ -1980,6 +2214,10 @@
     public void Dispose()
     {
         StopPolling();
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
+        _ispHealthRefreshTimer?.Dispose();
+        _ispHealthRefreshTimer = null;
         WanSpeedTestService.OnPathAnalysisComplete -= OnPathAnalysisComplete;
         GatewayWanTestService.OnPathAnalysisComplete -= OnPathAnalysisComplete;
     }

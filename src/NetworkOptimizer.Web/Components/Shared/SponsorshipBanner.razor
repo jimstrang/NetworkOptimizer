@@ -1,5 +1,8 @@
 @using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Web.Services.Licensing
 @inject ISponsorshipService SponsorshipService
+@inject SiteContextService SiteContext
+@inject LicenseStateService LicenseState
 
 @if (_showThankYou)
 {
@@ -88,6 +91,11 @@ else if (_nag != null)
         _ => null
     };
 
+    protected override void OnInitialized()
+    {
+        LicenseState.OnStateChanged += HandleLicenseStateChanged;
+    }
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
@@ -96,8 +104,22 @@ else if (_nag != null)
         }
     }
 
+    // Re-evaluate when license state changes (e.g. a key is added). A now-licensed
+    // install must drop any nag it cached before the license existed - the banner
+    // otherwise holds _nag from its one-time firstRender fetch.
+    private void HandleLicenseStateChanged() => _ = InvokeAsync(async () =>
+    {
+        await LoadNagAsync();
+        StateHasChanged();
+    });
+
     private async Task LoadNagAsync()
     {
+        // The sponsorship nag is a primary-site concern only - never nag while
+        // viewing a managed (non-default) site, including the Settings preview.
+        if (!SiteContext.IsDefault)
+            return;
+
         try
         {
             _nag = await SponsorshipService.GetCurrentNagAsync(AlwaysShow);
@@ -174,6 +196,7 @@ else if (_nag != null)
 
     public void Dispose()
     {
+        LicenseState.OnStateChanged -= HandleLicenseStateChanged;
         _cts?.Cancel();
         _cts?.Dispose();
     }

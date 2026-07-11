@@ -138,6 +138,37 @@ public class IspHealthScorerTests
     }
 
     [Fact]
+    public void Acknowledged_outage_is_excluded_from_penalty_and_findings_but_still_masks_loss()
+    {
+        OutageEvent HourOutage(bool acknowledged) => new()
+        {
+            Start = TestSeries.Start.AddHours(2),
+            End = TestSeries.Start.AddHours(3),
+            PeakLossPct = 100,
+            DegradedTargetCount = 8,
+            PathTargetCount = 9,
+            Acknowledged = acknowledged
+        };
+
+        var unacked = new IspHealthScorer(Options).Score(BuildInputs(outages: new List<OutageEvent> { HourOutage(false) }), Gpon);
+        unacked.OverallScore.Should().BeLessThan(100);
+        unacked.Issues.Should().Contain(i => i.OutageStarts.Count > 0);
+
+        // "That was me": no penalty, no finding, and the dark hour's loss is still masked
+        // from the Packet Loss factor like any blackout (samples inside the span at 100%).
+        var inputs = BuildInputs(outages: new List<OutageEvent> { HourOutage(true) });
+        inputs.LossPoolSeries[0] = inputs.LossPoolSeries[0]
+            .Select(s => s.Time >= TestSeries.Start.AddHours(2) && s.Time < TestSeries.Start.AddHours(3)
+                ? s with { LossPercent = 100 }
+                : s)
+            .ToList();
+        var acked = new IspHealthScorer(Options).Score(inputs, Gpon);
+        acked.OverallScore.Should().Be(100);
+        acked.Issues.Should().NotContain(i => i.OutageStarts.Count > 0);
+        acked.Outages.Should().ContainSingle(o => o.Acknowledged && o.ScorePenaltyPoints == 0);
+    }
+
+    [Fact]
     public void Outage_penalty_scales_with_breadth_and_depth()
     {
         int Drop(OutageEvent o) => 100 - new IspHealthScorer(Options)
@@ -475,6 +506,27 @@ public class IspHealthScorerTests
         var factor = report.AccessDimension.Factors.Single(f => f.Name == "Speed vs Plan");
         factor.Score.Should().Be(100);
         factor.Description.Should().Contain("older than");
+    }
+
+    [Fact]
+    public void Sparse_window_tops_up_to_min_samples_from_before_window()
+    {
+        // Two tests inside the 24 h window plus older tests within the 7-day fallback:
+        // selection reaches back to reach SpeedTestMinSamples (4) and grades all four.
+        // The newest graded test is in-window, so the factor is not marked stale.
+        var report = new IspHealthScorer(Options).Score(BuildInputs(
+            speedTests: new List<SpeedTestSample>
+            {
+                new(TestSeries.Start.AddHours(3), 980, 490),
+                new(TestSeries.Start.AddHours(6), 970, 485),
+                new(TestSeries.Start.AddDays(-1), 960, 480),
+                new(TestSeries.Start.AddDays(-2), 950, 475),
+                new(TestSeries.Start.AddDays(-4), 940, 470)
+            }), Gpon);
+
+        var factor = report.AccessDimension.Factors.Single(f => f.Name == "Speed vs Plan");
+        factor.Description.Should().Contain("Fastest of 4 WAN tests");
+        factor.Description.Should().NotContain("older than");
     }
 
     [Fact]

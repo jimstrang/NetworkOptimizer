@@ -16,7 +16,6 @@ public class NetworkOptimizerDbContext : DbContext
 
     public DbSet<AuditResult> AuditResults { get; set; }
     public DbSet<SqmBaseline> SqmBaselines { get; set; }
-    public DbSet<AgentConfiguration> AgentConfigurations { get; set; }
     public DbSet<LicenseInfo> Licenses { get; set; }
     public DbSet<ModemConfiguration> ModemConfigurations { get; set; }
     public DbSet<DeviceSshConfiguration> DeviceSshConfigurations { get; set; }
@@ -24,6 +23,7 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<UniFiSshSettings> UniFiSshSettings { get; set; }
     public DbSet<GatewaySshSettings> GatewaySshSettings { get; set; }
     public DbSet<DismissedIssue> DismissedIssues { get; set; }
+    public DbSet<OutageAcknowledgement> OutageAcknowledgements { get; set; }
     public DbSet<SystemSetting> SystemSettings { get; set; }
     public DbSet<UniFiConnectionSettings> UniFiConnectionSettings { get; set; }
     public DbSet<SqmWanConfiguration> SqmWanConfigurations { get; set; }
@@ -64,10 +64,52 @@ public class NetworkOptimizerDbContext : DbContext
     public DbSet<ApChannelOutcome> ApChannelOutcomes { get; set; }
     public DbSet<ApChannelChange> ApChannelChanges { get; set; }
     public DbSet<ApNeighborSighting> ApNeighborSightings { get; set; }
+    public DbSet<Site> Sites { get; set; }
+    public DbSet<WanContext> WanContexts { get; set; }
+    public DbSet<SiteAgent> SiteAgents { get; set; }
+    public DbSet<LicenseKeyRecord> LicenseKeyRecords { get; set; }
+    public DbSet<SiteLicenseAssignment> SiteLicenseAssignments { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
+
+        modelBuilder.Entity<Site>(entity =>
+        {
+            entity.ToTable("Sites");
+            entity.HasIndex(e => e.Slug).IsUnique();
+        });
+
+        modelBuilder.Entity<SiteAgent>(entity =>
+        {
+            entity.ToTable("SiteAgents");
+            entity.HasIndex(e => e.SiteId);
+            entity.HasIndex(e => e.EnrollmentTokenHash);
+            entity.HasIndex(e => e.AgentKeyHash);
+        });
+
+        modelBuilder.Entity<LicenseKeyRecord>(entity =>
+        {
+            entity.ToTable("LicenseKeyRecords");
+            entity.HasIndex(e => e.LicenseKey).IsUnique();
+            entity.HasIndex(e => e.Status);
+            entity.HasIndex(e => e.NextCheckAt);
+        });
+
+        modelBuilder.Entity<SiteLicenseAssignment>(entity =>
+        {
+            entity.ToTable("SiteLicenseAssignments");
+            entity.HasIndex(e => e.SiteId).IsUnique();
+            entity.HasIndex(e => e.LicenseKeyRecordId);
+            entity.HasOne<LicenseKeyRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.LicenseKeyRecordId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne<Site>()
+                .WithMany()
+                .HasForeignKey(e => e.SiteId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
 
         // AuditResult configuration
         modelBuilder.Entity<AuditResult>(entity =>
@@ -86,14 +128,6 @@ public class NetworkOptimizerDbContext : DbContext
             entity.HasIndex(e => e.InterfaceId);
             entity.HasIndex(e => new { e.DeviceId, e.InterfaceId }).IsUnique();
             entity.HasIndex(e => e.BaselineStart);
-        });
-
-        // AgentConfiguration configuration
-        modelBuilder.Entity<AgentConfiguration>(entity =>
-        {
-            entity.ToTable("AgentConfigurations");
-            entity.HasIndex(e => e.IsEnabled);
-            entity.HasIndex(e => e.LastSeenAt);
         });
 
         // LicenseInfo configuration
@@ -177,6 +211,13 @@ public class NetworkOptimizerDbContext : DbContext
         {
             entity.ToTable("DismissedIssues");
             entity.HasIndex(e => e.IssueKey).IsUnique();
+        });
+
+        // OutageAcknowledgement configuration ("that was me" on ISP Health outages)
+        modelBuilder.Entity<OutageAcknowledgement>(entity =>
+        {
+            entity.ToTable("OutageAcknowledgements");
+            entity.HasIndex(e => e.OutageStartUtc);
         });
 
         // SystemSetting configuration (key-value store)

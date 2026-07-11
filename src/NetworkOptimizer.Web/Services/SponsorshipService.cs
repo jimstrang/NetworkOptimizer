@@ -78,19 +78,37 @@ public class SponsorshipService : ISponsorshipService
     {
         try
         {
-            using var scope = _serviceProvider.CreateScope();
+            // Async scope: the usage-count path resolves MonitoringInfluxClient, which is
+            // IAsyncDisposable-only, so a synchronous scope dispose would throw.
+            await using var scope = _serviceProvider.CreateAsyncScope();
+
+            // A licensed install has already paid for the product - never nag it for
+            // sponsorship, not even the Settings preview (alwaysShow bypasses the daily
+            // limit and progressive gating, but NOT the license check). Also stay silent
+            // until the license snapshot has been computed at least once: until then
+            // AnyKeysActive fails closed (false), and briefly nagging a licensed install
+            // during startup is worse than a brief silence.
+            var licenseState = scope.ServiceProvider.GetRequiredService<Licensing.LicenseStateService>();
+            if (licenseState.Snapshot == null || licenseState.AnyKeysActive)
+            {
+                return null;
+            }
+
             var settingsService = scope.ServiceProvider.GetRequiredService<ISystemSettingsService>();
 
+            // Sponsorship nag state is instance-wide (one operator), so it always lives in
+            // the MAIN database - the site-routed accessors would read/write a separate
+            // copy per site while browsing secondary sites.
             // Check if user has already marked themselves as a sponsor
-            var alreadySponsorStr = await settingsService.GetAsync(SystemSettingKeys.SponsorshipAlreadySponsor);
+            var alreadySponsorStr = await settingsService.GetGlobalAsync(SystemSettingKeys.SponsorshipAlreadySponsor);
             if (!string.IsNullOrEmpty(alreadySponsorStr) && alreadySponsorStr.Equals("true", StringComparison.OrdinalIgnoreCase))
             {
                 return null;
             }
 
             // Get current state
-            var lastShownLevelStr = await settingsService.GetAsync(SystemSettingKeys.SponsorshipLastShownLevel);
-            var lastNagTimeStr = await settingsService.GetAsync(SystemSettingKeys.SponsorshipLastNagTime);
+            var lastShownLevelStr = await settingsService.GetGlobalAsync(SystemSettingKeys.SponsorshipLastShownLevel);
+            var lastNagTimeStr = await settingsService.GetGlobalAsync(SystemSettingKeys.SponsorshipLastNagTime);
 
             var lastShownLevel = int.TryParse(lastShownLevelStr, out var level) ? level : 0;
             var lastNagTime = DateTime.TryParse(lastNagTimeStr, out var time) ? time : DateTime.MinValue;
@@ -106,7 +124,7 @@ public class SponsorshipService : ISponsorshipService
             }
 
             // Get earned level based on usage
-            var earnedLevel = await GetEarnedLevelInternalAsync(scope);
+            var earnedLevel = await GetEarnedLevelInternalAsync(scope.ServiceProvider);
 
             if (earnedLevel == 0)
             {
@@ -154,8 +172,8 @@ public class SponsorshipService : ISponsorshipService
             var settingsService = scope.ServiceProvider.GetRequiredService<ISystemSettingsService>();
 
             // Save the shown level and timestamp
-            await settingsService.SetAsync(SystemSettingKeys.SponsorshipLastShownLevel, level.ToString());
-            await settingsService.SetAsync(SystemSettingKeys.SponsorshipLastNagTime, DateTime.UtcNow.ToString("O"));
+            await settingsService.SetGlobalAsync(SystemSettingKeys.SponsorshipLastShownLevel, level.ToString());
+            await settingsService.SetGlobalAsync(SystemSettingKeys.SponsorshipLastNagTime, DateTime.UtcNow.ToString("O"));
 
             _logger.LogDebug("Marked sponsorship nag level {Level} as shown", level);
         }
@@ -167,21 +185,21 @@ public class SponsorshipService : ISponsorshipService
 
     public async Task<int> GetUsageCountAsync()
     {
-        using var scope = _serviceProvider.CreateScope();
-        return await GetUsageCountInternalAsync(scope);
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        return await GetUsageCountInternalAsync(scope.ServiceProvider);
     }
 
     public async Task<int> GetEarnedLevelAsync()
     {
-        using var scope = _serviceProvider.CreateScope();
-        return await GetEarnedLevelInternalAsync(scope);
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        return await GetEarnedLevelInternalAsync(scope.ServiceProvider);
     }
 
-    private async Task<int> GetUsageCountInternalAsync(IServiceScope scope)
+    private async Task<int> GetUsageCountInternalAsync(IServiceProvider services)
     {
-        var auditRepository = scope.ServiceProvider.GetRequiredService<IAuditRepository>();
-        var speedTestRepository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
-        var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<NetworkOptimizerDbContext>>();
+        var auditRepository = services.GetRequiredService<IAuditRepository>();
+        var speedTestRepository = services.GetRequiredService<ISpeedTestRepository>();
+        var dbFactory = services.GetRequiredService<IDbContextFactory<NetworkOptimizerDbContext>>();
 
         // Count all usage sources. These run sequentially rather than in parallel: the repositories
         // share a single scoped DbContext (and the factory context below is a single instance too),
@@ -237,7 +255,7 @@ public class SponsorshipService : ISponsorshipService
         count += perfTweakCount * 2;
 
         // Monitoring: flat bonus if InfluxDB is connected, plus 1 per 5 enabled targets
-        var influxClient = scope.ServiceProvider.GetRequiredService<MonitoringInfluxClient>();
+        var influxClient = services.GetRequiredService<MonitoringInfluxClient>();
         if (influxClient.IsConfigured)
         {
             count += MonitoringEnabledBonus;
@@ -247,7 +265,7 @@ public class SponsorshipService : ISponsorshipService
         return count;
     }
 
-    private async Task<int> GetEarnedLevelInternalAsync(IServiceScope scope)
+    private async Task<int> GetEarnedLevelInternalAsync(IServiceProvider services)
     {
         lock (_earnedLevelCacheLock)
         {
@@ -257,7 +275,7 @@ public class SponsorshipService : ISponsorshipService
             }
         }
 
-        var usageCount = await GetUsageCountInternalAsync(scope);
+        var usageCount = await GetUsageCountInternalAsync(services);
         var earnedLevel = UsageCountToLevel(usageCount);
 
         lock (_earnedLevelCacheLock)
@@ -294,7 +312,7 @@ public class SponsorshipService : ISponsorshipService
         {
             using var scope = _serviceProvider.CreateScope();
             var settingsService = scope.ServiceProvider.GetRequiredService<ISystemSettingsService>();
-            await settingsService.SetAsync(SystemSettingKeys.SponsorshipAlreadySponsor, "true");
+            await settingsService.SetGlobalAsync(SystemSettingKeys.SponsorshipAlreadySponsor, "true");
             _logger.LogInformation("User marked as already a sponsor - nags permanently dismissed");
         }
         catch (Exception ex)
@@ -309,7 +327,7 @@ public class SponsorshipService : ISponsorshipService
         {
             using var scope = _serviceProvider.CreateScope();
             var settingsService = scope.ServiceProvider.GetRequiredService<ISystemSettingsService>();
-            var value = await settingsService.GetAsync(SystemSettingKeys.SponsorshipAlreadySponsor);
+            var value = await settingsService.GetGlobalAsync(SystemSettingKeys.SponsorshipAlreadySponsor);
             return !string.IsNullOrEmpty(value) && value.Equals("true", StringComparison.OrdinalIgnoreCase);
         }
         catch (Exception ex)

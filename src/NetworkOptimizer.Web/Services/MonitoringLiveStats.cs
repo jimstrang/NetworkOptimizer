@@ -25,14 +25,54 @@ public class MonitoringLiveStats
     private static readonly TimeSpan TargetCacheTtl = TimeSpan.FromSeconds(30);
     private readonly Lock _targetCacheLock = new();
 
+    private readonly SiteDbContextFactory? _siteDbFactory;
+    private readonly string? _siteSlug;
+
+    /// <param name="siteSlug">
+    /// Non-default site whose database backs the target lookups. Null/empty =
+    /// the default site, reading from the main database as before.
+    /// </param>
     public MonitoringLiveStats(ILogger<MonitoringLiveStats> logger,
-        IDbContextFactory<NetworkOptimizerDbContext> dbFactory)
+        IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        SiteDbContextFactory? siteDbFactory = null,
+        string? siteSlug = null)
     {
         _logger = logger;
         _dbFactory = dbFactory;
+        _siteDbFactory = siteDbFactory;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? null : siteSlug;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteContextAsync(CancellationToken ct)
+    {
+        if (_siteSlug != null && _siteDbFactory != null)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
     }
 
     private readonly ConcurrentDictionary<string, DeviceLiveStats> _stats = new();
+
+    // Last time SNMP data was seen for a device, keyed by normalized MAC. On an
+    // agent-covered site the server never polls SNMP locally (the agent does), so the
+    // collection agent's own last-polled tracker stays empty; the tunnel result sink
+    // stamps this each time a device's SNMP batch arrives, and the SNMP Devices status
+    // table reads it so agent-polled devices show as Polling rather than "not yet polled".
+    private readonly ConcurrentDictionary<string, DateTime> _snmpSeenByMac = new();
+
+    /// <summary>Records that SNMP data was just relayed for a device (agent-covered sites).</summary>
+    public void RecordSnmpSeen(string deviceMac, DateTime timestamp)
+    {
+        if (string.IsNullOrEmpty(deviceMac)) return;
+        _snmpSeenByMac[Normalize(deviceMac)] = timestamp;
+    }
+
+    /// <summary>The last time SNMP data was seen for a device, or null.</summary>
+    public DateTime? GetSnmpLastSeen(string deviceMac)
+    {
+        if (string.IsNullOrEmpty(deviceMac)) return null;
+        return _snmpSeenByMac.TryGetValue(Normalize(deviceMac), out var t) ? t : null;
+    }
 
     /// <summary>Total bytes/sec across all monitored interfaces on this device, plus latency.</summary>
     public DeviceLiveStats? GetForDevice(string deviceMac)
@@ -301,7 +341,7 @@ public class MonitoringLiveStats
                 return _ispTransitTargets;
         }
 
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteContextAsync(ct);
         var targets = await db.MonitoringTargets.AsNoTracking()
             .Where(t => t.Enabled
                 && (t.TargetType == MonitoringTargetType.AccessIsp

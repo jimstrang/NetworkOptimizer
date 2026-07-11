@@ -3,13 +3,13 @@
 <div class="isp-gauge @(Small ? "isp-gauge-small" : "")">
     <svg viewBox="0 0 200 120" class="gauge-svg">
         @* Flat origin, rounded leading end: butt caps with a cap dot at each arc's tip *@
-        <path d="M 20 100 A 80 80 0 0 1 180 100"
+        <path d="@ArcPath"
               fill="none"
               stroke="#232326"
               stroke-width="@StrokeWidth"
               stroke-linecap="butt"/>
         <circle cx="180" cy="100" r="@CapRadius" fill="#232326"/>
-        <path d="M 20 100 A 80 80 0 0 1 180 100"
+        <path d="@ArcPath"
               fill="none"
               stroke="@ScoreColor()"
               stroke-width="@StrokeWidth"
@@ -38,10 +38,22 @@
 
     private string CapRadius => (StrokeWidth / 2.0).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture);
 
-    private string TipX => (100 - 80 * Math.Cos((Score ?? 0) / 100.0 * Math.PI))
+    // The butt origin wraps CCW past 180 degrees toward the cap-radius angle so its span
+    // approaches the rounded leading end's reach. Dialed to 75% of a full mirror by taste.
+    private double Delta => 0.75 * StrokeWidth / 160.0;
+
+    private string ArcStartX => (100 - 80 * Math.Cos(Delta)).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+
+    private string ArcStartY => (100 + 80 * Math.Sin(Delta)).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+
+    private string ArcPath => $"M {ArcStartX} {ArcStartY} A 80 80 0 1 1 180 100";
+
+    private double TipPhi => -Delta + (Score ?? 0) / 100.0 * (Math.PI + Delta);
+
+    private string TipX => (100 - 80 * Math.Cos(TipPhi))
         .ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 
-    private string TipY => (100 - 80 * Math.Sin((Score ?? 0) / 100.0 * Math.PI))
+    private string TipY => (100 - 80 * Math.Sin(TipPhi))
         .ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 
     private string ScoreColor() => Score switch
@@ -55,7 +67,7 @@
 
     private string DashArray()
     {
-        double totalLength = Math.PI * 80;
+        double totalLength = (Math.PI + Delta) * 80;
         double scoreLength = (Score ?? 0) / 100.0 * totalLength;
         return $"{scoreLength} {totalLength - scoreLength}";
     }

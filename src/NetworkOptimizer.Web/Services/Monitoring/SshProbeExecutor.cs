@@ -102,6 +102,12 @@ public class SshProbeExecutor : IProbeExecutor
         TimeSpan? perPingTimeout = null,
         CancellationToken ct = default)
     {
+        // TCP "ping" is repeated TCP connects to the port, not ICMP. Run them on the
+        // vantage itself so the result reflects that host's path (bash /dev/tcp), which
+        // is what the UI promises when TCP mode is selected.
+        if (target.Mode == ProbeMode.Tcp)
+            return await TcpPingViaSshAsync(target, count, perPingTimeout ?? TimeSpan.FromSeconds(2), ct);
+
         var cap = await GetCapabilityAsync(ct);
         if (!cap.CanIcmpPing)
         {
@@ -170,6 +176,68 @@ public class SshProbeExecutor : IProbeExecutor
             ErrorMessage = string.IsNullOrEmpty(output) ? "TCP probe failed" : output,
             Timestamp = DateTime.UtcNow
         };
+    }
+
+    /// <summary>
+    /// TCP "ping" from an SSH vantage: does <paramref name="count"/> real TCP connects to
+    /// the target port on the remote host via bash <c>/dev/tcp</c>, timing each with
+    /// <c>date</c>+<c>awk</c> so the RTT is the vantage's own connect time (not our SSH
+    /// round-trip). Emits one line per attempt - "OK &lt;ms&gt;", "OK" (no timer on this
+    /// host, e.g. busybox <c>date</c> without <c>%N</c>), or "FAIL" - which we aggregate
+    /// into a ping result. Reachability always works; RTT degrades gracefully.
+    /// </summary>
+    private async Task<PingProbeResult> TcpPingViaSshAsync(ProbeTarget target, int count, TimeSpan timeout, CancellationToken ct)
+    {
+        var port = target.Port ?? 443;
+        var timeoutSec = Math.Max(1, (int)timeout.TotalSeconds);
+        var addr = ShellEscape(target.Address);
+
+        var cmd =
+            $"n=0; while [ $n -lt {count} ]; do n=$((n+1)); " +
+            $"s=$(date +%s.%N 2>/dev/null); " +
+            $"if timeout {timeoutSec} bash -c '(echo > /dev/tcp/{addr}/{port})' 2>/dev/null; then " +
+            $"e=$(date +%s.%N 2>/dev/null); " +
+            $"awk -v s=$s -v e=$e 'BEGIN{{d=(e-s)*1000; if(d>0&&d<60000)printf \"OK %.3f\\n\",d; else print \"OK\"}}'; " +
+            $"else echo FAIL; fi; " +
+            $"sleep 0.2 2>/dev/null; done";
+
+        var result = await _ssh.ExecuteCommandAsync(_connection, cmd, TimeSpan.FromSeconds(timeoutSec * count + 15), ct);
+        var lines = (result.Output ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var rtts = new List<double>();
+        var received = 0;
+        foreach (var line in lines)
+        {
+            if (!line.StartsWith("OK", StringComparison.Ordinal)) continue;
+            received++;
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 1 &&
+                double.TryParse(parts[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var ms))
+                rtts.Add(ms);
+        }
+
+        return new PingProbeResult
+        {
+            Target = target,
+            Vantage = Vantage,
+            Sent = count,
+            Received = received,
+            RttMinMs = rtts.Count > 0 ? rtts.Min() : null,
+            RttAvgMs = rtts.Count > 0 ? rtts.Average() : null,
+            RttMaxMs = rtts.Count > 0 ? rtts.Max() : null,
+            JitterMs = rtts.Count > 1 ? StdDev(rtts) : null,
+            ErrorMessage = received == 0
+                ? $"No TCP connect to port {port} (closed/filtered, or bash /dev/tcp unavailable on this vantage)"
+                : null,
+            Timestamp = DateTime.UtcNow
+        };
+    }
+
+    private static double StdDev(IReadOnlyCollection<double> v)
+    {
+        var mean = v.Average();
+        return Math.Sqrt(v.Sum(x => (x - mean) * (x - mean)) / v.Count);
     }
 
     public async Task<TracerouteResult> TracerouteAsync(

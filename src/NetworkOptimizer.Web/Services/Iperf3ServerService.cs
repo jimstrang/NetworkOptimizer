@@ -1,6 +1,6 @@
 using System.Diagnostics;
-using System.Text;
 using System.Text.Json;
+using NetworkOptimizer.AgentProtocol;
 using NetworkOptimizer.Core.Helpers;
 
 namespace NetworkOptimizer.Web.Services;
@@ -12,11 +12,11 @@ namespace NetworkOptimizer.Web.Services;
 public class Iperf3ServerService : BackgroundService
 {
     private readonly ILogger<Iperf3ServerService> _logger;
-    private readonly ClientSpeedTestService _clientSpeedTestService;
+    private readonly SpeedTestServiceRegistry _speedTestRegistry;
     private readonly IConfiguration _configuration;
 
     private Process? _iperf3Process;
-    private const int Iperf3Port = 5201;
+    private const int Iperf3Port = Iperf3ServerArgs.DefaultPort;
 
     // Pause/resume support (used during WAN speed tests to free pipe handles)
     private volatile bool _isPaused;
@@ -24,13 +24,27 @@ public class Iperf3ServerService : BackgroundService
 
     public Iperf3ServerService(
         ILogger<Iperf3ServerService> logger,
-        ClientSpeedTestService clientSpeedTestService,
+        SpeedTestServiceRegistry speedTestRegistry,
         IConfiguration configuration)
     {
         _logger = logger;
-        _clientSpeedTestService = clientSpeedTestService;
+        // Keep the registry, not the resolved client service: resolving
+        // GetDefault() here would build the default speed-test bundle during
+        // construction, and that bundle's UwnSpeedTestService depends back on
+        // this service (via WanSpeedTestServiceBase) - a constructor cycle that
+        // deadlocks host startup. The client service is fetched lazily at the
+        // one use site, by which point this singleton is fully constructed and
+        // the bundle resolves it without re-entering the constructor.
+        _speedTestRegistry = speedTestRegistry;
         _configuration = configuration;
     }
+
+    /// <summary>
+    /// The default site's client speed test service, resolved on demand. The
+    /// local iperf3 server lives on the default site's network; agent sites run
+    /// their own iperf3 next to the agent (results relayed with their slug).
+    /// </summary>
+    private ClientSpeedTestService ClientSpeedTest => _speedTestRegistry.GetDefault().ClientSpeedTest;
 
     /// <summary>
     /// Whether the iperf3 server is currently running
@@ -187,7 +201,7 @@ public class Iperf3ServerService : BackgroundService
         var startInfo = new ProcessStartInfo
         {
             FileName = iperf3Path,
-            Arguments = $"-s -p {Iperf3Port} -J", // Server mode, JSON output
+            Arguments = Iperf3ServerArgs.Build(Iperf3Port), // Server mode, JSON output (shared)
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false,
@@ -197,55 +211,12 @@ public class Iperf3ServerService : BackgroundService
         _iperf3Process = new Process { StartInfo = startInfo };
         var startTime = DateTime.UtcNow;
 
-        // Buffer to accumulate JSON
-        var jsonBuffer = new StringBuilder();
-        var braceCount = 0;
-        var inJson = false;
-
+        // Brace-count the -J stream into complete per-test JSON objects (shared with the agent).
+        var accumulator = new JsonObjectAccumulator();
         _iperf3Process.OutputDataReceived += (sender, e) =>
         {
             if (e.Data == null) return;
-
-            var line = e.Data;
-
-            // Track JSON object boundaries
-            foreach (var ch in line)
-            {
-                if (ch == '{')
-                {
-                    if (!inJson)
-                    {
-                        inJson = true;
-                        jsonBuffer.Clear();
-                    }
-                    braceCount++;
-                }
-
-                if (inJson)
-                {
-                    jsonBuffer.Append(ch);
-                }
-
-                if (ch == '}' && inJson)
-                {
-                    braceCount--;
-                    if (braceCount == 0)
-                    {
-                        // Complete JSON object received
-                        var json = jsonBuffer.ToString();
-                        jsonBuffer.Clear();
-                        inJson = false;
-
-                        // Process asynchronously
-                        _ = ProcessCompletedTestAsync(json);
-                    }
-                }
-            }
-
-            if (inJson)
-            {
-                jsonBuffer.AppendLine();
-            }
+            accumulator.Feed(e.Data, json => _ = ProcessCompletedTestAsync(json));
         };
 
         _iperf3Process.ErrorDataReceived += (sender, e) =>
@@ -306,149 +277,11 @@ public class Iperf3ServerService : BackgroundService
         }
     }
 
-    private async Task ProcessCompletedTestAsync(string json)
-    {
-        try
-        {
-            _logger.LogDebug("Processing iperf3 server test result");
-
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            // Check for errors
-            if (root.TryGetProperty("error", out var errorProp))
-            {
-                var errorMsg = errorProp.GetString();
-                if (!string.IsNullOrEmpty(errorMsg))
-                {
-                    _logger.LogDebug("iperf3 test error: {Error}", errorMsg);
-                    return;
-                }
-            }
-
-            // Extract client IP and server's local IP from connection info
-            string? clientIp = null;
-            string? serverLocalIp = null;
-            if (root.TryGetProperty("start", out var start) &&
-                start.TryGetProperty("connected", out var connected) &&
-                connected.GetArrayLength() > 0)
-            {
-                var firstConn = connected[0];
-                if (firstConn.TryGetProperty("remote_host", out var remoteHost))
-                {
-                    clientIp = remoteHost.GetString();
-                }
-                if (firstConn.TryGetProperty("local_host", out var localHost))
-                {
-                    serverLocalIp = localHost.GetString();
-                }
-            }
-
-            if (string.IsNullOrEmpty(clientIp))
-            {
-                _logger.LogWarning("Could not extract client IP from iperf3 result");
-                return;
-            }
-
-            // Extract test parameters
-            int durationSeconds = 10;
-            int parallelStreams = 1;
-            if (root.TryGetProperty("start", out var startInfo) &&
-                startInfo.TryGetProperty("test_start", out var testStart))
-            {
-                if (testStart.TryGetProperty("duration", out var dur))
-                    durationSeconds = dur.GetInt32();
-                if (testStart.TryGetProperty("num_streams", out var streams))
-                    parallelStreams = streams.GetInt32();
-            }
-
-            // Parse end results - from SERVER perspective:
-            // sum_received = data server received FROM client = "From Device"
-            // sum_sent = data server sent TO client = "To Device"
-            //
-            // For bidir tests, _bidir_reverse fields carry the second direction.
-            // Prefer sum_received variants for bps (accurate goodput from receiver's
-            // measurement). Retransmits come from sum_sent (sender tracks them).
-            double fromDeviceBps = 0;
-            double toDeviceBps = 0;
-            long fromDeviceBytes = 0;
-            long toDeviceBytes = 0;
-            int? fromDeviceRetransmits = null;
-            int? toDeviceRetransmits = null;
-
-            if (root.TryGetProperty("end", out var end))
-            {
-                // From Device: sum_received = server received from client (goodput)
-                if (end.TryGetProperty("sum_received", out var sumReceived))
-                {
-                    fromDeviceBps = sumReceived.GetProperty("bits_per_second").GetDouble();
-                    if (sumReceived.TryGetProperty("bytes", out var bytes))
-                        fromDeviceBytes = bytes.GetInt64();
-                    if (sumReceived.TryGetProperty("retransmits", out var rt))
-                        fromDeviceRetransmits = rt.GetInt32();
-                }
-
-                // To Device: sum_sent = server sent to client
-                if (end.TryGetProperty("sum_sent", out var sumSent))
-                {
-                    toDeviceBps = sumSent.GetProperty("bits_per_second").GetDouble();
-                    if (sumSent.TryGetProperty("bytes", out var bytes))
-                        toDeviceBytes = bytes.GetInt64();
-                    if (sumSent.TryGetProperty("retransmits", out var rt))
-                        toDeviceRetransmits = rt.GetInt32();
-                }
-
-                // Bidir: to-device from _bidir_reverse fields
-                // Server-side JSON only has sum_sent_bidir_reverse (sender's view);
-                // sum_received_bidir_reverse is zero on the server side.
-                if (end.TryGetProperty("sum_sent_bidir_reverse", out var sumSentReverse))
-                {
-                    var reverseBps = sumSentReverse.GetProperty("bits_per_second").GetDouble();
-                    if (reverseBps > 0)
-                    {
-                        toDeviceBps = reverseBps;
-                        if (sumSentReverse.TryGetProperty("bytes", out var bytes))
-                            toDeviceBytes = bytes.GetInt64();
-                        if (sumSentReverse.TryGetProperty("retransmits", out var rt))
-                            toDeviceRetransmits = rt.GetInt32();
-                    }
-                }
-            }
-
-            // Only record if we got meaningful data
-            if (fromDeviceBps > 0 || toDeviceBps > 0)
-            {
-                await _clientSpeedTestService.RecordIperf3ClientResultAsync(
-                    clientIp,
-                    fromDeviceBps,   // DownloadBitsPerSecond = From Device
-                    toDeviceBps,     // UploadBitsPerSecond = To Device
-                    fromDeviceBytes, // DownloadBytes = From Device
-                    toDeviceBytes,   // UploadBytes = To Device
-                    fromDeviceRetransmits,
-                    toDeviceRetransmits,
-                    durationSeconds,
-                    parallelStreams,
-                    json,
-                    serverLocalIp);  // Actual server interface IP from iperf3
-
-                _logger.LogInformation(
-                    "Recorded iperf3 client test from {ClientIp}: From Device {FromDevice:F1} Mbps, To Device {ToDevice:F1} Mbps",
-                    clientIp, fromDeviceBps / 1_000_000, toDeviceBps / 1_000_000);
-            }
-            else
-            {
-                _logger.LogDebug("iperf3 test from {ClientIp} had no measurable data", clientIp);
-            }
-        }
-        catch (JsonException ex)
-        {
-            _logger.LogWarning(ex, "Failed to parse iperf3 server JSON output");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing iperf3 server test result");
-        }
-    }
+    // Client-initiated iperf3 results (the local iperf3 -s captured a LAN client's test) are
+    // parsed and stored by the shared recorder against the default site. Agent sites capture the
+    // same way and relay to /api/public/speedtest/iperf3-results, which records against their site.
+    private Task ProcessCompletedTestAsync(string json)
+        => Iperf3ClientResultRecorder.RecordAsync(ClientSpeedTest, json, _logger);
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {

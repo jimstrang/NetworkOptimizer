@@ -16,11 +16,15 @@ namespace NetworkOptimizer.Web.Services;
 /// <summary>
 /// Service for the Client Dashboard - identifies clients, polls signal quality,
 /// manages signal logs, and provides history data.
+/// Scoped per site: the injected UniFiConnectionService and ClientSpeedTestService forward to
+/// (or are resolved for) the current site, and all signal/speed history reads and writes go
+/// through that site's own database.
 /// </summary>
 public class ClientDashboardService
 {
     private readonly ILogger<ClientDashboardService> _logger;
-    private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
+    private readonly SiteContextService _siteContext;
     private readonly UniFiConnectionService _connectionService;
     private readonly INetworkPathAnalyzer _pathAnalyzer;
     private readonly ClientSpeedTestService _speedTestService;
@@ -48,20 +52,60 @@ public class ClientDashboardService
 
     public ClientDashboardService(
         ILogger<ClientDashboardService> logger,
-        IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         UniFiConnectionService connectionService,
-        INetworkPathAnalyzer pathAnalyzer,
-        ClientSpeedTestService speedTestService,
+        SpeedTestServiceRegistry speedTestRegistry,
         IConfiguration configuration,
-        IServiceScopeFactory scopeFactory)
+        IServiceScopeFactory scopeFactory,
+        SiteContextService siteContext)
     {
         _logger = logger;
-        _dbFactory = dbFactory;
+        _siteDbFactory = siteDbFactory;
+        _siteContext = siteContext;
         _connectionService = connectionService;
-        _pathAnalyzer = pathAnalyzer;
-        _speedTestService = speedTestService;
+        // The path analyzer must be this site's, not the main-pinned singleton, so L2 traces
+        // resolve against the current site's topology.
+        var siteServices = speedTestRegistry.GetFor(_siteContext.Slug);
+        _pathAnalyzer = siteServices.PathAnalyzer;
+        _speedTestService = siteServices.ClientSpeedTest;
         _configuration = configuration;
         _scopeFactory = scopeFactory;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private NetworkOptimizerDbContext CreateSiteDb() => _siteDbFactory.CreateForSite(_siteContext.Slug, _siteContext.IsDefault);
+
+    /// <summary>A device choice for the Client Performance page's manual picker.</summary>
+    public sealed record SelectableClient(string Ip, string Name, bool IsWired);
+
+    /// <summary>
+    /// This site's online clients as picker choices for the Client Performance page. Used on
+    /// managed (non-default) sites when the viewer's LAN address can't be discovered - the
+    /// browser reaches this central server over the WAN, and the on-site agent's whoami probe
+    /// may be unavailable (agent offline, or its certificate untrusted by the browser).
+    /// </summary>
+    public async Task<List<SelectableClient>> GetSelectableClientsAsync()
+    {
+        if (!_connectionService.IsConnected || _connectionService.Client == null)
+            return new List<SelectableClient>();
+        try
+        {
+            var clients = await _connectionService.Client.GetClientsAsync();
+            return (clients ?? new List<UniFiClientResponse>())
+                .Where(c => !string.IsNullOrEmpty(c.BestIp))
+                .Select(c => new SelectableClient(
+                    c.BestIp!,
+                    !string.IsNullOrWhiteSpace(c.Name) ? c.Name
+                        : !string.IsNullOrWhiteSpace(c.Hostname) ? c.Hostname : c.BestIp!,
+                    c.IsWired))
+                .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to load selectable clients for the device picker");
+            return new List<SelectableClient>();
+        }
     }
 
     /// <summary>
@@ -264,7 +308,7 @@ public class ClientDashboardService
     public async Task<List<SignalHistoryEntry>> GetSignalHistoryAsync(
         string mac, DateTime from, DateTime to, int skip = 0, int take = 500)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
 
         var query = db.ClientSignalLogs
             .Where(l => l.ClientMac == mac && l.Timestamp >= from && l.Timestamp <= to)
@@ -304,7 +348,7 @@ public class ClientDashboardService
     public async Task<List<SignalMapPoint>> GetSignalMapPointsAsync(
         string? mac, DateTime from, DateTime to)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
 
         var query = db.ClientSignalLogs
             .Where(l => l.Timestamp >= from && l.Timestamp < to
@@ -373,7 +417,7 @@ public class ClientDashboardService
     public async Task<List<TraceChangeEntry>> GetTraceHistoryAsync(
         string mac, DateTime from, DateTime to)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
 
         var logs = await db.ClientSignalLogs
             .Where(l => l.ClientMac == mac
@@ -413,7 +457,7 @@ public class ClientDashboardService
     public async Task<List<Iperf3Result>> GetSpeedResultsAsync(
         string mac, DateTime from, DateTime to)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
 
         // Include every LAN test direction for this device: server-initiated
         // (we SSH to the device and run iperf3), client-initiated, and browser-based.
@@ -449,7 +493,10 @@ public class ClientDashboardService
         // Try to augment with UniFi controller metrics (5-minute resolution)
         try
         {
+            // Pin the fresh scope to this service's already-resolved site rather than
+            // re-resolving from the ambient HTTP context, which is not guaranteed here.
             using var scope = _scopeFactory.CreateScope();
+            scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteContext.Slug);
             var wifiService = scope.ServiceProvider.GetRequiredService<WiFiOptimizerService>();
 
             var granularity = (to - from).TotalHours > 48
@@ -536,7 +583,10 @@ public class ClientDashboardService
     {
         try
         {
+            // Pinned like GetSignalHistoryWithUniFiAsync: don't re-resolve the site
+            // from the ambient HTTP context in a fresh scope.
             using var scope = _scopeFactory.CreateScope();
+            scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteContext.Slug);
             var wifiService = scope.ServiceProvider.GetRequiredService<WiFiOptimizerService>();
             return await wifiService.GetClientConnectionEventsAsync(mac, limit);
         }
@@ -564,7 +614,7 @@ public class ClientDashboardService
     /// </summary>
     public async Task SubmitGpsAsync(string clientMac, double lat, double lng, int? accuracy)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
 
         var recent = await db.ClientSignalLogs
             .Where(l => l.ClientMac == clientMac && l.Latitude == null)
@@ -585,7 +635,7 @@ public class ClientDashboardService
     /// </summary>
     public async Task CleanupOldLogsAsync(int retentionDays = 90)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = CreateSiteDb();
 
         var cutoff = DateTime.UtcNow.AddDays(-retentionDays);
 
@@ -725,7 +775,7 @@ public class ClientDashboardService
 
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync();
+            await using var db = CreateSiteDb();
 
             var log = new ClientSignalLog
             {
@@ -971,7 +1021,7 @@ public class ClientDashboardService
     {
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync();
+            await using var db = CreateSiteDb();
             // Seed from entries that have TraceJson stored (not just a hash).
             // Entries with a hash but no TraceJson were written without a snapshot,
             // so seeding from them would prevent the next poll from storing one.

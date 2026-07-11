@@ -77,6 +77,237 @@ public class OutageDetectorTests
     }
 
     [Fact]
+    public void Offmap_row_never_anchors_the_break_a_known_hop_does()
+    {
+        // Mirrors the real event that motivated KnownPosition: a hostname-based ISP target
+        // absent from the trace map sorts deepest and stays reachable through the outage.
+        // The break label must come from the deepest CLEAN hop with a known position (by its
+        // ASN), not the off-map target's display name.
+        var internet1 = Series(0, (OutStart, OutEnd, 100));
+        var internet2 = Series(0, (OutStart, OutEnd, 100));
+        var access = Series(0); // clean, known position
+        var transit = Series(0, (OutStart, OutEnd, 100));
+        var offmapSpeedtest = Series(0); // clean, NOT in the trace map
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop-a", 0, access, Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare", 2, internet1),
+            new OutageDetector.Hop("Google", 2, internet2),
+            new OutageDetector.Hop("ISP Speedtest", 3, offmapSpeedtest, Groupable: true, AsnLabel: null, KnownPosition: false),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().Be("Access ISP");
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Only_offmap_rows_clean_falls_back_to_naming_the_dark_network()
+    {
+        // Every trace-mapped hop went dark; only an off-map row stayed reachable. Its
+        // reachability still proves the break was upstream (scope), but it cannot say where -
+        // the event names the shallowest dark network's ASN instead of the off-map target.
+        var internet1 = Series(0, (OutStart, OutEnd, 100));
+        var internet2 = Series(0, (OutStart, OutEnd, 100));
+        var offmap = Series(0); // clean, NOT in the trace map, sorted nearest here
+        var transit = Series(0, (OutStart, OutEnd, 100));
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("ISP Speedtest", 0, offmap, Groupable: true, AsnLabel: null, KnownPosition: false),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare", 2, internet1),
+            new OutageDetector.Hop("Google", 2, internet2),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().Be("Transit Net");
+    }
+
+    [Fact]
+    public void Coalesced_all_dark_runs_read_whole_wan_not_upstream_of_the_deepest_hop()
+    {
+        // Two all-dark runs bridged by a healthy stretch coalesce into one padded window.
+        // Dark duty over the padded window falls below 50% for every hop AT ONCE, which used
+        // to read as "everything stayed reachable" - scope Upstream, break anchored on the
+        // deepest hop, even though every row went dark and recovered together. Duty is now
+        // normalized to the trigger tier's own dark buckets: everything was dark whenever
+        // the internet was dark - a whole-WAN outage.
+        var aEnd = OutStart.AddSeconds(30);
+        var bStart = OutStart.AddSeconds(180);
+        var bEnd = OutStart.AddSeconds(240);
+        var internet1 = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+        var internet2 = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+        var access = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+        var transit = Series(0, (OutStart, aEnd, 100), (bStart, bEnd, 100));
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, access, Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare (1.1.1.1)", 2, internet1, IsInternet: true),
+            new OutageDetector.Hop("Google (8.8.8.8)", 3, internet2, IsInternet: true),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.FullWan);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Internet_endpoint_never_anchors_the_break()
+    {
+        // The deepest clean row here is an internet display row - but "break upstream of a
+        // destination" says nothing (everything is upstream of it). The deepest clean PATH
+        // hop names the break instead.
+        var internet1 = Series(0, (OutStart, OutEnd, 100));
+        var internet2 = Series(0, (OutStart, OutEnd, 100));
+        var access = Series(0);
+        var transit = Series(0, (OutStart, OutEnd, 100));
+        var cleanInternetRow = Series(0);
+
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, access, Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit Net", 1, transit, AsnLabel: "Transit Net"),
+            new OutageDetector.Hop("Cloudflare (1.1.1.1)", 2, internet1, IsInternet: true),
+            new OutageDetector.Hop("Google (8.8.8.8)", 3, cleanInternetRow, IsInternet: true),
+        };
+
+        var events = OutageDetector.Detect(Triggers(internet1, internet2), hops, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().Be("Access ISP");
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Bursty_partial_loss_touching_every_tier_reads_path_wide_not_upstream_of_an_endpoint()
+    {
+        // Miniature of a real event: the nearest access row degraded in a short burst (low duty,
+        // so the duty test alone calls it "clean"), all transit lossy the whole window, internet
+        // endpoints bursty at 67%. The old attribution anchored on the least-lossy internet
+        // endpoint and read "break upstream of Google (8.8.8.8)". Nothing was cleanly reachable,
+        // so no hop may be named and no single network blamed - the event reads path-wide.
+        var ds = OutStart;
+        var de = OutStart.AddMinutes(10);
+        var burstEnd = OutStart.AddMinutes(2);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, burstEnd, 67), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 60), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 60), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 60), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Transit D", 4, LossSeries(ds, de, 60), AsnLabel: "Transit D"),
+            new OutageDetector.Hop("Google (8.8.8.8)", 5, LossSeries(ds, burstEnd, 67), IsInternet: true),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().BeNull();
+        events[0].IsNearTotal.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Total_loss_on_every_hop_that_missed_the_blackout_pass_reads_near_total()
+    {
+        // A short sharp outage that straddles the blackout pass's bucket edges lands in the
+        // partial pass - but 100% peak loss on every reporting hop, access tier included, is
+        // no "partial loss". The event is flagged near-total so the UI reads total loss.
+        var ds = OutStart;
+        var de = OutStart.AddSeconds(40);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, de, 100), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 100), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 100), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 100), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Cloudflare", 4, LossSeries(ds, de, 100), IsInternet: true),
+            new OutageDetector.Hop("Google", 5, LossSeries(ds, de, 100), IsInternet: true),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].IsPartial.Should().BeTrue();
+        events[0].IsNearTotal.Should().BeTrue();
+        events[0].DegradedTargetCount.Should().Be(6);
+        events[0].PathTargetCount.Should().Be(6);
+    }
+
+    [Fact]
+    public void Clean_sibling_branch_deeper_than_the_loss_does_not_anchor()
+    {
+        // Miniature of a real event: bursty loss at the access tier, four transit ASNs lossy
+        // the whole window, one sibling transit branch untouched and sorted deepest. The old
+        // attribution read "break upstream of <the clean sibling>" - but loss starting at the
+        // access tier means the clean deeper row is a parallel branch, not a boundary. No
+        // waterfall shape, no anchor, and the touched access tier also blocks blaming any
+        // single network: path-wide.
+        var ds = OutStart;
+        var de = OutStart.AddMinutes(10);
+        var burstEnd = OutStart.AddMinutes(2);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, burstEnd, 67), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 60), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 60), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 60), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Transit D", 4, LossSeries(ds, de, 60), AsnLabel: "Transit D"),
+            new OutageDetector.Hop("Sibling Transit (+6 ms hop)", 5, LossSeries(ds, de, 0), AsnLabel: "Sibling Transit (+6 ms hop)"),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().BeNull();
+    }
+
+    [Fact]
+    public void Lossy_transit_branch_with_clean_access_is_named_as_the_broken_network()
+    {
+        // The branch-correct localization: access tier fully clean, one transit ASN lossy for
+        // the whole window, its sibling branch clean and deeper. Naming the sibling as "last
+        // reachable" would be wrong; the event names the lossy network itself instead.
+        var ds = OutStart;
+        var de = OutStart.AddMinutes(10);
+        var hops = new[]
+        {
+            new OutageDetector.Hop("access-hop", 0, LossSeries(ds, de, 0), Groupable: true, AsnLabel: "Access ISP"),
+            new OutageDetector.Hop("Transit A", 1, LossSeries(ds, de, 60), AsnLabel: "Transit A"),
+            new OutageDetector.Hop("Transit B", 2, LossSeries(ds, de, 60), AsnLabel: "Transit B"),
+            new OutageDetector.Hop("Transit C", 3, LossSeries(ds, de, 60), AsnLabel: "Transit C"),
+            new OutageDetector.Hop("Transit D", 4, LossSeries(ds, de, 60), AsnLabel: "Transit D"),
+            new OutageDetector.Hop("Sibling Transit (+6 ms hop)", 5, LossSeries(ds, de, 0), AsnLabel: "Sibling Transit (+6 ms hop)"),
+        };
+
+        var events = OutageDetector.DetectPartial(hops, NoDarkWindows, Options);
+
+        events.Should().ContainSingle();
+        events[0].Scope.Should().Be(OutageScope.Upstream);
+        events[0].LastReachableHop.Should().BeNull();
+        events[0].BrokenNetwork.Should().Be("Transit A");
+    }
+
+    [Fact]
     public void Olt_blip_at_onset_then_recovery_still_reads_upstream_and_leads_the_waterfall()
     {
         var internet1 = Series(0, (OutStart, OutEnd, 100));

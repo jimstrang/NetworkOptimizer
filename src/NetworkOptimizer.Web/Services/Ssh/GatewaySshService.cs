@@ -7,6 +7,9 @@ namespace NetworkOptimizer.Web.Services.Ssh;
 /// <summary>
 /// Service for SSH operations on the UniFi gateway/UDM.
 /// Uses SSH.NET via SshClientService for cross-platform support.
+/// One instance exists per site, owned by <see cref="GatewaySshRegistry"/>: settings
+/// come from that site's database and the gateway-host fallback from that site's
+/// console connection, so commands land on the right gateway.
 /// </summary>
 public class GatewaySshService : IGatewaySshService
 {
@@ -15,6 +18,7 @@ public class GatewaySshService : IGatewaySshService
     private readonly SshClientService _sshClient;
     private readonly ICredentialProtectionService _credentialProtection;
     private readonly UniFiConnectionService _connectionService;
+    private readonly string _siteSlug;
 
     // Cache the settings to avoid repeated DB queries
     private GatewaySshSettings? _cachedSettings;
@@ -26,13 +30,51 @@ public class GatewaySshService : IGatewaySshService
         IServiceProvider serviceProvider,
         SshClientService sshClient,
         ICredentialProtectionService credentialProtection,
-        UniFiConnectionService connectionService)
+        SiteConnectionRegistry siteConnections,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
         _logger = logger;
         _serviceProvider = serviceProvider;
         _sshClient = sshClient;
         _credentialProtection = credentialProtection;
-        _connectionService = connectionService;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _connectionService = siteConnections.GetFor(_siteSlug);
+    }
+
+    /// <summary>
+    /// Creates a DI scope pinned to this instance's site so scoped services
+    /// (repositories, DbContext) hit this site's database.
+    /// </summary>
+    private IServiceScope CreateSiteScope()
+    {
+        var scope = _serviceProvider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteSlug);
+        return scope;
+    }
+
+    /// <summary>
+    /// Routes a connection through the site's agent tunnel when the site's devices
+    /// are reached via agent: SSH.NET then dials a loopback proxy port that the
+    /// agent forwards to the real host inside the site's network.
+    /// </summary>
+    /// <remarks>
+    /// The proxied SSH is end-to-end between SSH.NET and the real gateway (the agent
+    /// only pipes bytes), but we intentionally do NOT pin the gateway's SSH host key.
+    /// Hard pinning is impractical: UniFi regenerates host keys on firmware upgrades
+    /// (and adoption/factory reset), so a strict pin would break SSH after routine
+    /// updates and train operators to click through warnings. The residual risk -
+    /// a rogue agent or leaked agentKey presenting a fake gateway to harvest
+    /// credentials - is addressed at the tunnel instead (guard the agentKey,
+    /// IP-allowlist the tunnel endpoint to site IPs, and the planned one-tunnel-
+    /// per-key + source-IP alert), not by host-key pinning here. See the agent
+    /// README "Security and hardening" section and TODO.md.
+    /// </remarks>
+    private async Task<SshConnectionInfo> MaybeRouteViaAgentAsync(SshConnectionInfo connection)
+    {
+        var routing = _serviceProvider.GetService<SiteTunnelRouting>();
+        if (routing == null) return connection;
+        (connection.Host, connection.Port) = await routing.RouteAsync(_siteSlug, connection.Host, connection.Port);
+        return connection;
     }
 
     /// <inheritdoc />
@@ -44,7 +86,7 @@ public class GatewaySshService : IGatewaySshService
             return _cachedSettings;
         }
 
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
 
         var settings = await repository.GetGatewaySshSettingsAsync();
@@ -76,7 +118,7 @@ public class GatewaySshService : IGatewaySshService
     /// <inheritdoc />
     public async Task<GatewaySshSettings> SaveSettingsAsync(GatewaySshSettings settings)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
 
         settings.UpdatedAt = DateTime.UtcNow;
@@ -117,7 +159,7 @@ public class GatewaySshService : IGatewaySshService
 
         try
         {
-            var connection = CreateConnectionInfo(settings);
+            var connection = await CreateConnectionInfoAsync(settings);
             var (success, message) = await _sshClient.TestConnectionAsync(connection);
 
             if (success)
@@ -165,7 +207,7 @@ public class GatewaySshService : IGatewaySshService
 
         try
         {
-            var connection = new SshConnectionInfo
+            var connection = await MaybeRouteViaAgentAsync(new SshConnectionInfo
             {
                 Host = host,
                 Port = port,
@@ -173,7 +215,7 @@ public class GatewaySshService : IGatewaySshService
                 Password = password,
                 PrivateKeyPath = privateKeyPath,
                 Timeout = TimeSpan.FromSeconds(5)
-            };
+            });
 
             var (success, message) = await _sshClient.TestConnectionAsync(connection);
 
@@ -220,16 +262,26 @@ public class GatewaySshService : IGatewaySshService
             return (false, "SSH credentials not configured");
         }
 
-        var connection = CreateConnectionInfo(settings);
+        var connection = await CreateConnectionInfoAsync(settings);
         var result = await _sshClient.ExecuteCommandAsync(connection, command, timeout, cancellationToken);
 
         return (result.Success, result.CombinedOutput);
     }
 
+    /// <inheritdoc />
+    public async Task<SshConnectionInfo?> GetConnectionInfoAsync()
+    {
+        var settings = await GetSettingsAsync();
+        if (!settings.Enabled || string.IsNullOrEmpty(settings.Host) || !settings.HasCredentials)
+            return null;
+        return await CreateConnectionInfoAsync(settings);
+    }
+
     /// <summary>
-    /// Create SshConnectionInfo from gateway settings with decrypted password.
+    /// Create SshConnectionInfo from gateway settings with decrypted password,
+    /// routed through the site's agent tunnel when configured.
     /// </summary>
-    private SshConnectionInfo CreateConnectionInfo(GatewaySshSettings settings)
+    private async Task<SshConnectionInfo> CreateConnectionInfoAsync(GatewaySshSettings settings)
     {
         string? decryptedPassword = null;
         if (!string.IsNullOrEmpty(settings.Password))
@@ -237,7 +289,7 @@ public class GatewaySshService : IGatewaySshService
             decryptedPassword = _credentialProtection.Decrypt(settings.Password);
         }
 
-        return SshConnectionInfo.FromGatewaySettings(settings, decryptedPassword);
+        return await MaybeRouteViaAgentAsync(SshConnectionInfo.FromGatewaySettings(settings, decryptedPassword));
     }
 
     /// <summary>

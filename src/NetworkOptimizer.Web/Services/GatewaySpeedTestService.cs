@@ -1,8 +1,8 @@
 using System.Diagnostics;
 using System.Text.RegularExpressions;
 using NetworkOptimizer.Core.Helpers;
-using NetworkOptimizer.Storage.Interfaces;
 using NetworkOptimizer.Storage.Models;
+using NetworkOptimizer.Storage.Services;
 using NetworkOptimizer.UniFi;
 using NetworkOptimizer.UniFi.Models;
 using NetworkOptimizer.Web.Services.Ssh;
@@ -12,32 +12,51 @@ namespace NetworkOptimizer.Web.Services;
 /// <summary>
 /// Service for running iperf3 speed tests to the gateway.
 /// SSH operations are delegated to IGatewaySshService.
+/// Scoped per site: the injected IGatewaySshService forwards to the current site's gateway,
+/// and results are stored in that site's own database.
 /// </summary>
 public class GatewaySpeedTestService : IGatewaySpeedTestService
 {
     private readonly ILogger<GatewaySpeedTestService> _logger;
-    private readonly IServiceProvider _serviceProvider;
     private readonly IGatewaySshService _gatewaySsh;
     private readonly SystemSettingsService _systemSettings;
     private readonly INetworkPathAnalyzer _pathAnalyzer;
+    private readonly SiteDbContextFactory _siteDbFactory;
+    private readonly SiteContextService _siteContext;
+    private readonly SiteTunnelRouting _tunnelRouting;
+    private readonly AgentIperf3Service _agentIperf3;
 
     // Track running tests
     private bool _isTestRunning = false;
     private GatewaySpeedTestResult? _lastResult;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     public GatewaySpeedTestService(
         ILogger<GatewaySpeedTestService> logger,
-        IServiceProvider serviceProvider,
         IGatewaySshService gatewaySsh,
         SystemSettingsService systemSettings,
-        INetworkPathAnalyzer pathAnalyzer)
+        SpeedTestServiceRegistry speedTestRegistry,
+        SiteDbContextFactory siteDbFactory,
+        SiteContextService siteContext,
+        SiteTunnelRouting tunnelRouting,
+        AgentIperf3Service agentIperf3,
+        Licensing.LicenseStateService licenseState)
     {
+        _licenseState = licenseState;
         _logger = logger;
-        _serviceProvider = serviceProvider;
         _gatewaySsh = gatewaySsh;
         _systemSettings = systemSettings;
-        _pathAnalyzer = pathAnalyzer;
+        _siteDbFactory = siteDbFactory;
+        _siteContext = siteContext;
+        // Use this site's path analyzer (not the main-pinned singleton) so gateway speed-test
+        // path analysis resolves against the current site's topology.
+        _pathAnalyzer = speedTestRegistry.GetFor(_siteContext.Slug).PathAnalyzer;
+        _tunnelRouting = tunnelRouting;
+        _agentIperf3 = agentIperf3;
     }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private NetworkOptimizerDbContext CreateSiteDb() => _siteDbFactory.CreateForSite(_siteContext.Slug, _siteContext.IsDefault);
 
     #region Settings Management (delegated to IGatewaySshService)
 
@@ -228,6 +247,16 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
     /// </summary>
     public async Task<GatewaySpeedTestResult> RunSpeedTestAsync(int durationSeconds, int parallelStreams)
     {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("Gateway speed test refused: site {Site} is license-restricted", _siteContext.Slug);
+            return new GatewaySpeedTestResult
+            {
+                Success = false,
+                Error = Licensing.LicenseGuard.RestrictedMessage
+            };
+        }
+
         if (_isTestRunning)
         {
             return new GatewaySpeedTestResult
@@ -336,9 +365,25 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
         }
     }
 
+    /// <summary>
+    /// Runs the iperf3 client against the gateway for one direction. For an
+    /// agent-backed secondary site the client runs at the site's agent (through the
+    /// same primitive the LAN test uses) so throughput reflects the site's link to
+    /// its gateway; otherwise it runs locally on this server, exactly as before.
+    /// The default site is never routed via agent, so its path is unchanged. The
+    /// reverse flag carries the same "To/From Device" direction over both paths.
+    /// </summary>
     private async Task<(bool success, string output)> RunIperf3ClientAsync(
         string host, int port, int duration, int parallel, bool reverse)
     {
+        if (!_siteContext.IsDefault && await _tunnelRouting.IsViaAgentAsync(_siteContext.Slug))
+        {
+            _logger.LogDebug("Routing gateway iperf3 client to agent for site {Slug} against {Host}:{Port} (reverse={Reverse})",
+                _siteContext.Slug, host, port, reverse);
+            return await _agentIperf3.RunClientAsync(
+                _siteContext.Slug, host, port, duration, parallel, reverse, CancellationToken.None);
+        }
+
         var args = new List<string>
         {
             "-c", host,
@@ -490,15 +535,12 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
     }
 
     /// <summary>
-    /// Save the gateway speed test result to the shared history database
+    /// Save the gateway speed test result to the current site's history database
     /// </summary>
     private async Task SaveResultToHistoryAsync(GatewaySpeedTestResult result, PathAnalysisResult? pathAnalysis)
     {
         try
         {
-            using var scope = _serviceProvider.CreateScope();
-            var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
-
             var historyResult = new Iperf3Result
             {
                 DeviceHost = result.GatewayHost ?? "gateway",
@@ -520,7 +562,9 @@ public class GatewaySpeedTestService : IGatewaySpeedTestService
                 PathAnalysis = pathAnalysis
             };
 
-            await repository.SaveIperf3ResultAsync(historyResult);
+            await using var db = CreateSiteDb();
+            db.Iperf3Results.Add(historyResult);
+            await db.SaveChangesAsync();
 
             _logger.LogDebug("Saved gateway speed test result to history");
         }

@@ -26,20 +26,7 @@ LAN_SPEED_TEST=false
 INSECURE=false
 INSTALL_DIR="/opt/netopt-agent"
 SERVICE_NAME="netopt-agent"
-# ############################################################################
-# ##  ⚠️  TEMPORARY HACK — main ONLY. DO NOT SHIP TO STABLE 2.0 GA.  ⚠️      ##
-# ############################################################################
-# This script lives on `main` purely so the 2.0.0-beta.4 agent-install one-liner
-# (which is baked into the beta app image and fetches this file from `main`)
-# works BEFORE 2.0 GA, without rebuilding the app. It HARDCODES the preview tag
-# below instead of using /releases/latest.
-#
-#   >>> FIX BEFORE MERGING release/2.0-multi-site -> main <<<
-#   Replace the hardcoded tag with real version handling (detect the server's
-#   version or accept --version; default to /releases/latest for stable).
-#   Until then, BUMP this tag on every new beta (beta.2, beta.3, ...).
-# ############################################################################
-RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/download/v2.0.0-beta.5"
+RELEASE_BASE="https://github.com/Ozark-Connect/NetworkOptimizer/releases/latest/download"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -158,6 +145,43 @@ CFGJS
         # runs as an independent master rather than a system-nginx drop-in.
         curl -fsSL "$RAW/docker/agent/nginx.conf" -o "${INSTALL_DIR}/nginx-speedtest-server.conf"
         sed -i "s#root /usr/share/nginx/html;#root ${WEBROOT};#" "${INSTALL_DIR}/nginx-speedtest-server.conf"
+
+        if [ "${AGENT_SPEEDTEST_TLS:-1}" = "0" ]; then
+            # Self-signed TLS opt-out (AGENT_SPEEDTEST_TLS=0 at install time): serve the
+            # speed test listener as plain http - for sites already behind their own
+            # reverse proxy / TLS, or shaving TLS overhead on high-throughput LANs. Strips
+            # ssl from the listener, drops the ssl_* directives, skips cert generation.
+            # The app side must then reach this agent via an http:// per-site speed-test
+            # URL override (the app defaults to https).
+            sed -i \
+                -e 's/^\([[:space:]]*listen[[:space:]][^;]*\) ssl\([^;]*;\)/\1\2/' \
+                -e '/^[[:space:]]*ssl_/d' \
+                "${INSTALL_DIR}/nginx-speedtest-server.conf"
+            echo "AGENT_SPEEDTEST_TLS=0 - LAN speed test will serve plain http on port 3000."
+        else
+            # Persisted self-signed cert for the LAN speed test's TLS listener (secure context
+            # for the browser Geolocation API / GPS-tagged results, no per-site reverse proxy).
+            # SANs cover the host's LAN IPs + hostname; persisted so a client's browser trust
+            # exception survives restarts. Wire the cert paths into the server block.
+            CERTDIR="${INSTALL_DIR}/speedtest-tls"
+            mkdir -p "$CERTDIR"
+            if [ ! -f "$CERTDIR/cert.pem" ] && command -v openssl >/dev/null 2>&1; then
+                IPS=$(hostname -I 2>/dev/null || echo)
+                SAN="DNS:$(hostname),DNS:localhost"
+                for ip in $IPS; do SAN="$SAN,IP:$ip"; done
+                CN=$(echo "$IPS" | awk '{print $1}')
+                openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                    -keyout "$CERTDIR/key.pem" -out "$CERTDIR/cert.pem" \
+                    -subj "/CN=${CN:-agent}" -addext "subjectAltName=$SAN" >/dev/null 2>&1 \
+                    && chmod 600 "$CERTDIR/key.pem" \
+                    || echo "WARNING: self-signed cert generation failed - the LAN speed test won't serve over TLS."
+            fi
+            sed -i \
+                -e "s#__CERTFILE__#${CERTDIR}/cert.pem#" \
+                -e "s#__KEYFILE__#${CERTDIR}/key.pem#" \
+                "${INSTALL_DIR}/nginx-speedtest-server.conf"
+        fi
+
         curl -fsSL "$RAW/docker/agent/nginx-standalone.conf" -o "${INSTALL_DIR}/nginx-speedtest.conf"
         sed -i \
             -e "s#__PIDFILE__#${INSTALL_DIR}/nginx.pid#" \

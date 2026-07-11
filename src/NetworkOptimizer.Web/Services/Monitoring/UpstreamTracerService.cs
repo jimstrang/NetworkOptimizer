@@ -25,11 +25,18 @@ namespace NetworkOptimizer.Web.Services.Monitoring;
 /// </summary>
 public class UpstreamTracerService
 {
+    // Per-site: the site's console + gateway SSH + ISP Health, and the "server" probe
+    // vantage - the local server on the default site, or the on-site agent (running the
+    // same LocalProbeExecutor over the tunnel) on a secondary site, so the traceroute
+    // originates on the site's own network with first-hop logic identical to home.
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
     private readonly UniFiConnectionService _connectionService;
     private readonly IGatewaySshService _gatewaySsh;
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
     private readonly AsnResolutionService _asnResolution;
-    private readonly LocalProbeExecutor _localProbe;
+    private readonly IProbeExecutor _traceExecutor;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IspHealth.IspHealthService _ispHealth;
     private readonly NetworkOptimizer.Audit.Services.IeeeOuiDatabase _ouiDb;
@@ -85,27 +92,40 @@ public class UpstreamTracerService
 
     private record TraceEndpoint(string Label, string Address, bool IsTransitProbe = false, bool EndpointIsTransitHop = false);
 
+    // Built per site by UpstreamTracerRegistry, which resolves the site's console,
+    // gateway SSH, ISP Health, and "server" probe vantage (local on the default site,
+    // on-site agent on a secondary site).
     public UpstreamTracerService(
+        string siteSlug,
+        bool isDefault,
         UniFiConnectionService connectionService,
         IGatewaySshService gatewaySsh,
+        IspHealth.IspHealthService ispHealth,
+        IProbeExecutor traceExecutor,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
         AsnResolutionService asnResolution,
-        LocalProbeExecutor localProbe,
         IServiceScopeFactory scopeFactory,
-        IspHealth.IspHealthService ispHealth,
         NetworkOptimizer.Audit.Services.IeeeOuiDatabase ouiDb,
         ILogger<UpstreamTracerService> logger)
     {
+        _siteSlug = siteSlug;
+        _isDefault = isDefault;
         _connectionService = connectionService;
         _gatewaySsh = gatewaySsh;
+        _ispHealth = ispHealth;
+        _traceExecutor = traceExecutor;
+        _siteDbFactory = siteDbFactory;
         _dbFactory = dbFactory;
         _asnResolution = asnResolution;
-        _localProbe = localProbe;
         _scopeFactory = scopeFactory;
-        _ispHealth = ispHealth;
         _ouiDb = ouiDb;
         _logger = logger;
     }
+
+    /// <summary>The site's own database for persisting upstream discovery state.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateDbAsync(CancellationToken ct = default) =>
+        _isDefault ? await _dbFactory.CreateDbContextAsync(ct) : _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
 
     /// <summary>
     /// Rehydrate the in-memory <see cref="State"/> from persisted DB rows when
@@ -119,7 +139,7 @@ public class UpstreamTracerService
         if (State.Step != TracerStep.Idle) return;
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateDbAsync(ct);
             var ctx = await db.WanDiscoveryContexts
                 .OrderByDescending(c => c.LastDiscoveryAt ?? c.UpdatedAt)
                 .FirstOrDefaultAsync(ct);
@@ -240,7 +260,7 @@ public class UpstreamTracerService
     {
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateDbAsync(ct);
             var ctx = await db.WanDiscoveryContexts
                 .OrderByDescending(c => c.LastDiscoveryAt ?? c.UpdatedAt)
                 .FirstOrDefaultAsync(ct);
@@ -478,7 +498,7 @@ public class UpstreamTracerService
         // tracer completes.
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateDbAsync(ct);
             var settings = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (settings != null)
             {
@@ -584,7 +604,7 @@ public class UpstreamTracerService
         // survives across discovery runs and is available to MonitoringPathView.
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateDbAsync(ct);
             var settings = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (settings != null)
             {
@@ -892,7 +912,7 @@ public class UpstreamTracerService
         var target = new ProbeTarget(endpoint.Address, mode);
         try
         {
-            var result = await _localProbe.TracerouteAsync(target, maxHops: 30,
+            var result = await _traceExecutor.TracerouteAsync(target, maxHops: 30,
                 perHopTimeout: TimeSpan.FromSeconds(1),
                 totalDeadline: TimeSpan.FromSeconds(10),
                 ct: ct);
@@ -904,7 +924,7 @@ public class UpstreamTracerService
             return (endpoint.Label, new TracerouteResult
             {
                 Target = target,
-                Vantage = _localProbe.Vantage,
+                Vantage = _traceExecutor.Vantage,
                 ModeUsed = mode,
                 Hops = Array.Empty<TraceHop>(),
                 Reached = false,
@@ -1014,16 +1034,23 @@ public class UpstreamTracerService
         foreach (var group in transitGroups)
         {
             // Per-ASN selection: the parallel ICMP+UDP sweep already captured every
-            // hop that responded, so the chosen target is just the lowest-hop entry
-            // in this ASN. TCP/443 probing was considered as a fallback for ASNs with
-            // no responders but rejected: (1) we have 10k+ users and SYN-probing
-            // transit routers looks like scanning to NOCs; (2) transit routers don't
+            // hop that responded; candidates come from those responders, clumped
+            // below. TCP/443 probing was considered as a fallback for ASNs with
+            // no responders but rejected: (1) SYN-probing transit routers from
+            // every install looks like scanning to NOCs; (2) transit routers don't
             // serve 443 so a RST doesn't reflect anything real; (3) ACLs drop most
             // of them silently anyway. The path-proxy block below covers unenumerated
             // transit ASNs cleanly by monitoring the CDN destination instead.
             var asn = group.First().Asn!;
-            var hopsInOrder = group.OrderBy(h => h.HopNumber).Take(3).ToList();
 
+            // An ASN typically spans its ingress POP near the access network and,
+            // several ms later, a distant egress POP - and across the merged pool
+            // of heterogeneous traces only RTT separates those POPs, never hop
+            // numbers. Carry the nearest responders as candidates; selection is
+            // provisional here (nearest hop) and is refined after the reachability
+            // pass, which clusters the ASN's hops by verified RTT and enables the
+            // lowest-RTT gate-clearing hop in each cluster.
+            var hopsInOrder = group.OrderBy(h => h.HopNumber).Take(MaxTransitCandidatesPerAsn).ToList();
             foreach (var hop in hopsInOrder)
             {
                 candidates.Add(new TransitAsnCandidate
@@ -1035,6 +1062,7 @@ public class UpstreamTracerService
                     HopAddress = hop.Address,
                     HopHostname = hop.Hostname,
                     RespondedTo = hop.RespondedTo,
+                    HopNumber = hop.HopNumber,
                     Enabled = hop == hopsInOrder.First()
                 });
             }
@@ -1101,7 +1129,7 @@ public class UpstreamTracerService
         // Reconcile ALL candidates (transit + path-end) and access hops against
         // existing DB targets. Enabled → pre-check; disabled → uncheck.
         // Absorb descriptive names over numbered fallbacks.
-        await using var reconcileDb = await _dbFactory.CreateDbContextAsync(ct);
+        await using var reconcileDb = await CreateDbAsync(ct);
         var allExisting = await reconcileDb.MonitoringTargets
             .AsNoTracking()
             .ToListAsync(ct);
@@ -1115,6 +1143,7 @@ public class UpstreamTracerService
             if (existingByAddress.TryGetValue(addr, out var existing))
             {
                 c.Enabled = existing.Enabled;
+                c.PreservedFromExisting = true;
                 if (!string.IsNullOrEmpty(existing.Name))
                     c.Label = existing.Name;
             }
@@ -1136,6 +1165,84 @@ public class UpstreamTracerService
         State.CurrentActivity = candidates.Count > 0
             ? $"Discovered {transitCount} transit ASN(s) and {proxyCount} path-end target(s)."
             : "No transit ASNs or path-end targets identified.";
+    }
+
+    /// <summary>RTT clumps monitored per transit ASN (near ingress + far egress).</summary>
+    internal const int MaxClumpsPerAsn = 2;
+
+    /// <summary>Responding hops carried as candidates per transit ASN.</summary>
+    internal const int MaxTransitCandidatesPerAsn = 6;
+
+    /// <summary>Minimum RTT step (ms) that starts a new clump within an ASN's run.</summary>
+    internal const double RttClumpStepFloorMs = 2.0;
+
+    /// <summary>
+    /// Fractional RTT step that starts a new clump, for high-RTT paths where a few ms
+    /// is noise. Kept below the floor's reach until ~20 ms so the 2 ms floor governs
+    /// the low-RTT regime - at metro RTTs, anything over 2 ms IS the next POP.
+    /// </summary>
+    internal const double RttClumpStepFraction = 0.10;
+
+    /// <summary>
+    /// Post-verification auto-selection: sorts each transit ASN's gate-clearing hops
+    /// by verified RTT and clusters them where the RTT steps up by more than
+    /// max(<see cref="RttClumpStepFloorMs"/>, <see cref="RttClumpStepFraction"/> of the
+    /// previous hop) - the signature of the long-haul link between two of the ASN's
+    /// POPs. Hop numbers are deliberately NOT used for ordering: the candidates come
+    /// from the merged pool of heterogeneous traces, whose hop numbers interleave
+    /// meaninglessly across paths (the same warning the near-transit window handles
+    /// per trace above); RTT is the physical quantity that actually separates POPs.
+    /// The lowest-RTT NET-NEW hop in each of the first <see cref="MaxClumpsPerAsn"/>
+    /// clusters is enabled. Candidates reconciled from existing targets are never
+    /// flipped in either direction: an existing enabled row keeps covering its
+    /// cluster (no second pick is added beside it), and an existing disabled row is
+    /// never re-enabled - a disabled row can be a flaky-target verdict, not just an
+    /// old default. ASNs with no gate-clearing hop end up with nothing enabled, which
+    /// is what lets the downstream witness/fallback injection step in.
+    /// </summary>
+    internal static void ApplyTransitClumpSelection(IEnumerable<TransitAsnCandidate> candidates)
+    {
+        var byAsn = candidates
+            .Where(c => c.Method == DiscoveryMethod.DirectRouter)
+            .GroupBy(c => c.AsnNumber);
+        foreach (var asnGroup in byAsn)
+        {
+            var byRtt = asnGroup
+                .Where(c => !c.Unreachable && c.VerifiedRttMs.HasValue)
+                .OrderBy(c => c.VerifiedRttMs!.Value)
+                .ThenBy(c => c.HopNumber)
+                .ToList();
+
+            var clumps = new List<List<TransitAsnCandidate>>();
+            foreach (var c in byRtt)
+            {
+                if (clumps.Count > 0)
+                {
+                    var prevRtt = clumps[^1][^1].VerifiedRttMs!.Value;
+                    if (c.VerifiedRttMs!.Value - prevRtt > Math.Max(RttClumpStepFloorMs, prevRtt * RttClumpStepFraction))
+                        clumps.Add(new List<TransitAsnCandidate>());
+                }
+                else
+                {
+                    clumps.Add(new List<TransitAsnCandidate>());
+                }
+                clumps[^1].Add(c);
+            }
+
+            var winners = new HashSet<TransitAsnCandidate>();
+            foreach (var clump in clumps.Take(MaxClumpsPerAsn))
+            {
+                if (clump.Any(c => c.PreservedFromExisting && c.Enabled)) continue;
+                var winner = clump.FirstOrDefault(c => !c.PreservedFromExisting);
+                if (winner != null) winners.Add(winner);
+            }
+
+            foreach (var c in asnGroup)
+            {
+                if (c.PreservedFromExisting) continue;
+                c.Enabled = winners.Contains(c);
+            }
+        }
     }
 
     // Reachability gate: a candidate must answer enough pings in a short rapid burst (200 ms
@@ -1160,7 +1267,7 @@ public class UpstreamTracerService
 
     /// <summary>Rapid ping burst used for reachability verification.</summary>
     private Task<PingProbeResult> ProbeReachabilityAsync(string address, ProbeMode mode, CancellationToken ct) =>
-        _localProbe.PingAsync(new ProbeTarget(address, mode),
+        _traceExecutor.PingAsync(new ProbeTarget(address, mode),
             count: ReachabilityPingCount, perPingTimeout: TimeSpan.FromSeconds(2), ct: ct);
 
     private async Task VerifyReachabilityAsync(CancellationToken ct)
@@ -1187,7 +1294,11 @@ public class UpstreamTracerService
         {
             if (result.Received >= minSuccesses)
             {
-                t.ApplyRtt(result.RttAvgMs);
+                // Burst MINIMUM, not average: this RTT feeds the POP clustering, and
+                // a single queued reply in the average drags a near hop into the far
+                // cluster (observed: a 11.3 ms hop measuring 14.7 avg bridged two
+                // POPs). The minimum is the standard path-distance estimator.
+                t.ApplyRtt(result.RttMinMs ?? result.RttAvgMs);
             }
             else
             {
@@ -1197,6 +1308,13 @@ public class UpstreamTracerService
                     result.Received, result.Sent, t.Address, minSuccesses);
             }
         }
+
+        // With verified RTTs in hand, refine the provisional per-clump picks: enable
+        // the lowest-RTT hop that cleared the gate in each of an ASN's clumps (near
+        // ingress + far egress), instead of blindly keeping the lowest hop number.
+        // Runs before witness injection so an ASN that ends up with a selection
+        // doesn't also get a witness.
+        ApplyTransitClumpSelection(State.TransitAsns);
 
         // Item A: if Level 3 (AS3356) is on the path but no AS3356 router cleared the gate, inject
         // 4.2.2.2 as a transit witness so ISP Health still has Lumen transit data.
@@ -1608,7 +1726,7 @@ public class UpstreamTracerService
     {
         if (State.Step != TracerStep.ReviewingResults) return;
 
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateDbAsync(ct);
 
         // Scope all writes to the WAN this discovery ran against. Multi-WAN setups
         // get one row in MonitoringTargets per (target, wan) and one row in

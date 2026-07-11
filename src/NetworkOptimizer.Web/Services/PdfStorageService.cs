@@ -5,21 +5,39 @@ namespace NetworkOptimizer.Web.Services;
 /// <summary>
 /// Service for storing and retrieving pre-generated PDF reports.
 /// PDFs are stored on disk to avoid JS interop issues on mobile browsers.
+/// Scoped per site: the default site uses the root directory (unchanged from
+/// single-site installs), and each secondary site's PDFs live under their own
+/// slug subdirectory since AuditResults.Id autoincrements independently in each
+/// site's database.
 /// </summary>
 public class PdfStorageService
 {
     private readonly ILogger<PdfStorageService> _logger;
+    private readonly SiteContextService _siteContext;
     private readonly string _pdfDirectory;
 
-    public PdfStorageService(ILogger<PdfStorageService> logger)
+    public PdfStorageService(ILogger<PdfStorageService> logger, SiteContextService siteContext)
     {
         _logger = logger;
+        _siteContext = siteContext;
         _pdfDirectory = GetPdfDirectory();
 
-        // Ensure directory exists
+        // Ensure the root directory exists; the per-site subdirectory (below) is
+        // created lazily on write since the site isn't known until resolved.
         Directory.CreateDirectory(_pdfDirectory);
         _logger.LogInformation("PDF storage directory: {Directory}", _pdfDirectory);
     }
+
+    /// <summary>
+    /// This site's PDF directory. AuditResults.Id autoincrements per-site database,
+    /// so two sites can produce the same audit ID - namespacing by slug keeps their
+    /// PDFs from colliding. The default site keeps the original root path so PDFs
+    /// generated before multi-site stay findable (same layout as floor plans);
+    /// secondary sites nest under their slug.
+    /// </summary>
+    private string SitePdfDirectory => _siteContext.IsDefault
+        ? _pdfDirectory
+        : Path.Combine(_pdfDirectory, _siteContext.Slug);
 
     private static string GetPdfDirectory()
     {
@@ -54,8 +72,9 @@ public class PdfStorageService
     {
         try
         {
-            // Ensure directory exists (may have been deleted)
-            Directory.CreateDirectory(_pdfDirectory);
+            // Ensure the site's directory exists (may have been deleted, or this may
+            // be the first PDF saved for this site)
+            Directory.CreateDirectory(SitePdfDirectory);
 
             var filePath = GetPdfPath(auditId);
 
@@ -104,7 +123,7 @@ public class PdfStorageService
     /// </summary>
     public string GetPdfPath(int auditId)
     {
-        return Path.Combine(_pdfDirectory, $"audit_{auditId}.pdf");
+        return Path.Combine(SitePdfDirectory, $"audit_{auditId}.pdf");
     }
 
     /// <summary>
@@ -115,8 +134,12 @@ public class PdfStorageService
     {
         try
         {
+            // Nothing to clean up if this site has never saved a PDF yet.
+            if (!Directory.Exists(SitePdfDirectory))
+                return;
+
             var validSet = validAuditIds.ToHashSet();
-            var files = Directory.GetFiles(_pdfDirectory, "audit_*.pdf");
+            var files = Directory.GetFiles(SitePdfDirectory, "audit_*.pdf");
 
             foreach (var file in files)
             {

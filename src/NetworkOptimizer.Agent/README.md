@@ -3,9 +3,9 @@
 Runs at a remote site and reports back to a central Network Optimizer server.
 Capabilities: enrollment, a persistent outbound gRPC tunnel with REST
 heartbeat fallback, latency/loss probing (with per-WAN source IP binding),
-SNMP monitoring relay, UniFi Console proxying over the tunnel, and LAN speed
-test serving (OpenSpeedTest page + iperf3). Planned: SSH proxying over the
-tunnel.
+SNMP monitoring relay, TCP proxying into the site over the tunnel (SSH to the
+gateway and devices, and the UniFi Console), and LAN speed test serving
+(OpenSpeedTest page + iperf3).
 
 The agent connects to a **single URL** - the central server's reverse-proxied
 HTTPS address (the same host you open the app at, derived from the server's
@@ -52,6 +52,37 @@ Both scripts accept:
 - `--insecure` - accept a self-signed cert on the server's reverse proxy
 - `--dir PATH` - override the install directory
 
+### Speed test listener: TLS, plain HTTP, and reverse proxies
+
+The LAN speed test listener serves self-signed HTTPS by default (a secure
+context, so browser geolocation works for GPS-tagged results). Two supported
+deviations, and **both require updating the site's speed test URL override in
+the central app** (Settings > Multi-Site > the site's Configuration), because
+the app builds agent speed-test links as `https://<agent LAN IP>:3000` by
+default:
+
+- **Plain HTTP opt-out**: set `AGENT_SPEEDTEST_TLS=0` (an environment variable
+  on the Docker container, or in the environment when running
+  `install-native.sh`) to skip cert generation and serve HTTP on port 3000 -
+  e.g. to avoid the self-signed trust prompt or shave TLS overhead on a
+  high-throughput LAN. Then set the site's URL override to the matching
+  `http://<agent>:3000` address.
+- **Your own reverse proxy / TLS in front of the agent**: point the site's URL
+  override at the proxy's address (e.g. `https://speedtest.site.example.com`).
+  The auto-detected agent LAN IP would otherwise bypass your proxy and hit the
+  self-signed listener directly.
+
+If the two sides disagree (agent serving HTTP while the app links `https://`,
+or vice versa), the speed test page simply won't load - fix the URL override
+to match how the agent actually serves.
+
+Note for the plain-HTTP opt-out: browsers block an https page from posting to
+an `http://` LAN address (mixed content), so an HTTP-mode agent cannot receive
+the WAN speed test post-back from an external test server - WAN results on
+that site lose their client attribution. The opt-out is intended for LAN
+speed tests (same-origin) only; keep TLS on agents whose sites run WAN tests
+through `/wan/`.
+
 Re-running either script updates the agent in place and preserves the enrolled
 key. To build from source instead (development, or an architecture without a
 published binary), see below.
@@ -87,6 +118,12 @@ the LAN speed test is enabled (it serves the OpenSpeedTest page + transfer legs)
 address as reachable from the site - over a site-to-site VPN or a public
 address. The agent refuses anything but HTTPS. Self-signed certificates work
 with `"ignoreSslErrors": true`; plain `http://` never does.
+
+> **Only enable `ignoreSslErrors` for a self-signed server.** It disables TLS
+> certificate validation on the tunnel and result post-back entirely, which
+> opens the whole channel to a man-in-the-middle. If your central server has a
+> valid (CA-signed) certificate - which it should in production - leave this
+> `false` (the default).
 
 3. Run the binary (optionally pass a config path, default `agent.json`; or set
    `NO_AGENT_CONFIG`):
@@ -203,6 +240,45 @@ Everything rides that one TLS session: heartbeats, probe and SNMP traffic
 (including SNMP credentials pushed to the agent), and proxied UniFi Console
 connections - which are additionally HTTPS end-to-end inside the tunnel.
 
+## Security and hardening
+
+The agent dials out only, so the site never exposes an inbound port - a real
+posture win. The flip side is that the central server it dials into can SSH into
+this site's gateway, and a gateway is the LAN router, so that reach is
+effectively LAN-wide. That makes the **central server the highest-value target**
+in the whole setup, and hardening it the priority:
+
+- **IP-allowlist both planes.** Restrict the admin/management surface *and* the
+  agent tunnel endpoint to your sites' public IPs. Commercial sites are stable,
+  and residential WAN IPs are sticky enough in practice (often unchanged for a
+  year) that this stays maintainable - you touch it only when a site's IP
+  actually changes. A stolen `agentKey` used from a random address then dies at
+  the firewall before the bearer key is ever presented; the key and
+  rate-limiting stay as defense-in-depth behind it.
+- **Guard the `agentKey`.** It lives in `agent.json` (file permissions matter)
+  and is revocable server-side. Treat it like a credential.
+- **Keep TLS real.** Leave `ignoreSslErrors` at its default `false`; only enable
+  it for a self-signed server, and know it opens the whole channel to a MITM.
+
+A compromised central server is game-over for the gateways it manages, and that
+is inherent to centralized gateway management, not a flaw of the tunnel - no
+protocol trick changes it, which is exactly why protecting the server is the
+whole ballgame.
+
+Two controls we deliberately did **not** build, so the reasoning is on record:
+
+- **An agent-side allowlist on proxy dial targets** would contain nothing.
+  Gateway SSH already reaches the entire LAN, so anything with gateway access
+  pivots through it; restricting what the agent may dial doesn't limit a
+  compromised server, it just adds complexity.
+- **Pinning the gateway's SSH host key** is impractical here: UniFi regenerates
+  host keys on firmware upgrades (and adoption/factory reset), so a strict pin
+  would break SSH after routine updates and train operators to click through
+  warnings. The residual risk it would guard - a rogue agent presenting a fake
+  gateway - is better addressed at the tunnel (guard the key, IP-allowlist, and
+  one-tunnel-per-key), with at most a soft "host key changed" alert that never
+  blocks.
+
 ## Local dev / testing
 
 Build for the site box's architecture and copy the single binary over - no build
@@ -242,6 +318,12 @@ them to the central server tagged with the site slug and the client's real IP, s
 they land in the site's own database with no CORS or exposure of the central
 server to browsers. If an `iperf3` binary is on the agent's PATH, an iperf3 server
 (port 5201) runs alongside for wired/CLI throughput tests.
+
+The address the central server hands to site clients for these tests is the
+agent's auto-detected LAN IPv4 (`DetectLocalIpFromInterfaces`). With the default
+host networking that is correct; if the agent can't see the real LAN address
+(Docker bridge mode, or a multi-NIC host picks the wrong interface), set
+`NO_AGENT_LAN_IP=<ip>` in its environment to override it.
 
 ## Probe-only mode for multi-WAN monitoring
 

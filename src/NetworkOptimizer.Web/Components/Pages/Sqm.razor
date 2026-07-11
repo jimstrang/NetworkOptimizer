@@ -5,6 +5,8 @@
 @inject UniFiConnectionService ConnectionService
 @inject NetworkOptimizer.Storage.Interfaces.ISpeedTestRepository SpeedTestRepository
 @inject TcMonitorClient SqmMonitorClient
+@inject SiteContextService SiteContext
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
 @inject IGatewaySshService GatewaySshService
 @inject IJSRuntime JS
 @inject ILogger<Sqm> Logger
@@ -23,6 +25,8 @@
     <h1>Adaptive SQM Manager</h1>
     <p class="page-description">Dynamic bandwidth optimization with dual-mode (Speedtest + Ping) adjustment. Uses 7-day congestion profiles tuned for your connection type to keep SQM tight and bufferbloat in check. Queue memory and burst sizes are scaled to your WAN speed to prevent hard packet drops - reducing collateral impact on other devices and slightly improving overall throughput.</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized && !string.IsNullOrEmpty(ConnectionService.LastError))
 {
@@ -159,7 +163,7 @@
                         @if (!ConnectionService.IsConnected)
                         {
                             <strong>UniFi Console Not Connected:</strong>
-                            <span>Adaptive SQM needs a working UniFi Console connection to detect your WAN interfaces. Go to <a href="/settings">Settings</a> to configure your Console connection.</span>
+                            <span>Adaptive SQM needs a working UniFi Console connection to detect your WAN interfaces. Go to <a href="/settings#console-connection">Settings</a> to configure your Console connection.</span>
                         }
                         else
                         {
@@ -891,7 +895,7 @@
                 }
 
                 <div class="action-buttons">
-                    <button class="btn btn-primary" @onclick="DeploySqm" disabled="@isDeploying">
+                    <button class="btn btn-primary" @onclick="DeploySqm" disabled="@(isDeploying || IsLicenseRestricted)">
                         @if (isDeploying)
                         {
                             <span class="spinner-border spinner-border-sm"></span>
@@ -903,7 +907,7 @@
                         }
                     </button>
                     <span title="@(deploymentStatus?.IsDeployed != true ? "Deploy SQM scripts first" : "")">
-                        <button class="btn btn-secondary" @onclick="DeployTcMonitor" disabled="@(isDeploying || deploymentStatus?.IsDeployed != true)">
+                        <button class="btn btn-secondary" @onclick="DeployTcMonitor" disabled="@(isDeploying || deploymentStatus?.IsDeployed != true || IsLicenseRestricted)">
                             Deploy SQM Monitor Only
                         </button>
                     </span>
@@ -1548,6 +1552,8 @@
 </style>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     // Cache settings
     private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(5);
     private static DateTime _lastStatusCheck = DateTime.MinValue;
@@ -1694,11 +1700,20 @@
 
     private async void OnConnectionChanged()
     {
-        // Connection changed (reconnect after server restart, etc.) - refresh all data
-        await LoadSavedConfigsAsync();
-        await RefreshStatus(forceRefresh: true);
-        await LoadSqmMonitorDataAsync();
-        await InvokeAsync(StateHasChanged);
+        // Connection changed (reconnect after server restart, etc.) - refresh all data.
+        // Fires from a background thread, so marshal the whole reload onto the dispatcher
+        // and swallow exceptions so this async void handler can't crash the circuit.
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                await LoadSavedConfigsAsync();
+                await RefreshStatus(forceRefresh: true);
+                await LoadSqmMonitorDataAsync();
+                StateHasChanged();
+            });
+        }
+        catch { /* component may be disposed */ }
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -2373,7 +2388,7 @@
                     var (gatewayHost, tcPort) = await GetGatewayConnectionAsync();
                     if (!string.IsNullOrEmpty(gatewayHost))
                     {
-                        sqmMonitorData = await SqmMonitorClient.GetTcStatsAsync(gatewayHost, tcPort, forceRefresh: true);
+                        sqmMonitorData = await SqmMonitorClient.GetTcStatsAsync(gatewayHost, tcPort, forceRefresh: true, siteSlug: SiteContext.Slug);
                         tcInterfaces = sqmMonitorData?.GetAllInterfaces();
                     }
                 }
@@ -3163,7 +3178,7 @@
             var (gatewayHost, tcPort) = await GetGatewayConnectionAsync();
             if (!string.IsNullOrEmpty(gatewayHost))
             {
-                sqmMonitorData = await SqmMonitorClient.GetTcStatsAsync(gatewayHost, tcPort, forceRefresh: true);
+                sqmMonitorData = await SqmMonitorClient.GetTcStatsAsync(gatewayHost, tcPort, forceRefresh: true, siteSlug: SiteContext.Slug);
                 tcInterfaces = sqmMonitorData?.GetAllInterfaces();
 
                 // Adjust polling rate based on speedtest status

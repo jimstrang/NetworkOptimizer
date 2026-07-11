@@ -5,7 +5,9 @@
 @using NetworkOptimizer.Core.Enums
 @implements IDisposable
 @inject MonitoringLiveStats LiveStats
-@inject IDbContextFactory<NetworkOptimizerDbContext> DbFactory
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject SiteContextService SiteCtx
+@inject MonitoringInfluxClient InfluxClient
 @inject UniFiConnectionService ConnectionService
 @inject IspHealthService IspHealthService
 @inject IJSRuntime JS
@@ -201,7 +203,21 @@ else
         await LoadDataAsync();
         _refreshTimer = new System.Threading.Timer(async _ =>
         {
-            try { await InvokeAsync(StateHasChanged); }
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    // The dashboard renders this panel eagerly, before an external site's console
+                    // connection (which establishes in the background) is up - so the first
+                    // LoadDataAsync gets no devices and the gateway identity stays null, blanking
+                    // WAN rates and gateway CPU/Mem/Temp/RTT until a manual nav away and back.
+                    // Re-load once the connection lands to resolve the gateway (and flip _ready so
+                    // the map mounts); the map's own polling re-fetches its topology from there.
+                    if (ConnectionService.IsConnected && (!_ready || _gatewayMac == null))
+                        await LoadDataAsync();
+                    StateHasChanged();
+                });
+            }
             catch { }
         }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(3));
     }
@@ -275,11 +291,22 @@ else
     {
         try
         {
-            await using var db = await DbFactory.CreateDbContextAsync();
+            // Per-site: read this site's own MonitoringSettings/targets, and gate on the
+            // current site's (derived) InfluxDB client being configured rather than the
+            // site row's token/url - a secondary site's row has no token of its own
+            // (it derives the shared connection from main), so checking the row would
+            // wrongly report the Live View as unconfigured.
+            await using var db = SiteDb.CreateForSite(SiteCtx.Slug, SiteCtx.IsDefault);
             var settings = await db.MonitoringSettings.FirstOrDefaultAsync();
-            if (settings == null || !settings.Enabled
-                || string.IsNullOrEmpty(settings.InfluxDbToken)
-                || string.IsNullOrEmpty(settings.InfluxDbUrl))
+            if (settings == null || !settings.Enabled)
+            {
+                _ready = false;
+                return;
+            }
+
+            if (!InfluxClient.IsConfigured)
+                await InfluxClient.ReconfigureAsync();
+            if (!InfluxClient.IsConfigured)
             {
                 _ready = false;
                 return;

@@ -57,6 +57,51 @@ public class SystemSettingsService : ISystemSettingsService
     }
 
     /// <summary>
+    /// Get a GLOBAL (instance-wide) setting from the MAIN database, regardless of the
+    /// current site. <see cref="GetAsync"/> routes to the current site's database, which
+    /// is correct for genuinely per-site keys but wrong for values shared across all
+    /// sites (Mapbox token, CrowdSec config): on a secondary site those would read that
+    /// site's own empty SystemSettings row. Callers for shared keys must use this.
+    /// </summary>
+    public async Task<string?> GetGlobalAsync(string key)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<NetworkOptimizerDbContext>>();
+        await using var db = await dbFactory.CreateDbContextAsync();
+        var setting = await db.SystemSettings.FindAsync(key);
+        return setting?.Value;
+    }
+
+    /// <summary>
+    /// Set a GLOBAL (instance-wide) setting in the MAIN database, regardless of the
+    /// current site. Pair with <see cref="GetGlobalAsync"/> for shared keys.
+    /// </summary>
+    public async Task SetGlobalAsync(string key, string? value)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<NetworkOptimizerDbContext>>();
+        await using var db = await dbFactory.CreateDbContextAsync();
+        var setting = await db.SystemSettings.FindAsync(key);
+        if (setting == null)
+            db.SystemSettings.Add(new SystemSetting { Key = key, Value = value });
+        else
+            setting.Value = value;
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>Get a GLOBAL setting as int with default (see <see cref="GetGlobalAsync"/>).</summary>
+    public async Task<int> GetGlobalIntAsync(string key, int defaultValue)
+    {
+        var value = await GetGlobalAsync(key);
+        if (string.IsNullOrEmpty(value) || !int.TryParse(value, out var result))
+            return defaultValue;
+        return result;
+    }
+
+    /// <summary>Set a GLOBAL setting as int (see <see cref="SetGlobalAsync"/>).</summary>
+    public Task SetGlobalIntAsync(string key, int value) => SetGlobalAsync(key, value.ToString());
+
+    /// <summary>
     /// Get a setting value as int with default
     /// </summary>
     public async Task<int> GetIntAsync(string key, int defaultValue)
@@ -89,53 +134,57 @@ public class SystemSettingsService : ISystemSettingsService
     /// </summary>
     public Task SetIntAsync(string key, int value) => SetAsync(key, value.ToString());
 
+    // iperf3 test settings are GLOBAL (instance-wide): they're an operator preference
+    // that applies to every site's speed tests, and the local-iperf3 availability
+    // cache describes the single app host, so all of these use the main database.
+
     /// <summary>
     /// Get iperf3 test duration setting
     /// </summary>
     public Task<int> GetIperf3DurationAsync() =>
-        GetIntAsync(SystemSettingKeys.Iperf3Duration, DefaultIperf3Duration);
+        GetGlobalIntAsync(SystemSettingKeys.Iperf3Duration, DefaultIperf3Duration);
 
     /// <summary>
     /// Set iperf3 test duration setting
     /// </summary>
     public Task SetIperf3DurationAsync(int value) =>
-        SetIntAsync(SystemSettingKeys.Iperf3Duration, value);
+        SetGlobalIntAsync(SystemSettingKeys.Iperf3Duration, value);
 
     /// <summary>
     /// Get iperf3 gateway parallel streams setting
     /// </summary>
     public Task<int> GetIperf3GatewayParallelStreamsAsync() =>
-        GetIntAsync(SystemSettingKeys.Iperf3GatewayParallelStreams, DefaultIperf3GatewayParallelStreams);
+        GetGlobalIntAsync(SystemSettingKeys.Iperf3GatewayParallelStreams, DefaultIperf3GatewayParallelStreams);
 
     /// <summary>
     /// Set iperf3 gateway parallel streams setting
     /// </summary>
     public Task SetIperf3GatewayParallelStreamsAsync(int value) =>
-        SetIntAsync(SystemSettingKeys.Iperf3GatewayParallelStreams, value);
+        SetGlobalIntAsync(SystemSettingKeys.Iperf3GatewayParallelStreams, value);
 
     /// <summary>
     /// Get iperf3 UniFi device parallel streams setting
     /// </summary>
     public Task<int> GetIperf3UniFiParallelStreamsAsync() =>
-        GetIntAsync(SystemSettingKeys.Iperf3UniFiParallelStreams, DefaultIperf3UniFiParallelStreams);
+        GetGlobalIntAsync(SystemSettingKeys.Iperf3UniFiParallelStreams, DefaultIperf3UniFiParallelStreams);
 
     /// <summary>
     /// Set iperf3 UniFi device parallel streams setting
     /// </summary>
     public Task SetIperf3UniFiParallelStreamsAsync(int value) =>
-        SetIntAsync(SystemSettingKeys.Iperf3UniFiParallelStreams, value);
+        SetGlobalIntAsync(SystemSettingKeys.Iperf3UniFiParallelStreams, value);
 
     /// <summary>
     /// Get iperf3 other device parallel streams setting
     /// </summary>
     public Task<int> GetIperf3OtherParallelStreamsAsync() =>
-        GetIntAsync(SystemSettingKeys.Iperf3OtherParallelStreams, DefaultIperf3OtherParallelStreams);
+        GetGlobalIntAsync(SystemSettingKeys.Iperf3OtherParallelStreams, DefaultIperf3OtherParallelStreams);
 
     /// <summary>
     /// Set iperf3 other device parallel streams setting
     /// </summary>
     public Task SetIperf3OtherParallelStreamsAsync(int value) =>
-        SetIntAsync(SystemSettingKeys.Iperf3OtherParallelStreams, value);
+        SetGlobalIntAsync(SystemSettingKeys.Iperf3OtherParallelStreams, value);
 
     /// <summary>
     /// Get all iperf3 settings as a DTO
@@ -191,9 +240,9 @@ public class SystemSettingsService : ISystemSettingsService
     /// </summary>
     public async Task<LocalIperf3Status?> GetCachedLocalIperf3StatusAsync()
     {
-        var availableStr = await GetAsync(SystemSettingKeys.Iperf3LocalAvailable);
-        var version = await GetAsync(SystemSettingKeys.Iperf3LocalVersion);
-        var lastCheckedStr = await GetAsync(SystemSettingKeys.Iperf3LocalLastChecked);
+        var availableStr = await GetGlobalAsync(SystemSettingKeys.Iperf3LocalAvailable);
+        var version = await GetGlobalAsync(SystemSettingKeys.Iperf3LocalVersion);
+        var lastCheckedStr = await GetGlobalAsync(SystemSettingKeys.Iperf3LocalLastChecked);
 
         if (string.IsNullOrEmpty(availableStr) || string.IsNullOrEmpty(lastCheckedStr))
             return null;
@@ -221,9 +270,9 @@ public class SystemSettingsService : ISystemSettingsService
     /// </summary>
     private async Task CacheLocalIperf3StatusAsync(LocalIperf3Status status)
     {
-        await SetAsync(SystemSettingKeys.Iperf3LocalAvailable, status.IsAvailable.ToString());
-        await SetAsync(SystemSettingKeys.Iperf3LocalVersion, status.Version);
-        await SetAsync(SystemSettingKeys.Iperf3LocalLastChecked, status.LastChecked.ToString("O"));
+        await SetGlobalAsync(SystemSettingKeys.Iperf3LocalAvailable, status.IsAvailable.ToString());
+        await SetGlobalAsync(SystemSettingKeys.Iperf3LocalVersion, status.Version);
+        await SetGlobalAsync(SystemSettingKeys.Iperf3LocalLastChecked, status.LastChecked.ToString("O"));
     }
 
     /// <summary>

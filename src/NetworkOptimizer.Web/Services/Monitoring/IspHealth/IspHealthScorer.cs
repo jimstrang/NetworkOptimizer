@@ -24,9 +24,10 @@ public class IspHealthScorer
     private AccessProfile? _profile;
 
     // Only blackout outages mask their loss from the other factors; partial-loss disruptions are
-    // deliberately left in the Packet Loss factor (their loss IS the degradation signal), so they
-    // are excluded here.
-    private bool InOutage(DateTime time) => _outages.Any(o => !o.IsPartial && time >= o.Start && time < o.End);
+    // deliberately left in the Packet Loss factor (their loss IS the degradation signal) - unless
+    // the user marked one "that was me", where the whole span is their own doing and must not
+    // leak into the loss factors either.
+    private bool InOutage(DateTime time) => _outages.Any(o => (!o.IsPartial || o.Acknowledged) && time >= o.Start && time < o.End);
 
     public IspHealthScorer(IspHealthOptions options, ILogger? logger = null)
     {
@@ -119,7 +120,9 @@ public class IspHealthScorer
         // Both components are scaled by the event's time-of-day usage weight (1.0 unless the service
         // set it): an outage during the user's heavy-usage hours counts in full, one during typically
         // idle hours dings less.
-        var wanOutages = inputs.Outages.Where(o => o.Scope != OutageScope.Local).ToList();
+        // Acknowledged ("that was me") outages are the user's own maintenance, not the ISP:
+        // excluded from the penalty like Local ones, while their dark windows still mask loss.
+        var wanOutages = inputs.Outages.Where(o => o.Scope != OutageScope.Local && !o.Acknowledged).ToList();
         double EffectiveMinutes(OutageEvent o) => o.Duration.TotalMinutes *
             (o.IsPartial ? Math.Clamp(o.PeakLossPct / 100.0, 0, 1) * _options.OutagePartialPenaltyWeight : 1.0)
             * o.UsageWeight;
@@ -285,17 +288,30 @@ public class IspHealthScorer
     }
 
     /// <summary>
-    /// Picks the WAN speed tests to grade: those inside the score window, else the
-    /// most recent within SpeedTestFallbackDays (marked stale).
+    /// Picks the WAN speed tests to grade. Prefers those inside the score window; when the
+    /// window holds fewer than <see cref="IspHealthOptions.SpeedTestMinSamples"/>, tops up with
+    /// the most recent tests from before the window (reaching back no further than
+    /// SpeedTestFallbackDays) so a sparse window still grades on a stable sample. Marked stale
+    /// only when the window itself is empty - the newest graded test then predates it.
     /// </summary>
     private (List<SpeedTestSample> Tests, bool Stale) SelectSpeedTests(IspHealthInputs inputs)
     {
-        var inWindow = inputs.WanSpeedTests.Where(t => t.Time >= inputs.WindowStart && t.Time <= inputs.WindowEnd).ToList();
-        if (inWindow.Count > 0) return (inWindow, false);
+        var inWindow = inputs.WanSpeedTests
+            .Where(t => t.Time >= inputs.WindowStart && t.Time <= inputs.WindowEnd)
+            .OrderByDescending(t => t.Time)
+            .ToList();
+        if (inWindow.Count >= _options.SpeedTestMinSamples) return (inWindow, false);
 
         var fallbackStart = inputs.WindowEnd.AddDays(-_options.SpeedTestFallbackDays);
-        var latest = inputs.WanSpeedTests.Where(t => t.Time >= fallbackStart).OrderByDescending(t => t.Time).FirstOrDefault();
-        return latest == null ? (new List<SpeedTestSample>(), false) : (new List<SpeedTestSample> { latest }, true);
+        var borrowed = inputs.WanSpeedTests
+            .Where(t => t.Time >= fallbackStart && t.Time < inputs.WindowStart)
+            .OrderByDescending(t => t.Time)
+            .Take(_options.SpeedTestMinSamples - inWindow.Count)
+            .ToList();
+
+        var combined = inWindow.Concat(borrowed).ToList();
+        if (combined.Count == 0) return (new List<SpeedTestSample>(), false);
+        return (combined, inWindow.Count == 0);
     }
 
     /// <summary>
@@ -1231,7 +1247,9 @@ public class IspHealthScorer
         // shouldn't read as the same event as a multi-minute outage. Both ride the same severity
         // curve (a brief disruption costs at most a point), so the per-event score share is taken
         // from the already-attributed ScorePenaltyPoints rather than recomputing the curve per group.
-        var wanOutages = inputs.Outages.Where(o => o.Scope != OutageScope.Local).ToList();
+        // Acknowledged ("that was me") outages were the user's own doing and are left out of the
+        // findings entirely, same as the penalty.
+        var wanOutages = inputs.Outages.Where(o => o.Scope != OutageScope.Local && !o.Acknowledged).ToList();
         var fullOutages = wanOutages.Where(o => !o.IsPartial && !o.IsBrief).ToList();
         var briefDisruptions = wanOutages.Where(o => !o.IsPartial && o.IsBrief).ToList();
         var partialDisruptions = wanOutages.Where(o => o.IsPartial).ToList();
@@ -1265,7 +1283,8 @@ public class IspHealthScorer
                     ? "No action needed on your side for an upstream outage; it is logged here so you can correlate it with ISP incidents."
                     : "Logged here so you can correlate it with ISP incidents; if the first ISP hop keeps dropping, check your modem/ONT and the line to your ISP.",
                 LinkUrl = "#isp-outages",
-                LinkText = "The recovery shape is shown on the timeline below."
+                LinkText = "The recovery shape is shown on the timeline below.",
+                OutageStarts = fullOutages.Select(o => o.Start).ToList()
             });
         }
         if (briefDisruptions.Count > 0)
@@ -1291,7 +1310,8 @@ public class IspHealthScorer
                 Description = $"{count} occurred while the Monitoring Agent kept probing (so {(multiple ? "these are real, not monitoring gaps" : "this is real, not a monitoring gap")}).{where}{impact}{UsageNote(briefDisruptions)}",
                 Recommendation = "Short drops like these are usually transient upstream or transit events; logged here so you can spot a pattern of flapping.",
                 LinkUrl = "#isp-outages",
-                LinkText = "Shown on the timeline below."
+                LinkText = "Shown on the timeline below.",
+                OutageStarts = briefDisruptions.Select(o => o.Start).ToList()
             });
         }
         if (partialDisruptions.Count > 0)
@@ -1313,6 +1333,9 @@ public class IspHealthScorer
                 Recommendation = "Coincident partial loss across many targets is usually upstream/transit congestion or a brief routing wobble; logged so you can correlate it with ISP incidents or watch for a pattern.",
                 LinkUrl = "#isp-outages",
                 LinkText = "Shown on the timeline below."
+                // No "that was me" here: partial loss is congestion/routing behavior, not the
+                // signature of the user's own maintenance (that reads as a blackout). The
+                // per-event action on the disruption rows still allows excluding one.
             });
         }
 

@@ -19,7 +19,7 @@ COPY ["src/NetworkOptimizer.Audit/NetworkOptimizer.Audit.csproj", "src/NetworkOp
 COPY ["src/NetworkOptimizer.Sqm/NetworkOptimizer.Sqm.csproj", "src/NetworkOptimizer.Sqm/"]
 COPY ["src/NetworkOptimizer.Monitoring/NetworkOptimizer.Monitoring.csproj", "src/NetworkOptimizer.Monitoring/"]
 COPY ["src/NetworkOptimizer.Storage/NetworkOptimizer.Storage.csproj", "src/NetworkOptimizer.Storage/"]
-COPY ["src/NetworkOptimizer.Agents/NetworkOptimizer.Agents.csproj", "src/NetworkOptimizer.Agents/"]
+COPY ["src/NetworkOptimizer.AgentProtocol/NetworkOptimizer.AgentProtocol.csproj", "src/NetworkOptimizer.AgentProtocol/"]
 COPY ["src/NetworkOptimizer.Reports/NetworkOptimizer.Reports.csproj", "src/NetworkOptimizer.Reports/"]
 COPY ["src/NetworkOptimizer.Diagnostics/NetworkOptimizer.Diagnostics.csproj", "src/NetworkOptimizer.Diagnostics/"]
 COPY ["src/NetworkOptimizer.WiFi/NetworkOptimizer.WiFi.csproj", "src/NetworkOptimizer.WiFi/"]
@@ -32,9 +32,19 @@ RUN dotnet restore "src/NetworkOptimizer.Web/NetworkOptimizer.Web.csproj"
 # Copy all source files
 COPY src/ src/
 
+# Grpc.Tools' bundled linux_arm64 protoc segfaults (exit 139) under dotnet on native
+# arm64 runners (grpc/grpc#26032, #38538). Use the distro's protoc there; amd64 keeps
+# the bundled one so its build is unchanged. Only branches carrying AgentProtocol (.proto)
+# run protoc at all.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Build and publish Web UI (includes all dependent projects)
 # MinVerVersionOverride tells MinVer to use this version instead of reading git tags
-RUN dotnet publish "src/NetworkOptimizer.Web/NetworkOptimizer.Web.csproj" \
+RUN if [ "$TARGETARCH" = "arm64" ]; then export PROTOBUF_PROTOC=/usr/bin/protoc; fi; \
+    dotnet publish "src/NetworkOptimizer.Web/NetworkOptimizer.Web.csproj" \
     -c Release \
     -o /app/publish \
     --no-restore \

@@ -81,6 +81,7 @@ public class NetworkPathAnalyzer : INetworkPathAnalyzer
     private readonly IMemoryCache _cache;
     private readonly ILogger<NetworkPathAnalyzer> _logger;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly bool _isRemoteSite;
 
     // Cache keys
     private const string TopologyCacheKey = "NetworkTopology";
@@ -165,15 +166,24 @@ public class NetworkPathAnalyzer : INetworkPathAnalyzer
         { "UniFi Cloud Gateway Fiber", 9800 },
     };
 
+    /// <param name="isRemoteSite">
+    /// True when this analyzer serves a site other than the one this process runs on.
+    /// A remote site's analyzer must never fall back to this host's identity (HOST_IP
+    /// or local interface addresses) for server position discovery - those addresses
+    /// belong to the central server's network, never the remote site's, and can
+    /// coincidentally match an unrelated client there.
+    /// </param>
     public NetworkPathAnalyzer(
         IUniFiClientProvider clientProvider,
         IMemoryCache cache,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        bool isRemoteSite = false)
     {
         _clientProvider = clientProvider;
         _cache = cache;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<NetworkPathAnalyzer>();
+        _isRemoteSite = isRemoteSite;
     }
 
     /// <summary>
@@ -210,9 +220,13 @@ public class NetworkPathAnalyzer : INetworkPathAnalyzer
         // Determine which IP(s) to search for
         // Priority: HOST_IP env var > sourceIp from iperf3 > interface enumeration
         // HOST_IP takes priority because on Docker port-mapping mode (macOS), the iperf3
-        // sourceIp will be the container's internal IP which isn't visible to UniFi
+        // sourceIp will be the container's internal IP which isn't visible to UniFi.
+        // A remote site's analyzer skips both HOST_IP and interface enumeration: they
+        // identify THIS host, which is never on the remote site's network, and can
+        // coincidentally match an unrelated client there. Callers pass the on-site
+        // endpoint (the agent's LAN IP) as sourceIp instead.
         List<string> localIps;
-        var hostIpOverride = Environment.GetEnvironmentVariable("HOST_IP");
+        var hostIpOverride = _isRemoteSite ? null : Environment.GetEnvironmentVariable("HOST_IP");
         if (!string.IsNullOrWhiteSpace(hostIpOverride))
         {
             // Admin has explicitly configured the server IP - use it
@@ -224,6 +238,11 @@ public class NetworkPathAnalyzer : INetworkPathAnalyzer
             // Use the specific source IP from iperf3 output - this is the actual IP used
             localIps = new List<string> { sourceIp };
             _logger.LogDebug("Using source IP from iperf3: {Ip}", sourceIp);
+        }
+        else if (_isRemoteSite)
+        {
+            _logger.LogWarning("No source IP provided for remote-site server position discovery");
+            return null;
         }
         else
         {

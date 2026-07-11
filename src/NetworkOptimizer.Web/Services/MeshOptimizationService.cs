@@ -7,10 +7,14 @@ namespace NetworkOptimizer.Web.Services;
 /// available parent. The parent set is decided by UniFi Network (Auto, or a constrained/pinned
 /// parent); this service never chooses the parent - it only prompts the scan and reports the
 /// before/after link. On-demand, re-runnable, idempotent.
+/// Scoped per site: the injected <see cref="UniFiSshService"/> forwards to the current site's
+/// device SSH credentials, so the scan runs against the right site's AP.
 /// </summary>
 public class MeshOptimizationService
 {
     private readonly UniFiSshService _ssh;
+    private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
     private readonly ILogger<MeshOptimizationService> _logger;
 
     /// <summary>
@@ -29,9 +33,15 @@ public class MeshOptimizationService
     /// </summary>
     private static readonly Regex ValidStaIface = new(@"^vwiresta\d+$", RegexOptions.Compiled);
 
-    public MeshOptimizationService(UniFiSshService ssh, ILogger<MeshOptimizationService> logger)
+    public MeshOptimizationService(
+        UniFiSshService ssh,
+        SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState,
+        ILogger<MeshOptimizationService> logger)
     {
         _ssh = ssh;
+        _siteContext = siteContext;
+        _licenseState = licenseState;
         _logger = logger;
     }
 
@@ -45,6 +55,12 @@ public class MeshOptimizationService
     public async Task<MeshOptimizationResult> OptimizeAsync(
         string? host, string? iface, string? apName, CancellationToken cancellationToken = default)
     {
+        if (!_licenseState.IsSiteOperational(_siteContext.Slug))
+        {
+            _logger.LogWarning("Mesh optimization refused: site {Site} is license-restricted", _siteContext.Slug);
+            return MeshOptimizationResult.NoOp(iface, Licensing.LicenseGuard.RestrictedMessage);
+        }
+
         if (string.IsNullOrWhiteSpace(host))
             return MeshOptimizationResult.NoOp(iface, "This AP has no reachable address.");
 

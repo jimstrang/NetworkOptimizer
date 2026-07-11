@@ -15,6 +15,7 @@ public class SqmService : ISqmService
     private readonly UniFiConnectionService _connectionService;
     private readonly TcMonitorClient _tcMonitorClient;
     private readonly IServiceProvider _serviceProvider;
+    private readonly SiteContextService _siteContext;
 
     // Track SQM state
     private SqmConfiguration? _currentConfig;
@@ -30,12 +31,14 @@ public class SqmService : ISqmService
         ILogger<SqmService> logger,
         UniFiConnectionService connectionService,
         TcMonitorClient tcMonitorClient,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        SiteContextService siteContext)
     {
         _logger = logger;
         _connectionService = connectionService;
         _tcMonitorClient = tcMonitorClient;
         _serviceProvider = serviceProvider;
+        _siteContext = siteContext;
     }
 
     /// <summary>
@@ -69,7 +72,7 @@ public class SqmService : ISqmService
             return result;
         }
 
-        var tcStats = await _tcMonitorClient.GetTcStatsAsync(gatewayHost, tcMonitorPort);
+        var tcStats = await _tcMonitorClient.GetTcStatsAsync(gatewayHost, tcMonitorPort, siteSlug: _siteContext.Slug);
 
         if (tcStats != null)
         {
@@ -136,7 +139,7 @@ public class SqmService : ISqmService
         if (string.IsNullOrEmpty(host))
             return null;
 
-        var stats = await _tcMonitorClient.GetTcStatsAsync(host, port);
+        var stats = await _tcMonitorClient.GetTcStatsAsync(host, port, siteSlug: _siteContext.Slug);
 
         if (stats != null)
         {
@@ -154,7 +157,10 @@ public class SqmService : ISqmService
     {
         try
         {
+            // Pin the fresh scope to this service's already-resolved site rather than
+            // re-resolving from the ambient HTTP context, which is not guaranteed here.
             using var scope = _serviceProvider.CreateScope();
+            scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteContext.Slug);
             var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
             var settings = await repository.GetGatewaySshSettingsAsync();
             if (!string.IsNullOrEmpty(settings?.Host))
@@ -184,7 +190,7 @@ public class SqmService : ISqmService
             return (false, "Gateway SSH not configured");
         }
 
-        var available = await _tcMonitorClient.IsMonitorAvailableAsync(testHost, testPort);
+        var available = await _tcMonitorClient.IsMonitorAvailableAsync(testHost, testPort, siteSlug: _siteContext.Slug);
 
         if (available)
         {
@@ -685,8 +691,8 @@ public class SqmService : ISqmService
             return false;
         }
 
-        // TODO(agent-infrastructure): Deploy SQM via agent when infrastructure is ready.
-        // Requires: NetworkOptimizer.Agents package with SSH deployment capability.
+        // TODO(agent-infrastructure): Deploy SQM via the on-site agent once it
+        // grows SSH deployment capability.
         // Steps: 1) Generate scripts via NetworkOptimizer.Sqm.ScriptGenerator
         //        2) Push to gateway via agent SSH connection
         //        3) Verify tc qdisc installation and crontab entry

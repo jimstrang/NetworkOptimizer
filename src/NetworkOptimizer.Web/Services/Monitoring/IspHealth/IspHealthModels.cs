@@ -15,6 +15,9 @@ public enum IspHealthStatus
     InsufficientData,
     /// <summary>Prerequisites met; first computation has not finished yet.</summary>
     Computing,
+    /// <summary>The site's console connection is not up yet, so the expected ISP plan speeds
+    /// can't be read; the compute is deferred until it connects.</summary>
+    AwaitingConnection,
     /// <summary>A report is available.</summary>
     Ready
 }
@@ -156,6 +159,12 @@ public class IspHealthIssue
     /// mirroring the Access Layer sub-score headers (e.g. ?investigate=loaded-loss).</summary>
     public string? InvestigateUrl { get; init; }
     public string? InvestigateText { get; init; }
+
+    /// <summary>
+    /// Onset times (UTC) of the outage events this finding aggregates, so the panel can offer
+    /// the per-event "that was me" exclusion on the finding itself. Empty for non-outage findings.
+    /// </summary>
+    public List<DateTime> OutageStarts { get; init; } = new();
 }
 
 /// <summary>
@@ -285,6 +294,18 @@ public class PathShiftEvent
     /// <summary>True when this shift came from an internet/CDN destination (by DB TargetType),
     /// not an on-path ISP/transit hop. Correlation prefers a non-destination as the label.</summary>
     public bool IsDestination { get; init; }
+
+    /// <summary>
+    /// True for a transit-unreachable event: the target(s) went to total loss for minutes -
+    /// a route withdrawal/BGP change, not an RTT step. <see cref="Time"/> is the window
+    /// start and <see cref="UnreachableEnd"/> its end; the median/delta fields are unused
+    /// (0). The window's loss is carved out of the access-layer loss pool; the ASN's own
+    /// network grade still sees it.
+    /// </summary>
+    public bool IsUnreachable { get; init; }
+
+    /// <summary>End of the unreachable window (last dark sample); null for RTT-step shifts.</summary>
+    public DateTime? UnreachableEnd { get; init; }
 }
 
 /// <summary>Whether the access/first hop itself went dark, or only everything beyond it.</summary>
@@ -332,6 +353,13 @@ public class OutageEvent
     /// </summary>
     public bool IsPartial { get; init; }
 
+    /// <summary>
+    /// For a partial event: the loss reached the blackout dark threshold on (nearly) every
+    /// reporting hop - a short total outage whose bucket-edge dilution kept it out of the
+    /// blackout pass. Presentation upgrades the wording to total loss; scoring is unchanged.
+    /// </summary>
+    public bool IsNearTotal { get; init; }
+
     /// <summary>Worst per-target loss reached during the event. Feeds the partial-loss summary and the
     /// scorer's severity depth (peak loss fraction). Populated for blackouts and partials alike.</summary>
     public double PeakLossPct { get; init; }
@@ -348,9 +376,18 @@ public class OutageEvent
 
     /// <summary>
     /// The deepest tier/hop that stayed reachable through the outage - the break sat just
-    /// beyond it. Null when even the access hop went dark (a full WAN outage).
+    /// beyond it. Only hops with a known trace-map position anchor this (ASN label preferred
+    /// over the per-target name). Null when even the access hop went dark (a full WAN outage)
+    /// or when no anchorable hop stayed clean - see <see cref="BrokenNetwork"/>.
     /// </summary>
     public string? LastReachableHop { get; init; }
+
+    /// <summary>
+    /// For an Upstream outage that no trace-map-anchored hop can localize (only off-map rows
+    /// stayed reachable): the ASN of the network the break surfaced in - the shallowest dark
+    /// hop's ASN label. Null when <see cref="LastReachableHop"/> is set or no dark ASN is known.
+    /// </summary>
+    public string? BrokenNetwork { get; init; }
 
     /// <summary>Per-tier loss and recovery, nearest first, for the outage-shape display.</summary>
     public List<OutageTierState> Tiers { get; init; } = new();
@@ -369,6 +406,15 @@ public class OutageEvent
     /// penalty so a drop during a quiet hour dings less than the same drop at peak. Set by the service.
     /// </summary>
     public double UsageWeight { get; set; } = 1.0;
+
+    /// <summary>
+    /// True when the user marked this event "that was me" (their own maintenance - pulled the
+    /// coax to add a pad, re-seated a connector), excluding it from the outage score penalty
+    /// and the findings. Still shown on the timeline, and a blackout's dark window still
+    /// masks its loss from the other factors. Set by the service from the persisted
+    /// acknowledgements, matched to the onset time by tolerance.
+    /// </summary>
+    public bool Acknowledged { get; set; }
 }
 
 /// <summary>One network tier's behavior during an outage, for the recovery-shape display.</summary>
@@ -643,7 +689,7 @@ public record IspHealthSnapshot(IspHealthStatus Status, int? Score, DateTime? Co
     public string TileText => Status switch
     {
         IspHealthStatus.Ready when Score.HasValue => Score.Value.ToString(),
-        IspHealthStatus.Computing or IspHealthStatus.InsufficientData => "...",
+        IspHealthStatus.Computing or IspHealthStatus.InsufficientData or IspHealthStatus.AwaitingConnection => "...",
         _ => "Set up"
     };
 
@@ -652,6 +698,7 @@ public record IspHealthSnapshot(IspHealthStatus Status, int? Score, DateTime? Co
     {
         IspHealthStatus.Ready when Score.HasValue => $"ISP Health: {IspHealthReport.GradeLabel(Score.Value)}",
         IspHealthStatus.Computing => "Analyzing recent ISP data",
+        IspHealthStatus.AwaitingConnection => "Waiting for the console connection to read your ISP plan speeds",
         IspHealthStatus.InsufficientData => "Collecting data - ISP Health needs a few hours of monitoring",
         IspHealthStatus.NeedsDiscovery => "Run Upstream Discovery to enable ISP Health",
         IspHealthStatus.NeedsTechnology => "Select your access technology to enable ISP Health",

@@ -3,6 +3,7 @@
 @implements IDisposable
 @inject GatewaySpeedTestService GatewayService
 @inject TcMonitorClient TcMonitorClient
+@inject SiteContextService SiteContext
 @inject ISpeedTestRepository SpeedTestRepository
 
 <div class="sqm-status-panel">
@@ -26,7 +27,7 @@
             <div class="sqm-actions">
                 @if (needsGatewayConfig)
                 {
-                    <a href="/settings" class="btn btn-primary">Configure Gateway</a>
+                    <a href="/settings#gateway-ssh" class="btn btn-primary">Configure Gateway</a>
                 }
                 else if (isAwaitingStatus)
                 {
@@ -181,7 +182,7 @@
             }
 
             // Poll TC Monitor directly (fast HTTP call, 2s timeout)
-            var response = await TcMonitorClient.GetTcStatsAsync(gatewaySettings.Host, forceRefresh: forceRefresh);
+            var response = await TcMonitorClient.GetTcStatsAsync(gatewaySettings.Host, forceRefresh: forceRefresh, siteSlug: SiteContext.Slug);
 
             if (response != null)
             {

@@ -1509,9 +1509,9 @@ public class ChannelRecommendationServiceTests
 
     /// <summary>
     /// A single 5 GHz AP with heavy measured stress on its current channel. Historical stress
-    /// of X% yields roughly X/100 * (3.0 + 1.5 + 1.0) on the current channel, so ~60% lands
-    /// the score in the move window (2.0-4.0) while staying below the measured external
-    /// interference threshold (70%) that lifts soak; 90% trips it.
+    /// of X% yields roughly X/100 * (3.0 + 1.5 + 1.0) on the current channel, so ~45% lands the
+    /// score in the move window (2.0-4.0) while staying below the 5 GHz soak-escape interference
+    /// threshold (50%) that lifts the soak lock; 55%+ trips it.
     /// </summary>
     private InterferenceGraph BuildStressedSingleApGraph(double stressPct, ChannelSoakInfo? soak)
     {
@@ -1532,40 +1532,43 @@ public class ChannelRecommendationServiceTests
     }
 
     [Fact]
-    public void Optimize_SoakedChannels_NotRecommended()
+    public void Optimize_SoakingAp_HoldsCurrentChannel_EvenWhenBetterChannelAvailable()
     {
-        // Leave exactly one non-soaked escape channel; the stressed AP must move there and
-        // report what was suppressed. 60% interference sits in the move window while staying
-        // below the 70% escape threshold, so suppression stays active.
-        var probeGraph = BuildStressedSingleApGraph(60, soak: null);
+        // A soaking AP holds its current channel for the whole soak window even when a non-soaked
+        // channel scores better - it committed to the new channel and must gather measured data
+        // before another move (the DFS-toggle scenario in issue #961). Leave one non-soaked,
+        // non-overlapping channel that WOULD win if the AP were free to move; the AP must still
+        // stay put. 45% interference sits in the move window but below the 5 GHz 50% escape
+        // threshold, so the soak lock holds.
+        var probeGraph = BuildStressedSingleApGraph(45, soak: null);
         var validChannels = probeGraph.Nodes[0].ValidChannels;
-        // The escape must not share ch36's bonding block, or the measured stress (applied by
-        // span overlap) follows the AP there and no move clears the improvement gates.
+        // A channel that doesn't share ch36's bonding block, so the AP's measured stress doesn't
+        // follow it there - i.e. a genuinely better destination it is being denied by the soak.
         var currentSpan = ChannelSpanHelper.GetChannelSpan(RadioBand.Band5GHz, 36, 80);
-        var escapeChannel = validChannels.First(ch =>
+        var betterChannel = validChannels.First(ch =>
             !ChannelSpanHelper.SpansOverlap(currentSpan, ChannelSpanHelper.GetChannelSpan(RadioBand.Band5GHz, ch, 80)));
-        var soakedValidChannels = validChannels.Where(ch => ch != 36 && ch != escapeChannel).ToHashSet();
+        var soakedValidChannels = validChannels.Where(ch => ch != 36 && ch != betterChannel).ToHashSet();
         var soak = new ChannelSoakInfo
         {
             // 9999 is not a valid candidate - it must not be reported as soak-suppressed
-            // (it was never removed by the soak filter).
+            // (it was never a real candidate the soak removed).
             SoakedChannels = soakedValidChannels.Append(9999).ToHashSet(),
             LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
             SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
         };
 
-        var graph = BuildStressedSingleApGraph(60, soak);
+        var graph = BuildStressedSingleApGraph(45, soak);
         var plan = _service.Optimize(graph, RadioBand.Band5GHz, null);
 
         var rec = plan.Recommendations[0];
         rec.CurrentScore.Should().BeInRange(2.0, 4.0,
-            "the test relies on a stressed-but-not-catastrophic AP so suppression stays active");
-        rec.IsChanged.Should().BeTrue("heavy measured stress on ch36 justifies a move");
-        rec.RecommendedChannel.Should().Be(escapeChannel,
-            "every other channel is soaking and must not be recommended");
+            "the test relies on a stressed-but-below-escape AP so the soak lock stays active");
+        rec.IsChanged.Should().BeFalse(
+            "a soaking AP holds its current channel even though a better channel is available");
+        rec.RecommendedChannel.Should().Be(36, "the soaking AP holds the channel it is proving out");
         rec.IsSoaking.Should().BeTrue();
         rec.SoakSuppressedChannels.Should().BeEquivalentTo(soakedValidChannels,
-            "only channels actually removed from the candidate set are reported");
+            "only the recently-left channels that were real candidates are reported");
         rec.SoakEndsAt.Should().Be(soak.SoakEndsAt);
     }
 
@@ -1573,8 +1576,8 @@ public class ChannelRecommendationServiceTests
     public void Optimize_SoakSuppression_LiftedForCatastrophicAp()
     {
         // Soak EVERY alternative channel. An AP whose MEASURED external interference on the new
-        // channel is catastrophic (90%, past the 70% threshold) must still escape - soak
-        // prevents churn, not rescue.
+        // channel is a disaster (90%, well past the 5 GHz escape threshold) must still escape -
+        // soak prevents churn, not rescue.
         var probeGraph = BuildStressedSingleApGraph(90, soak: null);
         var soak = new ChannelSoakInfo
         {
@@ -1589,6 +1592,63 @@ public class ChannelRecommendationServiceTests
         var rec = plan.Recommendations[0];
         rec.IsChanged.Should().BeTrue("a measurably suffering AP must be allowed to leave despite soak");
         rec.IsSoaking.Should().BeFalse("lifted suppression is not reported as active");
+    }
+
+    [Fact]
+    public void Optimize_SoakEscape_LiftsWhenChannelTerrible_5GHz()
+    {
+        // A soaking 5 GHz AP whose current channel measures 55% foreign airtime - not a disaster,
+        // but past the 50% escape threshold - must be allowed a reasonable escape even though every
+        // alternative is soaked. This is the "escape a terrible channel" case: below the old
+        // disaster-only 70% bar it would have stayed stuck.
+        var probeGraph = BuildStressedSingleApGraph(55, soak: null);
+        var soak = new ChannelSoakInfo
+        {
+            SoakedChannels = probeGraph.Nodes[0].ValidChannels.Where(ch => ch != 36).ToHashSet(),
+            LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
+            SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
+        };
+
+        var graph = BuildStressedSingleApGraph(55, soak);
+        var plan = _service.Optimize(graph, RadioBand.Band5GHz, null);
+
+        var rec = plan.Recommendations[0];
+        rec.IsChanged.Should().BeTrue("55% foreign airtime is terrible enough to escape on 5 GHz");
+        rec.IsSoaking.Should().BeFalse("lifted suppression is not reported as active");
+    }
+
+    [Fact]
+    public void Optimize_SoakEscape_HoldsAtSameInterferenceOn24GHz()
+    {
+        // The per-band contrast: the SAME 55% foreign airtime that escapes on 5 GHz must HOLD on
+        // 2.4 GHz, where the band is crowded by nature and the escape bar is higher (60%). A better
+        // channel exists (ch11 is clean) but the soaking AP stays put on ch1.
+        var aps = new List<AccessPointSnapshot>
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-1", RadioBand.Band2_4GHz, 1, width: 20)
+        };
+        var stress = new Dictionary<string, Dictionary<int, (double, double, double)>>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new() { [1] = (55d, 55d, 55d) }
+        };
+        var soakInfo = new Dictionary<string, ChannelSoakInfo>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new ChannelSoakInfo
+            {
+                SoakedChannels = new HashSet<int> { 6 },
+                LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
+                SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
+            }
+        };
+
+        var graph = _service.BuildInterferenceGraph(
+            aps, RadioBand.Band2_4GHz, null, null, null, null, stress, soakInfo);
+        var plan = _service.Optimize(graph, RadioBand.Band2_4GHz, null);
+
+        var rec = plan.Recommendations[0];
+        rec.RecommendedChannel.Should().Be(1,
+            "55% foreign airtime is below the 60% escape bar on crowded-by-nature 2.4 GHz, so the soak holds");
+        rec.IsSoaking.Should().BeTrue();
     }
 
     [Fact]
@@ -1655,10 +1715,10 @@ public class ChannelRecommendationServiceTests
         // A mesh group moves as one: the leader is stressed enough to want a move, but the
         // CHILD is soaking on every alternative channel. The leader must stay put - otherwise
         // the child-sync would hop the child straight back onto a channel it just left.
-        // In the move window, below the 70% external interference escape threshold.
+        // In the move window, below the 5 GHz 50% external interference escape threshold.
         var leaderStress = new Dictionary<string, Dictionary<int, (double, double, double)>>
         {
-            ["aa:bb:cc:dd:ee:01"] = new() { [36] = (60d, 60d, 60d) }
+            ["aa:bb:cc:dd:ee:01"] = new() { [36] = (45d, 45d, 45d) }
         };
         List<AccessPointSnapshot> BuildAps() => new()
         {
@@ -1692,6 +1752,86 @@ public class ChannelRecommendationServiceTests
             "every alternative is soaked by the mesh child, and the group moves as one");
         childRec.RecommendedChannel.Should().Be(36);
         leaderRec.IsSoaking.Should().BeTrue("the child's soak gated the leader's candidates");
+        childRec.IsSoaking.Should().BeTrue(
+            "the child changes channel with its parent, so it soaks with the group (issue #961)");
+    }
+
+    [Fact]
+    public void Optimize_MeshChildOfSoakingLeader_ShowsSoaking()
+    {
+        // The leader itself is soaking; the child follows its channel, so the child's row must
+        // also show "Soaking" even though the child has no soak state of its own (issue #961).
+        var leaderChannels = _service.BuildInterferenceGraph(
+                new List<AccessPointSnapshot> { CreateAp("aa:bb:cc:dd:ee:01", "Leader", RadioBand.Band5GHz, 36) },
+                RadioBand.Band5GHz, null, null, null, null)
+            .Nodes[0].ValidChannels;
+
+        List<AccessPointSnapshot> BuildAps() => new()
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "Leader", RadioBand.Band5GHz, 36),
+            CreateAp("aa:bb:cc:dd:ee:02", "Child", RadioBand.Band5GHz, 36,
+                isMeshChild: true, meshParentMac: "aa:bb:cc:dd:ee:01",
+                meshUplinkBand: RadioBand.Band5GHz, meshUplinkChannel: 36)
+        };
+
+        var soakInfo = new Dictionary<string, ChannelSoakInfo>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new ChannelSoakInfo
+            {
+                SoakedChannels = leaderChannels.Where(ch => ch != 36).ToHashSet(),
+                LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
+                SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
+            }
+        };
+
+        var graph = _service.BuildInterferenceGraph(
+            BuildAps(), RadioBand.Band5GHz, null, null, null, null, null, soakInfo);
+        var plan = _service.Optimize(graph, RadioBand.Band5GHz, null);
+
+        var leaderRec = plan.Recommendations.First(r => r.ApName == "Leader");
+        var childRec = plan.Recommendations.First(r => r.ApName == "Child");
+        leaderRec.IsSoaking.Should().BeTrue();
+        childRec.IsSoaking.Should().BeTrue("a mesh child shows Soaking when its leader is soaking");
+        childRec.RecommendedChannel.Should().Be(36, "the child holds the leader's held channel");
+    }
+
+    [Fact]
+    public void Optimize_SoakingApChannel_NotRecommendedToAnotherAp()
+    {
+        // AP-A is soaking on 2.4 GHz ch1. AP-B sits on ch6 with heavy load on 6 and 11, so ch1
+        // would otherwise be its lowest-interference destination. The recommender must NOT move
+        // B onto ch1 while A is soaking there - stacking onto a mid-soak radio corrupts its
+        // measurement and A is locked and can't move out of the way (issue #961).
+        List<AccessPointSnapshot> BuildAps() => new()
+        {
+            CreateAp("aa:bb:cc:dd:ee:01", "AP-A", RadioBand.Band2_4GHz, 1, width: 20),
+            CreateAp("aa:bb:cc:dd:ee:02", "AP-B", RadioBand.Band2_4GHz, 6, width: 20)
+        };
+
+        var soakInfo = new Dictionary<string, ChannelSoakInfo>
+        {
+            ["aa:bb:cc:dd:ee:01"] = new ChannelSoakInfo
+            {
+                SoakedChannels = new HashSet<int> { 6, 11 },
+                LastChangeAt = DateTimeOffset.UtcNow.AddDays(-1),
+                SoakEndsAt = DateTimeOffset.UtcNow.AddDays(6)
+            }
+        };
+
+        var graph = _service.BuildInterferenceGraph(
+            BuildAps(), RadioBand.Band2_4GHz, null, null, null, null, null, soakInfo);
+        // Make ch6 and ch11 heavily loaded for B so ch1 (where A soaks) would win if allowed.
+        graph.ExternalLoad[1][6] = 8.0;
+        graph.ExternalLoad[1][11] = 8.0;
+
+        var plan = _service.Optimize(graph, RadioBand.Band2_4GHz, null);
+
+        var recA = plan.Recommendations.First(r => r.ApName == "AP-A");
+        var recB = plan.Recommendations.First(r => r.ApName == "AP-B");
+        recA.RecommendedChannel.Should().Be(1, "the soaking AP holds its channel");
+        recA.IsSoaking.Should().BeTrue();
+        recB.RecommendedChannel.Should().NotBe(1,
+            "no AP should be moved onto the channel another AP is soaking on");
     }
 
     [Fact]

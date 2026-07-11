@@ -14,22 +14,34 @@ namespace NetworkOptimizer.Web.Services;
 /// <summary>
 /// Service for running iperf3 speed tests to UniFi devices.
 /// Uses UniFiSshService for SSH operations with shared credentials.
+/// One instance exists per site, owned by <see cref="SpeedTestServiceRegistry"/>:
+/// devices, SSH credentials, and results live in that site's database, and the
+/// tests run against that site's devices (through the agent tunnel when the
+/// site's SSH is routed that way).
 /// </summary>
 public class Iperf3SpeedTestService : IIperf3SpeedTestService
 {
     private readonly ILogger<Iperf3SpeedTestService> _logger;
     private readonly IServiceProvider _serviceProvider;
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory _siteDbFactory;
     private readonly UniFiSshService _sshService;
     private readonly SystemSettingsService _settingsService;
     private readonly INetworkPathAnalyzer _pathAnalyzer;
     private readonly UniFiConnectionService _connectionService;
     private readonly ITopologySnapshotService _snapshotService;
+    private readonly SiteTunnelRouting _tunnelRouting;
+    private readonly AgentIperf3Service _agentIperf3;
     private readonly IAlertEventBus? _alertEventBus;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
+    private readonly string _siteSuffix;
 
     // Track running tests to prevent duplicates
     private readonly HashSet<string> _runningTests = new();
     private readonly object _lock = new();
+
+    private readonly Licensing.LicenseStateService? _licenseState;
 
     // Default iperf3 port
     private const int Iperf3Port = 5201;
@@ -44,22 +56,53 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         ILogger<Iperf3SpeedTestService> logger,
         IServiceProvider serviceProvider,
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
-        UniFiSshService sshService,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory siteDbFactory,
+        UniFiSshRegistry uniFiSshRegistry,
         SystemSettingsService settingsService,
         INetworkPathAnalyzer pathAnalyzer,
-        UniFiConnectionService connectionService,
+        SiteConnectionRegistry siteConnections,
         ITopologySnapshotService snapshotService,
-        IAlertEventBus? alertEventBus = null)
+        SiteTunnelRouting tunnelRouting,
+        AgentIperf3Service agentIperf3,
+        Licensing.LicenseStateService? licenseState = null,
+        IAlertEventBus? alertEventBus = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
+        _licenseState = licenseState;
         _logger = logger;
         _serviceProvider = serviceProvider;
         _dbFactory = dbFactory;
-        _sshService = sshService;
+        _siteDbFactory = siteDbFactory;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _siteSuffix = _isDefault ? "" : $" (site {_siteSlug})";
+        _sshService = uniFiSshRegistry.GetFor(_siteSlug);
         _settingsService = settingsService;
         _pathAnalyzer = pathAnalyzer;
-        _connectionService = connectionService;
+        _connectionService = siteConnections.GetFor(_siteSlug);
         _snapshotService = snapshotService;
+        _tunnelRouting = tunnelRouting;
+        _agentIperf3 = agentIperf3;
         _alertEventBus = alertEventBus;
+    }
+
+    /// <summary>
+    /// Creates a DI scope pinned to this instance's site so scoped services
+    /// (repositories, DbContext) hit this site's database.
+    /// </summary>
+    private IServiceScope CreateSiteScope()
+    {
+        var scope = _serviceProvider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(_siteSlug);
+        return scope;
+    }
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct = default)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
     }
 
     /// <summary>
@@ -301,6 +344,19 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     {
         var host = device.Host;
 
+        if (_licenseState != null && !_licenseState.IsSiteOperational(_siteSlug))
+        {
+            _logger.LogWarning("LAN speed test refused: site {Site} is license-restricted", _siteSlug);
+            return new Iperf3Result
+            {
+                DeviceHost = host,
+                DeviceName = device.Name,
+                DeviceType = device.DeviceType.ToString(),
+                Success = false,
+                ErrorMessage = Licensing.LicenseGuard.RestrictedMessage
+            };
+        }
+
         // Check if test is already running for this host
         lock (_lock)
         {
@@ -388,7 +444,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
             {
                 // Step 3: Run download test (device -> client, with -R flag) - "From Device"
                 _logger.LogDebug("Running download test from {Host}", host);
-                var downloadResult = await RunLocalIperf3Async(host, durationSeconds, parallelStreams, reverse: true);
+                var downloadResult = await RunIperf3ClientAsync(host, durationSeconds, parallelStreams, reverse: true);
 
                 if (downloadResult.success)
                 {
@@ -409,7 +465,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
 
                 // Step 4: Run upload test (client -> device) - "To Device"
                 _logger.LogDebug("Running upload test to {Host}", host);
-                var uploadResult = await RunLocalIperf3Async(host, durationSeconds, parallelStreams, reverse: false);
+                var uploadResult = await RunIperf3ClientAsync(host, durationSeconds, parallelStreams, reverse: false);
 
                 if (uploadResult.success)
                 {
@@ -497,7 +553,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> GetRecentResultsAsync(int count = 50, int hours = 0)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
         var results = await repository.GetRecentIperf3ResultsAsync(count, hours);
 
@@ -520,7 +576,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         if (needsRetry.Count > 0)
         {
             _logger.LogInformation("Retrying path analysis for {Count} results without valid paths", needsRetry.Count);
-            await using var db = await _dbFactory.CreateDbContextAsync();
+            await using var db = await CreateSiteDbAsync();
             foreach (var result in needsRetry)
             {
                 db.Attach(result);
@@ -537,7 +593,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> SearchResultsAsync(string filter, int count = 50, int hours = 0)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
         return await repository.SearchIperf3ResultsAsync(filter, count, hours);
     }
@@ -547,7 +603,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<List<Iperf3Result>> GetResultsForDeviceAsync(string deviceHost, int count = 20)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
         return await repository.GetIperf3ResultsForDeviceAsync(deviceHost, count);
     }
@@ -561,7 +617,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     {
         if (apIpToMac.Count == 0) return new();
 
-        await using var db = await _dbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var apIps = apIpToMac.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         var results = await db.Iperf3Results
@@ -580,7 +636,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<bool> DeleteResultAsync(int id)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
         return await repository.DeleteIperf3ResultAsync(id);
     }
@@ -590,7 +646,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<bool> UpdateNotesAsync(int id, string? notes)
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
         return await repository.UpdateIperf3ResultNotesAsync(id, notes);
     }
@@ -600,7 +656,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     /// </summary>
     public async Task<int> ClearHistoryAsync()
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
         var results = await repository.GetRecentIperf3ResultsAsync(int.MaxValue);
         var count = results.Count;
@@ -612,7 +668,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
     {
         try
         {
-            using var scope = _serviceProvider.CreateScope();
+            using var scope = CreateSiteScope();
             var repository = scope.ServiceProvider.GetRequiredService<ISpeedTestRepository>();
             await repository.SaveIperf3ResultAsync(result);
         }
@@ -620,6 +676,25 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
         {
             _logger.LogWarning(ex, "Failed to save iperf3 result to database");
         }
+    }
+
+    /// <summary>
+    /// Runs the iperf3 client for one direction. For an agent-backed secondary
+    /// site (devices reached via the tunnel), the client runs at the site's agent
+    /// so throughput reflects the site LAN; otherwise it runs locally on this
+    /// server, exactly as before. The default site is never routed via agent, so
+    /// its path is unchanged.
+    /// </summary>
+    private async Task<(bool success, string output)> RunIperf3ClientAsync(string host, int duration, int streams, bool reverse)
+    {
+        if (!_isDefault && await _tunnelRouting.IsViaAgentAsync(_siteSlug))
+        {
+            _logger.LogDebug("Routing iperf3 client to agent for site {Slug} against {Host} (reverse={Reverse})",
+                _siteSlug, host, reverse);
+            return await _agentIperf3.RunClientAsync(_siteSlug, host, Iperf3Port, duration, streams, reverse, CancellationToken.None);
+        }
+
+        return await RunLocalIperf3Async(host, duration, streams, reverse);
     }
 
     private async Task<(bool success, string output)> RunLocalIperf3Async(string host, int duration, int streams, bool reverse)
@@ -828,7 +903,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                 EventType = "speedtest.completed",
                 Severity = AlertSeverity.Info,
                 Source = "speedtest",
-                Title = $"LAN Speed test: {deviceLabel} - {downloadMbps:F0} / {uploadMbps:F0} Mbps",
+                Title = $"LAN Speed test: {deviceLabel} - {downloadMbps:F0} / {uploadMbps:F0} Mbps{_siteSuffix}",
                 Message = $"Device {deviceLabel} ({result.DeviceHost}): From device {downloadMbps:F1} Mbps, To device {uploadMbps:F1} Mbps",
                 DeviceIp = result.DeviceHost,
                 DeviceName = result.DeviceName,
@@ -844,7 +919,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
             // Check for regression vs recent average for same device and direction
             try
             {
-                await using var db = await _dbFactory.CreateDbContextAsync();
+                await using var db = await CreateSiteDbAsync();
                 var recent = await db.Iperf3Results
                     .AsNoTracking()
                     .Where(r => r.DeviceHost == result.DeviceHost && r.Id != result.Id && r.Success
@@ -867,7 +942,7 @@ public class Iperf3SpeedTestService : IIperf3SpeedTestService
                             Severity = dropPercent >= 50 ? AlertSeverity.Error
                                 : dropPercent >= 25 ? AlertSeverity.Warning : AlertSeverity.Info,
                             Source = "speedtest",
-                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average)",
+                            Title = $"Speed regression: {deviceLabel} at {downloadMbps:F0} Mbps ({dropPercent:F0}% below average){_siteSuffix}",
                             Message = $"{deviceLabel} download is {dropPercent:F0}% below the recent average of {avgDownload:F0} Mbps",
                             DeviceIp = result.DeviceHost,
                             DeviceName = result.DeviceName,

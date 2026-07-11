@@ -17,6 +17,8 @@
 @inject Iperf3ServerService Iperf3Server
 @inject ApMapService ApMapService
 @inject PullToRefreshState PtrState
+@inject SiteContextService SiteContext
+@inject SiteSpeedTestTargetResolver SiteTarget
 
 @* Uses unified Iperf3Result model with Direction field to distinguish test sources *@
 
@@ -33,6 +35,8 @@
     <p class="page-description">Test LAN speed from any device - phones, tablets, laptops</p>
 </div>
 
+<RestrictedSiteNotice />
+
 <div class="client-speedtest-container">
     <!-- Test Instructions -->
     <div class="card">
@@ -40,6 +44,21 @@
             <h2 class="card-title">Run a Speed Test</h2>
         </div>
         <div class="card-body">
+            @if (siteUsesAgent)
+            {
+                <div class="alert alert-info">
+                    <strong>On-site agent:</strong> Speed tests for this site run against its on-site agent at <code>@serverHost</code>, so they measure this site's own network rather than the central server.
+                    <a href="/settings#multi-site" class="tooltip-icon settings-link" data-tooltip="You can reconfigure this site's speed test URL if needed" data-tooltip-hover-only>
+                        <img src="/images/gear.svg" alt="" style="width:16px;height:16px;" />
+                    </a>
+                </div>
+            }
+            else if (agentSiteOffline)
+            {
+                <div class="alert alert-warning">
+                    <strong>On-site agent offline:</strong> This site's agent isn't reporting in, so the targets below point at the central server and may be unreachable from the site's network. Start the site's agent to test against the site directly.
+                </div>
+            }
             <div class="test-options">
                 <!-- OpenSpeedTest Option -->
                 <div class="test-option">
@@ -101,9 +120,9 @@
                         <h3>iperf3 to Server</h3>
                         <span class="badge badge-secondary">Advanced</span>
                     </div>
-                    <p>Run iperf3 from any device on your network to test LAN throughput to this server (<code>@serverHost</code>).</p>
+                    <p>Run iperf3 from any device on your network to test LAN throughput to @targetLabel (<code>@serverHost</code>).</p>
 
-                    @if (iperf3ServerEnabled && Iperf3Server.StartupFailed)
+                    @if (iperf3ServerEnabled && !siteUsesAgent && Iperf3Server.StartupFailed)
                     {
                         <div class="alert alert-danger">
                             <strong>Server Failed to Start:</strong> @Iperf3Server.FailureMessage
@@ -398,13 +417,13 @@
                 <h4 style="margin-top: 1.5rem;">iperf3 to Server</h4>
                 <ol>
                     <li>Install iperf3 on another device (laptop, phone, etc.)</li>
-                    <li>Run the command to connect to this server on port 5201</li>
+                    <li>Run the command to connect to @targetLabel on port 5201</li>
                     <li>Server automatically captures and records results</li>
                     <li>Device is identified by the connecting IP address</li>
                 </ol>
 
                 <p class="form-help">
-                    <strong>Note:</strong> This tests the LAN speed between client devices and the Network Optimizer server.
+                    <strong>Note:</strong> This tests the LAN speed between client devices and @(siteUsesAgent ? "the on-site agent" : "the Network Optimizer server").
                     It's useful for identifying wireless bottlenecks, cable issues, switch problems, or network congestion.
                 </p>
             </div>
@@ -783,6 +802,12 @@
     private bool openSpeedTestAvailable;
     private string serverHost = "<server IP>";
 
+    // Multi-site: on an agent-backed site, tests target the on-site agent instead
+    // of this central server (whose address is unreachable from a remote site LAN).
+    private bool siteUsesAgent;
+    private bool agentSiteOffline;
+    private string targetLabel = "this server";
+
     // OpenSpeedTest health check cache
     private static DateTime _lastHealthCheck = DateTime.MinValue;
     private static bool _lastHealthResult = false;
@@ -830,6 +855,30 @@
         // Load configuration
         iperf3ServerEnabled = Configuration.GetValue("Iperf3Server:Enabled", false);
 
+        // Multi-site: on an agent-backed site, point clients at the on-site agent
+        // (its own LAN IP) for LAN speed tests - the central server's own address is
+        // unreachable from a remote site's LAN. Shared resolution (override wins over
+        // agent LAN IP; the override never affects the server-side path trace) lives
+        // in SiteSpeedTestTargetResolver so this page, the Client Dashboard, and the
+        // WAN speed test link can't drift apart. Falls back to the central-server
+        // target below when the site has no online agent reporting a LAN IP yet.
+        var siteTarget = await SiteTarget.ResolveAsync();
+        agentSiteOffline = !SiteContext.IsDefault && siteTarget.AgentOffline;
+        siteUsesAgent = siteTarget.UsesAgent;
+        targetLabel = siteUsesAgent ? "the on-site agent" : "this server";
+
+        if (siteUsesAgent)
+        {
+            // The agent serves OpenSpeedTest over self-signed HTTPS on port 3000 (a secure
+            // context so the browser Geolocation API works for GPS-tagged results) and iperf3
+            // on 5201 on the site network.
+            openSpeedTestUrl = siteTarget.BaseUrl!;
+            serverHost = siteTarget.Host!;
+            iperf3ServerEnabled = true;
+            openSpeedTestAvailable = true;
+        }
+        else
+        {
         // Construct OpenSpeedTest URL - supports HTTPS when proxied
         var hostName = Configuration["HOST_NAME"];
         var hostIp = Configuration["HOST_IP"];
@@ -894,6 +943,7 @@
         else if (!string.IsNullOrEmpty(openSpeedTestHealthCheckUrl))
         {
             openSpeedTestAvailable = await CheckOpenSpeedTestHealthAsync();
+        }
         }
 
         await LoadHistory();

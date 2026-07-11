@@ -1,0 +1,221 @@
+@page "/sites"
+@rendermode InteractiveServer
+@implements IDisposable
+@using Microsoft.EntityFrameworkCore
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Web.Services
+@using NetworkOptimizer.Web.Services.Licensing
+@inject SiteManagementService SiteManagement
+@inject SiteContextService SiteContext
+@inject SiteConnectionRegistry SiteConnections
+@inject AgentEnrollmentService AgentEnrollment
+@inject AgentTunnelRegistry TunnelRegistry
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject NavigationManager NavigationManager
+@inject IJSRuntime JS
+
+<PageTitle>Sites - Network Optimizer</PageTitle>
+
+<div class="page-header">
+    <h1>Sites</h1>
+    <div class="page-header-actions">
+        <a href="/settings?tab=multisite" class="page-header-icon-link" data-tooltip="Multi-Site settings" aria-label="Multi-Site settings">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                <path fill-rule="evenodd" d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd" />
+            </svg>
+        </a>
+    </div>
+    <p class="page-description">Switch between managed sites</p>
+</div>
+
+@if (!_loaded)
+{
+    <div class="loading-container">
+        <div class="spinner"></div>
+    </div>
+}
+else if (!_enabled)
+{
+    <div class="empty-state">
+        <div class="empty-icon">
+            <img src="/icons/sites.png" alt="" />
+        </div>
+        <p>Multi-site management is not enabled on this instance.</p>
+        <a class="btn btn-primary" href="/settings?tab=multisite">Set Up Multi-Site</a>
+    </div>
+}
+else
+{
+    <SitesOverviewCard LinkToSwitcher="false" />
+
+    <div class="sites-grid">
+        @foreach (var site in _sites)
+        {
+            var isCurrent = site.Slug == SiteContext.Slug;
+            <div class="card site-card @(isCurrent ? "site-card-current" : "")" @onclick="() => SwitchToAsync(site)">
+                <div class="site-card-header">
+                    <span class="status-dot @(SiteConnections.GetFor(site.Slug).IsConnected ? "online" : "offline")" data-tooltip="@(SiteConnections.GetFor(site.Slug).IsConnected ? "Console connected" : "Console not connected")"></span>
+                    <h3 class="site-card-name">@site.Name</h3>
+                    @if (isCurrent)
+                    {
+                        <span class="status-badge status-connected">Current</span>
+                    }
+                </div>
+                @if (ConsoleHost(site.Id) is { Length: > 0 } host)
+                {
+                    <div class="site-card-console" data-tooltip="UniFi Console this site connects to">@host</div>
+                }
+                <div class="site-card-meta">
+                    <span class="site-card-slug">@site.Slug</span>
+                    @if (site.IsDefault)
+                    {
+                        <span class="status-badge">Default</span>
+                    }
+                    @if (LicenseState.GetStatus(site.Slug) is { } licenseStatus)
+                    {
+                        <span class="status-badge @LicenseBadgeClass(licenseStatus)" data-tooltip="@LicenseBadgeTooltip(licenseStatus)">@LicenseBadgeLabel(licenseStatus)</span>
+                    }
+                </div>
+                <div class="site-card-footer">
+                    @if (!site.IsDefault)
+                    {
+                        <span class="site-card-created">Added @site.CreatedAt.ToLocalTime().ToString("MMM d, yyyy")</span>
+                    }
+                    @if (AgentCount(site.Id) > 0)
+                    {
+                        <span class="site-card-agents">@OnlineAgentCount(site.Id)/@AgentCount(site.Id) agents online</span>
+                    }
+                </div>
+            </div>
+        }
+
+        <div class="card site-card site-card-add" @onclick="@(() => NavigationManager.NavigateTo("/settings?tab=multisite"))">
+            <span class="site-card-add-plus">+</span>
+            <span>Add Site</span>
+        </div>
+    </div>
+}
+
+@code {
+    private bool _loaded;
+    private bool _enabled;
+    private List<Site> _sites = new();
+    private List<SiteAgent> _agents = new();
+    private readonly Dictionary<int, string?> _consoleHosts = new();
+
+    private System.Threading.Timer? _pollTimer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _enabled = await SiteManagement.IsMultiSiteEnabledAsync();
+        if (_enabled)
+        {
+            _sites = await SiteManagement.GetSitesAsync();
+            _agents = await AgentEnrollment.GetAllAgentsAsync();
+            await LoadConsoleHostsAsync();
+
+            // Keep the console dots and agent counts current while the page is
+            // open - they'd otherwise freeze at whatever page load saw and drift
+            // from the site dropdown / Multi-Site settings after an agent or
+            // console comes or goes.
+            _pollTimer = new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        _agents = await AgentEnrollment.GetAllAgentsAsync();
+                        StateHasChanged();
+                    });
+                }
+                catch { /* prevent timer death */ }
+            }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        }
+        _loaded = true;
+    }
+
+    public void Dispose()
+    {
+        _pollTimer?.Dispose();
+    }
+
+    // Each site's UniFi Console host, read from its own database, shown under the
+    // site name so people can orient themselves and catch a wrong console before
+    // switching into it.
+    private async Task LoadConsoleHostsAsync()
+    {
+        foreach (var site in _sites)
+        {
+            try
+            {
+                await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+                // Prefer the real UniFi Console name; fall back to the console host.
+                var nameSetting = await db.SystemSettings.FindAsync(UniFiConnectionService.ConsoleNameKey);
+                if (!string.IsNullOrWhiteSpace(nameSetting?.Value))
+                {
+                    _consoleHosts[site.Id] = nameSetting.Value;
+                    continue;
+                }
+                var settings = await db.UniFiConnectionSettings.AsNoTracking().FirstOrDefaultAsync();
+                _consoleHosts[site.Id] = ExtractHost(settings?.ControllerUrl);
+            }
+            catch
+            {
+                _consoleHosts[site.Id] = null;
+            }
+        }
+    }
+
+    private string? ConsoleHost(int siteId) => _consoleHosts.TryGetValue(siteId, out var host) ? host : null;
+
+    private static string? ExtractHost(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return null;
+        return Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri) ? uri.Host : url.Trim();
+    }
+
+    private int AgentCount(int siteId) => _agents.Count(a => a.SiteId == siteId);
+
+    private int OnlineAgentCount(int siteId) =>
+        _agents.Count(a => a.SiteId == siteId && TunnelRegistry.IsAgentLive(a));
+
+    private static string LicenseBadgeClass(SiteLicenseStatus status) => status.State switch
+    {
+        SiteLicenseState.Licensed => "status-connected",
+        SiteLicenseState.Grace => "status-provisioning",
+        SiteLicenseState.Restricted => "status-error",
+        _ => "",
+    };
+
+    private static string LicenseBadgeLabel(SiteLicenseStatus status) => status.State switch
+    {
+        SiteLicenseState.Licensed => "Licensed",
+        SiteLicenseState.Grace => $"Grace - {GraceDaysLeft(status)} days left",
+        SiteLicenseState.Restricted => "Restricted",
+        _ => "Free tier",
+    };
+
+    private static string? LicenseBadgeTooltip(SiteLicenseStatus status) =>
+        status.State == SiteLicenseState.Licensed && !string.IsNullOrEmpty(status.CoveringKeyOrg)
+            ? status.CoveringKeyOrg
+            : null;
+
+    private static int GraceDaysLeft(SiteLicenseStatus status) =>
+        status.GraceDeadline is { } deadline
+            ? Math.Max(0, (int)Math.Ceiling((deadline - DateTime.UtcNow).TotalDays))
+            : 0;
+
+    private async Task SwitchToAsync(Site site)
+    {
+        if (site.Slug == SiteContext.Slug)
+            return;
+
+        // Site context is cookie-based; a full reload re-resolves every scoped
+        // service against the selected site's database.
+        await JS.InvokeVoidAsync("eval",
+            $"document.cookie = '{SiteContextService.CookieName}={site.Slug}; path=/; max-age=31536000; SameSite=Lax'");
+        NavigationManager.NavigateTo("/", forceLoad: true);
+    }
+}

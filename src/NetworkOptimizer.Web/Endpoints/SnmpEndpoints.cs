@@ -14,15 +14,46 @@ public static class SnmpEndpoints
         app.MapPost("/api/monitoring/snmp/oid-check", async (
             TestOidRequest request,
             UniFiConnectionService connectionService,
-            IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+            SiteDbContextFactory siteDbFactory,
+            SiteContextService siteContext,
             ICredentialProtectionService credentialProtection,
+            AgentSnmpQueryService agentSnmpQuery,
             ILoggerFactory loggerFactory,
             CancellationToken ct) =>
         {
+            var oidLog = loggerFactory.CreateLogger("SnmpOidCheck");
             if (string.IsNullOrWhiteSpace(request.DeviceMac) || string.IsNullOrWhiteSpace(request.Oid))
                 return Results.BadRequest(new TestOidResponse { ErrorMessage = "Device MAC and OID are required." });
 
-            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            var hasAgent = !siteContext.IsDefault && agentSnmpQuery.HasAgentForSite(siteContext.Slug);
+            oidLog.LogDebug(
+                "OID test: site={Slug} isDefault={IsDefault} hasAgent={HasAgent} mac={Mac} oid={Oid}",
+                siteContext.Slug, siteContext.IsDefault, hasAgent, request.DeviceMac, request.Oid);
+
+            // Agent-covered site: the server can't reach the device directly, so run the GET
+            // through the site's agent. Main and any site without an online agent fall through
+            // to the direct poll below (unchanged).
+            if (hasAgent)
+            {
+                var agentDeviceIp = await ResolveDeviceIpAsync(request.DeviceMac, connectionService, ct);
+                oidLog.LogDebug("OID test: agent path, resolved device IP={Ip} (connected={Connected})",
+                    agentDeviceIp ?? "<null>", connectionService.IsConnected);
+                if (agentDeviceIp == null)
+                    return Results.BadRequest(new TestOidResponse { ErrorMessage = "Could not resolve device IP." });
+
+                var agentResult = await agentSnmpQuery.QueryAsync(
+                    siteContext.Slug, agentDeviceIp, request.Oid, TimeSpan.FromSeconds(10), ct);
+                oidLog.LogDebug("OID test: agent result success={Success} value={Value} error={Error}",
+                    agentResult?.Success, agentResult?.Value, agentResult?.Error ?? "<null result>");
+                if (agentResult != null)
+                    return Results.Ok(agentResult.Success
+                        ? new TestOidResponse { Success = true, Value = agentResult.Value }
+                        : new TestOidResponse { ErrorMessage = string.IsNullOrEmpty(agentResult.Error) ? "No response." : agentResult.Error });
+                // agentResult == null: the agent's tunnel dropped between the check and the send;
+                // fall through to a direct attempt rather than failing outright.
+            }
+
+            await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
             var settings = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (settings == null)
                 return Results.BadRequest(new TestOidResponse { ErrorMessage = "Monitoring not configured." });
@@ -58,10 +89,11 @@ public static class SnmpEndpoints
 
         app.MapGet("/api/monitoring/snmp/custom-oids/{deviceMac}", async (
             string deviceMac,
-            IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+            SiteDbContextFactory siteDbFactory,
+            SiteContextService siteContext,
             CancellationToken ct) =>
         {
-            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
             var oids = await db.CustomOidConfigurations
                 .Where(c => c.DeviceMac == deviceMac)
                 .OrderBy(c => c.FieldName)
@@ -81,7 +113,8 @@ public static class SnmpEndpoints
 
         app.MapPost("/api/monitoring/snmp/custom-oids", async (
             SaveCustomOidRequest request,
-            IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+            SiteDbContextFactory siteDbFactory,
+            SiteContextService siteContext,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(request.DeviceMac) ||
@@ -89,7 +122,7 @@ public static class SnmpEndpoints
                 string.IsNullOrWhiteSpace(request.FieldName))
                 return Results.BadRequest("DeviceMac, Oid, and FieldName are required.");
 
-            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
             var now = DateTime.UtcNow;
 
             if (request.Id > 0)
@@ -127,10 +160,11 @@ public static class SnmpEndpoints
 
         app.MapDelete("/api/monitoring/snmp/custom-oids/{id:int}", async (
             int id,
-            IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
+            SiteDbContextFactory siteDbFactory,
+            SiteContextService siteContext,
             CancellationToken ct) =>
         {
-            await using var db = await dbFactory.CreateDbContextAsync(ct);
+            await using var db = siteDbFactory.CreateForSite(siteContext.Slug, siteContext.IsDefault);
             var entry = await db.CustomOidConfigurations.FindAsync(new object[] { id }, ct);
             if (entry == null) return Results.NotFound();
 

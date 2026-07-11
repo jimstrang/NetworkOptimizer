@@ -45,18 +45,47 @@ public class MonitoringInfluxClient : IAsyncDisposable
     private bool _initialized;
     private string? _tokenHash;
 
+    private readonly SiteDbContextFactory? _siteDbFactory;
+    private readonly string? _siteSlug;
+
+    /// <param name="siteSlug">
+    /// Non-default site whose database holds this client's MonitoringSettings
+    /// (URL, token, slug-prefixed bucket names). Null/empty = the default
+    /// site, configured from the main database as before.
+    /// </param>
     public MonitoringInfluxClient(
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
         ICredentialProtectionService credentialProtection,
-        ILogger<MonitoringInfluxClient> logger)
+        ILogger<MonitoringInfluxClient> logger,
+        SiteDbContextFactory? siteDbFactory = null,
+        string? siteSlug = null)
     {
         _dbFactory = dbFactory;
         _credentialProtection = credentialProtection;
         _logger = logger;
+        _siteDbFactory = siteDbFactory;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? null : siteSlug;
+    }
+
+    /// <summary>Context for the database holding this client's settings row.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSettingsContextAsync(CancellationToken ct)
+    {
+        if (_siteSlug != null && _siteDbFactory != null)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
     }
 
     public string? CurrentUrl => _url;
     public bool IsConfigured => _client != null && !string.IsNullOrEmpty(_bucket);
+
+    /// <summary>The primary bucket this client actually reads/writes, after resolution
+    /// (slug-prefixed for non-default sites; collisions with main are corrected). Null
+    /// until configured. Use this for display so the UI matches the real target bucket
+    /// rather than the raw stored value.</summary>
+    public string? PrimaryBucket => _bucket;
+
+    /// <summary>The long-term bucket this client actually reads/writes, after resolution.</summary>
+    public string? LongtermBucket => _longtermBucket;
 
     /// <summary>
     /// Build (or rebuild) the client from current MonitoringSettings. Safe to call repeatedly.
@@ -67,8 +96,38 @@ public class MonitoringInfluxClient : IAsyncDisposable
         await _configLock.WaitAsync(ct);
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSettingsContextAsync(ct);
             var settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
+
+            // One InfluxDB server per NO server, many buckets. A non-default site NEVER
+            // holds its own connection: server, org, and token always come from the main
+            // site (whose org-scoped token can write every site's buckets). A site only
+            // chooses its bucket NAMES. Resolving them here - the single point every read
+            // and write is configured from - means no DB/scripted/edited state can ever
+            // point a site's client at main's buckets.
+            if (_siteSlug != null)
+            {
+                await using var mainDb = await _dbFactory.CreateDbContextAsync(ct);
+                var main = await mainDb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
+                if (!HasInfluxConfig(main))
+                {
+                    _logger.LogDebug("Main site has no shared InfluxDB connection yet; site {Slug} client not configured", _siteSlug);
+                    await DisposeClientAsync();
+                    _initialized = false;
+                    return false;
+                }
+
+                var derived = new MonitoringSettings
+                {
+                    InfluxDbUrl = main!.InfluxDbUrl,
+                    InfluxDbToken = main.InfluxDbToken,
+                    InfluxDbOrg = main.InfluxDbOrg,
+                    InfluxDbBucket = ResolveSiteBucket(settings?.InfluxDbBucket, main),
+                    InfluxDbLongtermBucket = ResolveSiteLongtermBucket(settings?.InfluxDbLongtermBucket, main)
+                };
+                return await ApplyConfigAsync(derived, ct);
+            }
+
             if (settings == null)
             {
                 _logger.LogDebug("MonitoringSettings row not yet created; InfluxDB client not configured");
@@ -83,6 +142,42 @@ public class MonitoringInfluxClient : IAsyncDisposable
             _configLock.Release();
         }
     }
+
+    private static bool HasInfluxConfig(MonitoringSettings? settings) =>
+        settings != null
+        && !string.IsNullOrWhiteSpace(settings.InfluxDbUrl)
+        && !string.IsNullOrWhiteSpace(settings.InfluxDbToken)
+        && !string.IsNullOrWhiteSpace(settings.InfluxDbOrg)
+        && !string.IsNullOrWhiteSpace(settings.InfluxDbBucket);
+
+    /// <summary>
+    /// Resolves a non-default site's primary bucket. A custom name from the site's own
+    /// row is honored (non-standard names are fine), EXCEPT a name that collides with
+    /// either of main's buckets - that is corrected to the slug-prefixed default so a
+    /// site's series can never be written into main's data. This is the hard floor
+    /// against writing into MAIN; collisions with OTHER sites are rejected at set-time
+    /// in the UI, where the full set of known buckets is available.
+    /// </summary>
+    private string ResolveSiteBucket(string? siteBucket, MonitoringSettings main)
+    {
+        var fallback = $"{_siteSlug}-{main.InfluxDbBucket}";
+        var name = siteBucket?.Trim();
+        return string.IsNullOrEmpty(name) || CollidesWithMain(name, main) ? fallback : name;
+    }
+
+    private string ResolveSiteLongtermBucket(string? siteLongterm, MonitoringSettings main)
+    {
+        var fallback = string.IsNullOrWhiteSpace(main.InfluxDbLongtermBucket)
+            ? string.Empty
+            : $"{_siteSlug}-{main.InfluxDbLongtermBucket}";
+        var name = siteLongterm?.Trim();
+        return string.IsNullOrEmpty(name) || CollidesWithMain(name, main) ? fallback : name;
+    }
+
+    /// <summary>True when a proposed site bucket name equals one of main's bucket names.</summary>
+    private static bool CollidesWithMain(string name, MonitoringSettings main) =>
+        string.Equals(name, main.InfluxDbBucket?.Trim(), StringComparison.OrdinalIgnoreCase)
+        || string.Equals(name, main.InfluxDbLongtermBucket?.Trim(), StringComparison.OrdinalIgnoreCase);
 
     private async Task<bool> ApplyConfigAsync(MonitoringSettings settings, CancellationToken ct)
     {
@@ -238,7 +333,7 @@ public class MonitoringInfluxClient : IAsyncDisposable
     {
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSettingsContextAsync(ct);
             var settings = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (settings == null) return;
             settings.InfluxDbReachable = reachable;
@@ -395,7 +490,8 @@ public class MonitoringInfluxClient : IAsyncDisposable
         bool success,
         int sent,
         int received,
-        DateTime timestamp)
+        DateTime timestamp,
+        string? wanContext = null)
     {
         if (!IsConfigured) return Task.CompletedTask;
         var point = PointData.Measurement("latency")
@@ -416,6 +512,9 @@ public class MonitoringInfluxClient : IAsyncDisposable
         if (rttAvgMs.HasValue) point = point.Field("rtt_avg_ms", rttAvgMs.Value);
         if (rttMaxMs.HasValue) point = point.Field("rtt_max_ms", rttMaxMs.Value);
         if (jitterMs.HasValue) point = point.Field("jitter_ms", jitterMs.Value);
+        // Multi-WAN context tag, emitted only for non-default contexts so the
+        // schema stays additive-only: single-WAN installs never see it.
+        if (!string.IsNullOrEmpty(wanContext)) point = point.Tag("wan", wanContext);
 
         Enqueue(point, longterm: false);
         return Task.CompletedTask;
@@ -470,7 +569,10 @@ public class MonitoringInfluxClient : IAsyncDisposable
         string clientMac,
         double? txThroughputBps,
         double? rxThroughputBps,
-        DateTime timestamp)
+        DateTime timestamp,
+        int? port = null,
+        string? clientIp = null,
+        string? clientName = null)
     {
         if (!IsConfigured) return Task.CompletedTask;
         var point = PointData.Measurement("wired_client")
@@ -478,11 +580,154 @@ public class MonitoringInfluxClient : IAsyncDisposable
             .Field("client_mac", NormalizeMac(clientMac))
             .Timestamp(timestamp.ToUniversalTime(), WritePrecision.Ns);
 
+        // Port tag (additive, absent on pre-2.0 points): lets playback reconstruct
+        // which client sat on which port at a given instant (the Port Statistics
+        // Client column). Series growth is bounded by physical ports in use per
+        // device. client_ip / client_name are fields (no cardinality impact) so a
+        // historical scrub can label the client without consulting the live client
+        // registry, whose names may have drifted since.
+        if (port is > 0) point = point.Tag("port", port.Value.ToString());
+        if (!string.IsNullOrEmpty(clientIp)) point = point.Field("client_ip", clientIp);
+        if (!string.IsNullOrEmpty(clientName)) point = point.Field("client_name", clientName);
+
         if (txThroughputBps.HasValue) point = point.Field("tx_throughput_bps", txThroughputBps.Value);
         if (rxThroughputBps.HasValue) point = point.Field("rx_throughput_bps", rxThroughputBps.Value);
 
         Enqueue(point, longterm: false);
         return Task.CompletedTask;
+    }
+
+    /// <summary>A wired client resolved to a device port at a playback instant.</summary>
+    public class WiredPortClientPoint
+    {
+        public string DeviceMac { get; init; } = "";
+        public int Port { get; init; }
+        public string ClientMac { get; init; } = "";
+        public string? ClientIp { get; init; }
+        public string? ClientName { get; init; }
+    }
+
+    /// <summary>
+    /// The single wired client on each (device, port) around a historic instant,
+    /// from port-tagged <c>wired_client</c> points - the playback counterpart of
+    /// the live GetPortClient map. Ports that saw more than one distinct client
+    /// MAC in the window are omitted, matching the live map's rule of never
+    /// labelling an uplink/trunk with an arbitrary client. Points written before
+    /// the port tag existed (pre-2.0) carry no tag and simply yield no rows.
+    /// </summary>
+    public async Task<IReadOnlyList<WiredPortClientPoint>> QueryWiredPortClientsAsync(
+        IReadOnlyList<string>? deviceMacs,
+        DateTime at,
+        CancellationToken ct = default)
+    {
+        if (!IsConfigured) return Array.Empty<WiredPortClientPoint>();
+
+        // Same snapshot window as QueryPortStatsAsync so the Client column lines up
+        // with the counters shown at the same scrub point.
+        var center = at.ToUniversalTime();
+        var rangeClause = $"range(start: {ToFluxInstant(center.AddSeconds(-90))}, stop: {ToFluxInstant(center.AddSeconds(30))})";
+
+        var macFilter = "";
+        if (deviceMacs != null && deviceMacs.Count > 0)
+        {
+            var macs = deviceMacs.Select(NormalizeMac).Distinct().ToList();
+            macFilter = "\n  |> filter(fn: (r) => " +
+                string.Join(" or ", macs.Select(m => $@"r.device_mac == ""{m}""")) + ")";
+        }
+
+        var flux = $@"
+from(bucket: ""{_bucket}"")
+  |> {rangeClause}
+  |> filter(fn: (r) => r._measurement == ""wired_client"")
+  |> filter(fn: (r) => exists r.port)
+  |> filter(fn: (r) => r._field == ""client_mac"" or r._field == ""client_ip"" or r._field == ""client_name""){macFilter}
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+";
+        var rows = new List<(string DeviceMac, int Port, DateTime Time, string ClientMac, string? Ip, string? Name)>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            // Normalize on read so grouping (and the caller's dictionary key) can
+            // never split one device across case variants, matching the sibling
+            // QueryPortStatsAsync's case-insensitive grouping.
+            var deviceMac = NormalizeMac(record.GetValueByKey("device_mac") as string ?? "");
+            var clientMac = record.GetValueByKey("client_mac") as string ?? "";
+            if (deviceMac.Length == 0 || clientMac.Length == 0) continue;
+            if (!int.TryParse(record.GetValueByKey("port") as string, out var port) || port <= 0) continue;
+            rows.Add((deviceMac, port, ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
+                clientMac,
+                record.GetValueByKey("client_ip") as string,
+                record.GetValueByKey("client_name") as string));
+        }
+
+        var result = new List<WiredPortClientPoint>();
+        foreach (var group in rows.GroupBy(r => (r.DeviceMac, r.Port)))
+        {
+            if (group.Select(r => r.ClientMac).Distinct(StringComparer.OrdinalIgnoreCase).Count() != 1)
+                continue; // multiple clients in the window - trunk/uplink, never label
+            var latest = group.OrderByDescending(r => r.Time).First();
+            result.Add(new WiredPortClientPoint
+            {
+                DeviceMac = latest.DeviceMac,
+                Port = latest.Port,
+                ClientMac = latest.ClientMac,
+                ClientIp = latest.Ip,
+                ClientName = latest.Name,
+            });
+        }
+        return result;
+    }
+
+    /// <summary>The latest persisted DDM reading of one SFP port (see <see cref="QueryLatestSfpAsync"/>).</summary>
+    public class SfpLatestPoint
+    {
+        public string DeviceMac { get; init; } = "";
+        public string PortName { get; init; } = "";
+        public double? RxPowerDbm { get; init; }
+        public double? TxPowerDbm { get; init; }
+        public double? TxBiasMa { get; init; }
+        public double? TemperatureC { get; init; }
+        public double? VoltageV { get; init; }
+        public DateTime Time { get; init; }
+    }
+
+    /// <summary>
+    /// Latest persisted DDM reading per (device, port) from the <c>sfp</c>
+    /// measurement, used to warm the live SFP cache after a restart so the
+    /// Optical tables aren't blank until the slow tier's first cycle (up to
+    /// several minutes on agent-backed sites, whose first tick usually fires
+    /// before the tunnel console reconnects). Window bounded to recent history:
+    /// a module that stopped reporting long ago should not resurrect as "live".
+    /// </summary>
+    public async Task<IReadOnlyList<SfpLatestPoint>> QueryLatestSfpAsync(CancellationToken ct = default)
+    {
+        if (!IsConfigured || string.IsNullOrEmpty(_longtermBucket)) return Array.Empty<SfpLatestPoint>();
+
+        var flux = $@"
+from(bucket: ""{_longtermBucket}"")
+  |> range(start: -6h)
+  |> filter(fn: (r) => r._measurement == ""sfp"")
+  |> last()
+  |> pivot(rowKey:[""_time""], columnKey: [""_field""], valueColumn: ""_value"")
+";
+        var results = new List<SfpLatestPoint>();
+        await foreach (var record in QueryFluxAsync(flux, ct))
+        {
+            var deviceMac = record.GetValueByKey("device_mac") as string ?? "";
+            var portName = record.GetValueByKey("port_name") as string ?? "";
+            if (deviceMac.Length == 0 || portName.Length == 0) continue;
+            results.Add(new SfpLatestPoint
+            {
+                DeviceMac = deviceMac,
+                PortName = portName,
+                RxPowerDbm = AsDoubleOrNull(record.GetValueByKey("rx_power_dbm")),
+                TxPowerDbm = AsDoubleOrNull(record.GetValueByKey("tx_power_dbm")),
+                TxBiasMa = AsDoubleOrNull(record.GetValueByKey("tx_bias_ma")),
+                TemperatureC = AsDoubleOrNull(record.GetValueByKey("temperature_c")),
+                VoltageV = AsDoubleOrNull(record.GetValueByKey("voltage_v")),
+                Time = ToUtc(record.GetTimeInDateTime() ?? DateTime.UtcNow),
+            });
+        }
+        return results;
     }
 
     public Task WriteSfpAsync(
@@ -2472,7 +2717,19 @@ from(bucket: ""{_longtermBucket}"")
         }
     }
 
-    public async ValueTask DisposeAsync()
+    /// <summary>
+    /// No-op. Instances are owned by MonitoringInfluxRegistry but handed out
+    /// through a scoped forwarding registration, so the DI container calls
+    /// DisposeAsync whenever a request/circuit scope ends. Disposing here would
+    /// tear down the shared client (its config/flush semaphores) out from under
+    /// the collection agent, ISP Health, and chart reads - every subsequent call
+    /// then throws ObjectDisposedException. Only the registry may tear it down,
+    /// via DisposeOwnedAsync. Mirrors UniFiConnectionService.Dispose/DisposeOwned.
+    /// </summary>
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    /// <summary>Real teardown, invoked only by the owning registry at app shutdown.</summary>
+    public async ValueTask DisposeOwnedAsync()
     {
         if (_disposed) return;
         _disposed = true;

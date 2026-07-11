@@ -12,6 +12,8 @@
 @inject NavigationManager NavigationManager
 @inject ApMapService ApMapService
 @inject MeshOptimizationService MeshService
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
 @inject PullToRefreshState PtrState
 @implements IDisposable
 @rendermode InteractiveServer
@@ -22,6 +24,8 @@
     <h1>Wi-Fi Optimizer</h1>
     <p class="page-description">Site health scoring, signal analysis, and optimization recommendations</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
 {
@@ -611,7 +615,7 @@
                                             {
                                                 <button class="btn btn-sm btn-primary optimize-mesh-btn"
                                                         @onclick="@(() => OptimizeMeshAsync(ap))"
-                                                        disabled="@(!ap.IsOnline || _optimizingMacs.Contains(ap.Mac))"
+                                                        disabled="@(!ap.IsOnline || _optimizingMacs.Contains(ap.Mac) || IsLicenseRestricted)"
                                                         data-tooltip="Re-scans the mesh uplink so this AP reconnects to its highest Uplink Priority parent when it's stuck on a weaker one. Safe to re-run.">
                                                     @if (_optimizingMacs.Contains(ap.Mac))
                                                     {
@@ -745,6 +749,8 @@
 }
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     [SupplyParameterFromQuery(Name = "client")]
     public string? ClientQueryParam { get; set; }
 
@@ -1027,9 +1033,19 @@
 
     private async void OnConnectionChanged()
     {
-        WiFiService.ClearCache();
-        await LoadDataAsync();
-        await InvokeAsync(StateHasChanged);
+        // Fires from a background thread (console reconnect), so marshal the whole
+        // reload onto the dispatcher - LoadDataAsync calls StateHasChanged directly -
+        // and swallow exceptions so this async void handler can't crash the circuit.
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                WiFiService.ClearCache();
+                await LoadDataAsync();
+                StateHasChanged();
+            });
+        }
+        catch { /* component may be disposed */ }
     }
 
     private async Task LoadDataAsync()

@@ -1,0 +1,422 @@
+@using NetworkOptimizer.Core.Helpers
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Web.Services.Licensing
+@implements IDisposable
+@inject LicenseStateService LicenseState
+@inject LicenseActivationService Activation
+@inject LicensePhoneHomeService PhoneHome
+@inject SiteManagementService SiteManagement
+@inject IJSRuntime JS
+
+<div class="card settings-tab-application" id="licensing">
+    <div class="card-header">
+        <h2 class="card-title">Licensing</h2>
+        @if (_multiSiteEnabled)
+        {
+            <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+        }
+    </div>
+    <div class="card-body">
+        @if (LicenseState.AnyKeysActive)
+        {
+            <p class="section-description">
+                @UsedSlots of @LicenseState.TotalAllowance licensed site slots used &middot; @FreeSlots free@(SoonestTermExpiry is { } expiry ? $" · earliest term expires {expiry.ToLocalTime():MMM d, yyyy}" : "")
+            </p>
+        }
+        else
+        {
+            <p class="section-description">
+                Free tier: up to @SiteManagementService.FreeSiteLimit sites for personal use. Enter a license key to unlock more.
+            </p>
+        }
+
+        <div class="form-group">
+            <label class="form-label">License Key</label>
+            <input type="text" class="form-control" @bind="_enteredKey" @bind:event="oninput"
+                   placeholder="NO-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"
+                   autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+        </div>
+        <div class="action-buttons license-activate-actions">
+            <button class="btn btn-primary" @onclick="ActivateKeyAsync" disabled="@(string.IsNullOrWhiteSpace(_enteredKey) || _activating)">
+                @if (_activating)
+                {
+                    <span class="spinner spinner-sm"></span>
+                    <span>Activating...</span>
+                }
+                else
+                {
+                    <span>Activate</span>
+                }
+            </button>
+        </div>
+
+        @if (!string.IsNullOrEmpty(_activationError))
+        {
+            <div class="alert alert-danger" style="margin-top: 1rem;">
+                @_activationError
+            </div>
+        }
+
+        @if (_keys.Count > 0)
+        {
+            <div class="table-responsive" style="padding-top: 1rem;">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Key</th>
+                            <th>Organization</th>
+                            <th>Model</th>
+                            <th>Sites</th>
+                            <th>Status</th>
+                            <th>Paid through</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var key in _keys)
+                        {
+                            <tr>
+                                <td><span class="license-key-cell" data-tooltip="@key.LicenseKey">@LicenseKeyUtilities.MaskKey(key.LicenseKey)</span></td>
+                                <td>@(string.IsNullOrEmpty(key.Org) ? "-" : key.Org)</td>
+                                <td>
+                                    @if (key.Model == LicenseKeyModels.Perpetual && key.PerpetualConfirmed)
+                                    {
+                                        <span data-tooltip="Confirmed with the license server; this key never phones home again">Perpetual (confirmed)</span>
+                                    }
+                                    else
+                                    {
+                                        @GetModelLabel(key)
+                                    }
+                                </td>
+                                <td>@AssignedCount(key.Id) / @key.SiteAllowance</td>
+                                <td><span class="status-badge @GetStatusBadgeClass(key)">@GetStatusLabel(key)</span></td>
+                                <td>@(key.Model == LicenseKeyModels.Perpetual || key.PaidThrough == null ? "-" : key.PaidThrough.Value.ToLocalTime().ToString("MMM d, yyyy"))</td>
+                                <td>
+                                    <button class="btn btn-danger btn-sm" @onclick="() => RemoveKeyAsync(key)" disabled="@(_removingKeyId == key.Id)">
+                                        @if (_removingKeyId == key.Id)
+                                        {
+                                            <span class="spinner spinner-sm"></span>
+                                        }
+                                        else
+                                        {
+                                            <span>Remove</span>
+                                        }
+                                    </button>
+                                </td>
+                            </tr>
+                            @if (!string.IsNullOrEmpty(key.LastCheckError))
+                            {
+                                <tr>
+                                    <td colspan="7">
+                                        <span class="status-warning license-check-error">@key.LastCheckError@(ShowFirewallHint(key) ? " If your network restricts outbound traffic, check that your firewall allows HTTPS (443) to licensing.ozarkconnect.net." : "")</span>
+                                    </td>
+                                </tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+
+        @if (_keys.Count > 0 && _multiSiteEnabled)
+        {
+            <h4 class="license-section-title">Site Coverage</h4>
+            @foreach (var site in _sites)
+            {
+                <div class="license-site-row">
+                    <div class="license-site-name">
+                        <strong>@site.Name</strong>
+                        <span> @site.Slug</span>
+                    </div>
+                    @if (LicenseState.GetStatus(site.Slug) is { } status)
+                    {
+                        <span class="status-badge @GetSiteBadgeClass(status)">@GetSiteBadgeLabel(status)</span>
+                    }
+                    <select class="form-control license-site-select" value="@(AssignedKeyId(site.Id)?.ToString() ?? "")"
+                            @onchange="e => OnAssignmentChangedAsync(site.Id, e)">
+                        <option value="">Not covered</option>
+                        @foreach (var key in _keys)
+                        {
+                            <option value="@key.Id">@GetKeyOptionLabel(key)</option>
+                        }
+                    </select>
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(_assignError))
+            {
+                <div class="alert alert-danger" style="margin-top: 1rem;">
+                    @_assignError
+                </div>
+            }
+        }
+
+        @if (_keys.Count > 0)
+        {
+            <div class="action-buttons license-refresh-actions">
+                <button class="btn btn-secondary" @onclick="RefreshLicensesAsync" disabled="@_refreshing">
+                    @if (_refreshing)
+                    {
+                        <span class="spinner spinner-sm"></span>
+                        <span>Refreshing...</span>
+                    }
+                    else
+                    {
+                        <span>Refresh licenses now</span>
+                    }
+                </button>
+                @if (NewestCheckAt is { } lastCheck)
+                {
+                    <span class="form-help">Last checked: @TimeFormatHelper.FormatRelativeTime(lastCheck)</span>
+                }
+            </div>
+        }
+
+    </div>
+</div>
+
+@code {
+    private bool _multiSiteEnabled;
+    private List<LicenseKeyRecord> _keys = new();
+    private List<SiteLicenseAssignment> _assignments = new();
+    private List<Site> _sites = new();
+
+    private string _enteredKey = "";
+    private string? _activationError;
+    private bool _activating;
+    private int _removingKeyId;
+    private string? _assignError;
+    private bool _refreshing;
+
+    /// <summary>
+    /// On a single-site instance there is no Site row to assign, but adding a key
+    /// declares commercial use, so the implicit main site consumes one seat from the
+    /// oldest active key. Once any Site row exists (multi-site enabled now, or enabled
+    /// before and since disabled - the row and its assignment are preserved) the main
+    /// site is a real row counted by its assignment, so this is null; otherwise the
+    /// assignment and the implicit seat would double-count.
+    /// </summary>
+    private int? ImplicitCoverKeyId
+    {
+        get
+        {
+            if (_sites.Count > 0)
+                return null;
+            var now = DateTime.UtcNow;
+            return _keys.Where(k => LicenseStateService.IsActiveCurrent(k, now))
+                .OrderBy(k => k.CreatedAt).ThenBy(k => k.Id)
+                .Select(k => (int?)k.Id).FirstOrDefault();
+        }
+    }
+
+    private int UsedSlots
+    {
+        get
+        {
+            var now = DateTime.UtcNow;
+            var activeKeyIds = _keys.Where(k => LicenseStateService.IsActiveCurrent(k, now)).Select(k => k.Id).ToHashSet();
+            var assigned = _assignments.Count(a => activeKeyIds.Contains(a.LicenseKeyRecordId));
+            return assigned + (ImplicitCoverKeyId != null ? 1 : 0);
+        }
+    }
+
+    private int FreeSlots => Math.Max(0, LicenseState.TotalAllowance - UsedSlots);
+
+    /// <summary>Soonest paid-through date among active term keys; null when all keys are perpetual.</summary>
+    private DateTime? SoonestTermExpiry
+    {
+        get
+        {
+            var now = DateTime.UtcNow;
+            return _keys
+                .Where(k => LicenseStateService.IsActiveCurrent(k, now) && k.Model == LicenseKeyModels.Term && k.PaidThrough != null)
+                .Select(k => k.PaidThrough!.Value)
+                .DefaultIfEmpty()
+                .Min() is { } d && d != default ? d : null;
+        }
+    }
+
+
+    private DateTime? NewestCheckAt => _keys
+        .Where(k => k.LastCheckAt != null)
+        .Select(k => k.LastCheckAt)
+        .OrderByDescending(t => t)
+        .FirstOrDefault();
+
+    protected override async Task OnInitializedAsync()
+    {
+        LicenseState.OnStateChanged += HandleStateChanged;
+        _multiSiteEnabled = await SiteManagement.IsMultiSiteEnabledAsync();
+        await LoadDataAsync();
+    }
+
+    private async Task LoadDataAsync()
+    {
+        _multiSiteEnabled = await SiteManagement.IsMultiSiteEnabledAsync();
+        _keys = await Activation.GetKeysAsync();
+        _assignments = await Activation.GetAssignmentsAsync();
+        _sites = await SiteManagement.GetSitesAsync();
+    }
+
+    private void HandleStateChanged() => _ = InvokeAsync(async () =>
+    {
+        try
+        {
+            await LoadDataAsync();
+            StateHasChanged();
+        }
+        catch
+        {
+            // Circuit may be tearing down; a missed refresh is harmless.
+        }
+    });
+
+    private async Task ActivateKeyAsync()
+    {
+        _activationError = null;
+
+        // Local checksum pre-check: reject obvious typos without a server round trip.
+        if (!LicenseKeyUtilities.IsValid(_enteredKey))
+        {
+            _activationError = "That key does not look right - check for typos";
+            return;
+        }
+
+        _activating = true;
+        try
+        {
+            var error = await Activation.ActivateAsync(_enteredKey);
+            if (error != null)
+            {
+                _activationError = error;
+            }
+            else
+            {
+                _enteredKey = "";
+                await LoadDataAsync();
+            }
+        }
+        finally
+        {
+            _activating = false;
+        }
+    }
+
+    private async Task RemoveKeyAsync(LicenseKeyRecord key)
+    {
+        if (!await JS.InvokeAsync<bool>("confirm",
+                $"Remove license key {LicenseKeyUtilities.MaskKey(key.LicenseKey)}? Sites it covers lose their coverage."))
+            return;
+
+        _removingKeyId = key.Id;
+        try
+        {
+            await Activation.RemoveAsync(key.Id);
+            await LoadDataAsync();
+        }
+        finally
+        {
+            _removingKeyId = 0;
+        }
+    }
+
+    private async Task OnAssignmentChangedAsync(int siteId, ChangeEventArgs e)
+    {
+        _assignError = null;
+        int? keyId = int.TryParse(e.Value?.ToString(), out var parsed) ? parsed : null;
+        var error = await Activation.AssignAsync(siteId, keyId);
+        if (error != null)
+            _assignError = error;
+        await LoadDataAsync();
+    }
+
+    private async Task RefreshLicensesAsync()
+    {
+        _refreshing = true;
+        try
+        {
+            await PhoneHome.RefreshAllAsync();
+            await LoadDataAsync();
+        }
+        finally
+        {
+            _refreshing = false;
+        }
+    }
+
+    private int AssignedCount(int keyId) =>
+        _assignments.Count(a => a.LicenseKeyRecordId == keyId) + (ImplicitCoverKeyId == keyId ? 1 : 0);
+
+    private int? AssignedKeyId(int siteId) =>
+        _assignments.FirstOrDefault(a => a.SiteId == siteId)?.LicenseKeyRecordId;
+
+    private static string GetModelLabel(LicenseKeyRecord key) => key.Model switch
+    {
+        LicenseKeyModels.Perpetual => "Perpetual",
+        LicenseKeyModels.Term => "Term",
+        _ => "-",
+    };
+
+    private static bool ShowFirewallHint(LicenseKeyRecord key) =>
+        key.LastCheckError?.Contains("unreachable", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static string GetStatusBadgeClass(LicenseKeyRecord key)
+    {
+        var now = DateTime.UtcNow;
+        if (key.Status == LicenseKeyStatuses.Revoked)
+            return "status-error";
+        if (key.Status == LicenseKeyStatuses.Pending)
+            return "status-provisioning";
+        if (LicenseStateService.IsActiveCurrent(key, now))
+            return "status-active";
+        if (LicenseStateService.IsInGrace(key, now))
+            return "status-provisioning";
+        return "status-error";
+    }
+
+    private static string GetStatusLabel(LicenseKeyRecord key)
+    {
+        var now = DateTime.UtcNow;
+        if (key.Status == LicenseKeyStatuses.Revoked)
+            return "Revoked";
+        if (key.Status == LicenseKeyStatuses.Pending)
+            return "Pending";
+        if (LicenseStateService.IsActiveCurrent(key, now))
+            return "Active";
+        if (LicenseStateService.IsInGrace(key, now))
+            return "Grace";
+        return "Expired";
+    }
+
+    private string GetKeyOptionLabel(LicenseKeyRecord key)
+    {
+        var freeSlots = Math.Max(0, key.SiteAllowance - AssignedCount(key.Id));
+        var org = string.IsNullOrEmpty(key.Org) ? "" : $"{key.Org} - ";
+        return $"{org}{LicenseKeyUtilities.MaskKey(key.LicenseKey)} ({freeSlots} free)";
+    }
+
+    private static string GetSiteBadgeClass(SiteLicenseStatus status) => status.State switch
+    {
+        SiteLicenseState.Licensed => "status-active",
+        SiteLicenseState.Grace => "status-provisioning",
+        SiteLicenseState.Restricted => "status-error",
+        _ => "status-neutral",
+    };
+
+    private static string GetSiteBadgeLabel(SiteLicenseStatus status) => status.State switch
+    {
+        SiteLicenseState.Licensed => "Licensed",
+        SiteLicenseState.Grace => $"Grace - {GraceDaysLeft(status)} days left",
+        SiteLicenseState.Restricted => "Restricted",
+        _ => "Free tier",
+    };
+
+    private static int GraceDaysLeft(SiteLicenseStatus status) =>
+        status.GraceDeadline is { } deadline
+            ? Math.Max(0, (int)Math.Ceiling((deadline - DateTime.UtcNow).TotalDays))
+            : 0;
+
+    public void Dispose()
+    {
+        LicenseState.OnStateChanged -= HandleStateChanged;
+    }
+}

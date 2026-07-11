@@ -53,6 +53,7 @@
                 }
             </div>
             <div class="header-actions">
+                <SiteSwitcher />
                 <a href="/api/auth/logout" class="logout-btn">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V15m3 0 3-3m0 0-3-3m3 3H9" />
@@ -63,6 +64,7 @@
         </header>
 
         <UpdateNotificationBanner />
+        <LicenseStatusBanner />
 
         <main class="page-content">
             <article class="content">
@@ -71,14 +73,10 @@
         </main>
 
         <footer class="app-footer">
-            @{
-                var infoVersion = Assembly.GetExecutingAssembly().GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion;
-                var baseVersion = infoVersion is not null ? System.Text.RegularExpressions.Regex.Match(infoVersion, @"^\d+\.\d+\.\d+").Value : null;
-            }
             <p>&copy; 2026 Ozark Connect - Network Optimizer
-                @if (baseVersion is { Length: > 0 } bv && !bv.StartsWith("0.0.0"))
+                @if (AppVersionInfo.ReleaseVersion is { } releaseVersion)
                 {
-                    <a href="https://github.com/Ozark-Connect/NetworkOptimizer/releases/tag/v@(bv)" target="_blank" rel="noopener">v@(infoVersion)</a>
+                    <a href="https://github.com/Ozark-Connect/NetworkOptimizer/releases/tag/v@(releaseVersion)" target="_blank" rel="noopener">v@(AppVersionInfo.Informational)</a>
                 }
                 else
                 {
@@ -112,6 +110,9 @@
         }
 
         var autoHideTimer = null;
+        // Auto-hide fires once per page visit; once the bar has hidden, revealing it
+        // by scrolling up must not re-arm the timer (re-hiding on its own feels jarring)
+        var autoHideDone = false;
 
         function isContentScrollable() {
             return currentEl && currentEl.scrollHeight > currentEl.clientHeight + 10;
@@ -119,13 +120,18 @@
 
         function startAutoHideTimer(topBar) {
             clearAutoHideTimer();
+            if (autoHideDone) return;
             var page = document.querySelector('[data-autohide-nav]');
             if (!page) return;
             var delay = parseInt(page.getAttribute('data-autohide-nav')) || 3000;
             autoHideTimer = setTimeout(function() {
                 var sidebarOpen = document.querySelector('.sidebar.open');
                 if (sidebarOpen) return;
+                // Site switcher menu lives inside the top bar; hiding the bar would make
+                // the open menu inherit pointer-events: none and freeze it on screen
+                if (document.querySelector('.site-switcher-menu')) return;
                 if (topBar && !topBar.classList.contains('top-bar-hidden')) {
+                    autoHideDone = true;
                     topBar.classList.add('top-bar-hidden');
                     setTimeout(function() { if (topBar.classList.contains('top-bar-hidden') && currentEl && currentEl.scrollHeight - topBar.offsetHeight > currentEl.clientHeight + 10) topBar.classList.add('top-bar-collapsed'); }, 350);
                     if (currentEl) currentEl.style.scrollPaddingTop = '0px';
@@ -167,10 +173,11 @@
                         scrollUpAccum = 0; // reset on any downward scroll
                     }
 
-                    if (st > lastScrollTop && st > 60 && isContentScrollable()) {
+                    if (st > lastScrollTop && st > 60 && isContentScrollable() && !document.querySelector('.site-switcher-menu')) {
                         topBar.classList.add('top-bar-hidden');
                         currentEl.style.scrollPaddingTop = '0px';
                         clearAutoHideTimer();
+                        autoHideDone = true;
                     } else if (!nearBottom && scrollUpAccum > 60) {
                         // Require 60px cumulative upward scroll, not near bottom
                         topBar.classList.remove('top-bar-hidden', 'top-bar-collapsed');
@@ -206,8 +213,10 @@
                     if (hidden) {
                         topBar.classList.add('top-bar-hidden');
                         clearAutoHideTimer();
+                        autoHideDone = true;
                     } else {
                         topBar.classList.remove('top-bar-hidden', 'top-bar-collapsed');
+                        autoHideDone = false;
                         startAutoHideTimer(topBar);
                     }
                 }

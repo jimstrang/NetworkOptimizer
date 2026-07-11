@@ -19,22 +19,35 @@ public static class ScheduleExecutorRegistration
 
         var scheduleService = app.Services.GetRequiredService<NetworkOptimizer.Alerts.ScheduleService>();
 
-        scheduleService.AuditExecutor = (ct) => ExecuteAuditAsync(app.Services, ct);
-        scheduleService.WanSpeedTestExecutor = (taskId, targetId, targetConfig, ct) =>
-            ExecuteWanSpeedTestAsync(app.Services, taskId, targetId, targetConfig, ct);
-        scheduleService.LanSpeedTestExecutor = (targetId, _, ct) =>
-            ExecuteLanSpeedTestAsync(app.Services, targetId, ct);
+        scheduleService.AuditExecutor = (siteKey, ct) => ExecuteAuditAsync(app.Services, siteKey, ct);
+        scheduleService.WanSpeedTestExecutor = (siteKey, taskId, targetId, targetConfig, ct) =>
+            ExecuteWanSpeedTestAsync(app.Services, siteKey, taskId, targetId, targetConfig, ct);
+        scheduleService.LanSpeedTestExecutor = (siteKey, targetId, _, ct) =>
+            ExecuteLanSpeedTestAsync(app.Services, siteKey, targetId, ct);
     }
 
+    /// <summary>Scheduled operations record a clean failure for license-restricted sites.</summary>
+    private static bool IsLicenseRestricted(IServiceProvider services, string siteKey) =>
+        !services.GetRequiredService<Licensing.LicenseStateService>().IsSiteOperational(siteKey);
+
+    private const string LicenseRestrictedError = "Site is restricted by licensing";
+
     private static async Task<(bool Success, string? Summary, string? Error)> ExecuteAuditAsync(
-        IServiceProvider services, CancellationToken ct)
+        IServiceProvider services, string siteKey, CancellationToken ct)
     {
-        // Ensure console connection is fresh for scheduled audits (fingerprint cache expires after 24h)
-        var connService = services.GetRequiredService<UniFiConnectionService>();
+        if (IsLicenseRestricted(services, siteKey))
+            return (false, null, LicenseRestrictedError);
+
+        // Ensure the site's console connection is fresh for scheduled audits
+        // (fingerprint cache expires after 24h)
+        var connService = services.GetRequiredService<SiteConnectionRegistry>().GetFor(siteKey);
         if (!connService.IsConnected)
             await connService.ReconnectAsync();
 
+        // Pin the scope so the audit pipeline (scoped repositories, scoped
+        // console forwarding) runs against this site's database and console.
         using var scope = services.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(siteKey);
         var auditService = scope.ServiceProvider.GetRequiredService<AuditService>();
         if (auditService.IsRunning)
             return (false, null, "Audit is already running");
@@ -53,9 +66,20 @@ public static class ScheduleExecutorRegistration
         }
     }
 
-    private static async Task<(bool Success, string? Summary, string? Error)> ExecuteWanSpeedTestAsync(
-        IServiceProvider services, int taskId, string? targetId, string? targetConfig, CancellationToken ct)
+    /// <summary>Scope pinned to a site so scoped services hit that site's database and console.</summary>
+    private static IServiceScope CreatePinnedScope(IServiceProvider services, string siteKey)
     {
+        var scope = services.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(siteKey);
+        return scope;
+    }
+
+    private static async Task<(bool Success, string? Summary, string? Error)> ExecuteWanSpeedTestAsync(
+        IServiceProvider services, string siteKey, int taskId, string? targetId, string? targetConfig, CancellationToken ct)
+    {
+        if (IsLicenseRestricted(services, siteKey))
+            return (false, null, LicenseRestrictedError);
+
         try
         {
             // Parse config for test type, max mode, multi-WAN
@@ -87,7 +111,7 @@ public static class ScheduleExecutorRegistration
             if (testType != "server" && (wanGroup != null || wanName != null))
             {
                 var reconcileResult = await ReconcileWanMetadataAsync(
-                    services, taskId, targetId, wanGroup, wanName, multiInterfaces,
+                    services, siteKey, taskId, targetId, wanGroup, wanName, multiInterfaces,
                     testType, maxMode, ct);
 
                 if (reconcileResult != null)
@@ -107,21 +131,34 @@ public static class ScheduleExecutorRegistration
 
             if (testType == "server")
             {
-                var serverService = services.GetRequiredService<UwnSpeedTestService>();
+                // The server-side ("Server") test runs the uwnspeedtest binary. For
+                // the default site it runs on THIS host; for an agent-backed site the
+                // service dispatches it to the site's agent so it measures the site's
+                // own WAN. The per-site instance resolves through the registry, and
+                // the service itself refuses sites that are neither (RunTestAsync).
+                var serverService = services.GetRequiredService<SpeedTestServiceRegistry>()
+                    .GetFor(siteKey).Uwn;
                 if (serverService.IsRunning)
                     return (false, null, "WAN speed test is already running");
                 result = await serverService.RunTestAsync(maxMode: maxMode, cancellationToken: ct);
             }
             else
             {
-                var gatewayService = services.GetRequiredService<GatewayWanSpeedTestService>();
+                // The site's own gateway runs the test and the result lands in the
+                // site's database - resolved by site key through the registry.
+                var gatewayService = services.GetRequiredService<SpeedTestServiceRegistry>()
+                    .GetFor(siteKey).GatewayWan;
                 if (gatewayService.IsRunning)
                     return (false, null, "WAN speed test is already running");
 
                 if (multiInterfaces is { Length: > 1 })
                 {
-                    var sqmService = services.GetRequiredService<SqmService>();
-                    var allWans = await sqmService.GetWanInterfacesFromControllerAsync();
+                    List<WanInterfaceInfo> allWans;
+                    using (var scope = CreatePinnedScope(services, siteKey))
+                    {
+                        var sqmService = scope.ServiceProvider.GetRequiredService<ISqmService>();
+                        allWans = await sqmService.GetWanInterfacesFromControllerAsync();
+                    }
                     var selectedWans = allWans.Where(w => multiInterfaces.Contains(w.Interface)).ToList();
                     result = await gatewayService.RunTestAsync(
                         "", wanGroup, wanName,
@@ -152,19 +189,25 @@ public static class ScheduleExecutorRegistration
     }
 
     private static async Task<(bool Success, string? Summary, string? Error)> ExecuteLanSpeedTestAsync(
-        IServiceProvider services, string? targetId, CancellationToken ct)
+        IServiceProvider services, string siteKey, string? targetId, CancellationToken ct)
     {
+        if (IsLicenseRestricted(services, siteKey))
+            return (false, null, LicenseRestrictedError);
+
         if (string.IsNullOrEmpty(targetId))
             return (false, null, "No target device specified");
 
-        var lanService = services.GetRequiredService<Iperf3SpeedTestService>();
+        // The site's own LAN speed test instance: its devices, SSH credentials, and
+        // results, with tests reaching the site over VPN or the agent tunnel.
+        var lanService = services.GetRequiredService<SpeedTestServiceRegistry>()
+            .GetFor(siteKey).LanSpeedTest;
         var devices = await lanService.GetDevicesAsync();
         var device = devices.FirstOrDefault(d => d.Host == targetId);
 
         // Fall back to UniFi-discovered devices if not found in manual config
         if (device == null)
         {
-            var connService = services.GetRequiredService<UniFiConnectionService>();
+            var connService = services.GetRequiredService<SiteConnectionRegistry>().GetFor(siteKey);
             try
             {
                 var discovered = await connService.GetDiscoveredDevicesAsync(ct);
@@ -216,14 +259,18 @@ public static class ScheduleExecutorRegistration
     /// if the schedule was irreconcilable and disabled.
     /// </summary>
     private static async Task<ReconcileResult?> ReconcileWanMetadataAsync(
-        IServiceProvider services, int taskId,
+        IServiceProvider services, string siteKey, int taskId,
         string? targetId, string? wanGroup, string? wanName, string[]? multiInterfaces,
         string testType, bool maxMode, CancellationToken ct)
     {
         try
         {
-            var sqmService = services.GetRequiredService<SqmService>();
-            var liveWans = await sqmService.GetWanInterfacesFromControllerAsync();
+            List<WanInterfaceInfo> liveWans;
+            using (var scope = CreatePinnedScope(services, siteKey))
+            {
+                var sqmService = scope.ServiceProvider.GetRequiredService<ISqmService>();
+                liveWans = await sqmService.GetWanInterfacesFromControllerAsync();
+            }
 
             if (liveWans.Count == 0)
                 return null; // Controller unreachable or no WANs - skip reconciliation
@@ -233,11 +280,11 @@ public static class ScheduleExecutorRegistration
 
             if (multiInterfaces is { Length: > 1 })
                 return await ReconcileMultiWanAsync(
-                    services, logger, taskId, targetId, wanGroup, wanName, multiInterfaces,
+                    services, siteKey, logger, taskId, targetId, wanGroup, wanName, multiInterfaces,
                     testType, maxMode, liveWans, ct);
 
             return await ReconcileSingleWanAsync(
-                services, logger, taskId, targetId, wanGroup, wanName,
+                services, siteKey, logger, taskId, targetId, wanGroup, wanName,
                 testType, maxMode, liveWans, ct);
         }
         catch (Exception ex)
@@ -275,7 +322,7 @@ public static class ScheduleExecutorRegistration
     }
 
     private static async Task<ReconcileResult> ReconcileSingleWanAsync(
-        IServiceProvider services, ILogger logger, int taskId,
+        IServiceProvider services, string siteKey, ILogger logger, int taskId,
         string? targetId, string? wanGroup, string? wanName,
         string testType, bool maxMode,
         List<WanInterfaceInfo> liveWans, CancellationToken ct)
@@ -285,7 +332,7 @@ public static class ScheduleExecutorRegistration
 
         if (!matched)
         {
-            await DisableScheduleAsync(services, taskId, ct);
+            await DisableScheduleAsync(services, siteKey, taskId, ct);
             return new ReconcileResult(false,
                 $"WAN schedule disabled: could not reconcile interface {targetId} " +
                 $"(group={wanGroup}, name={wanName}) against live controller data",
@@ -302,7 +349,7 @@ public static class ScheduleExecutorRegistration
             if (newGroup != null) configObj["wanGroup"] = newGroup;
             if (newName != null) configObj["wanName"] = newName;
 
-            await PersistScheduleUpdateAsync(services, taskId, newIface, configObj, ct);
+            await PersistScheduleUpdateAsync(services, siteKey, taskId, newIface, configObj, ct);
             logger.LogInformation(
                 "Reconciled WAN schedule {TaskId}: iface={Iface} group={Group} name={Name}",
                 taskId, newIface, newGroup, newName);
@@ -315,7 +362,7 @@ public static class ScheduleExecutorRegistration
     }
 
     private static async Task<ReconcileResult> ReconcileMultiWanAsync(
-        IServiceProvider services, ILogger logger, int taskId,
+        IServiceProvider services, string siteKey, ILogger logger, int taskId,
         string? targetId, string? wanGroup, string? wanName, string[] multiInterfaces,
         string testType, bool maxMode,
         List<WanInterfaceInfo> liveWans, CancellationToken ct)
@@ -338,7 +385,7 @@ public static class ScheduleExecutorRegistration
 
             if (!matched)
             {
-                await DisableScheduleAsync(services, taskId, ct);
+                await DisableScheduleAsync(services, siteKey, taskId, ct);
                 return new ReconcileResult(false,
                     $"WAN schedule disabled: could not reconcile interface {iface} " +
                     $"(group={grp}, name={nm}) against live controller data",
@@ -368,16 +415,17 @@ public static class ScheduleExecutorRegistration
                 ["interfaces"] = newMultiInterfaces
             };
 
-            await PersistScheduleUpdateAsync(services, taskId, newTargetId, configObj, ct);
+            await PersistScheduleUpdateAsync(services, siteKey, taskId, newTargetId, configObj, ct);
             logger.LogInformation("Reconciled multi-WAN schedule {TaskId}: updated groups/names", taskId);
         }
 
         return new ReconcileResult(true, null, newTargetId, newWanGroup, newWanName, newMultiInterfaces);
     }
 
-    private static async Task DisableScheduleAsync(IServiceProvider services, int taskId, CancellationToken ct)
+    private static async Task DisableScheduleAsync(IServiceProvider services, string siteKey, int taskId, CancellationToken ct)
     {
-        using var scope = services.CreateScope();
+        // Schedule rows live in each site's own database; task ids are per-site sequences.
+        using var scope = CreatePinnedScope(services, siteKey);
         var repo = scope.ServiceProvider.GetRequiredService<IScheduleRepository>();
         var task = await repo.GetByIdAsync(taskId, ct);
         if (task != null)
@@ -388,11 +436,11 @@ public static class ScheduleExecutorRegistration
     }
 
     private static async Task PersistScheduleUpdateAsync(
-        IServiceProvider services, int taskId, string? newTargetId,
+        IServiceProvider services, string siteKey, int taskId, string? newTargetId,
         Dictionary<string, object?> configObj, CancellationToken ct)
     {
         var newConfig = System.Text.Json.JsonSerializer.Serialize(configObj);
-        using var scope = services.CreateScope();
+        using var scope = CreatePinnedScope(services, siteKey);
         var repo = scope.ServiceProvider.GetRequiredService<IScheduleRepository>();
         var task = await repo.GetByIdAsync(taskId, ct);
         if (task != null)

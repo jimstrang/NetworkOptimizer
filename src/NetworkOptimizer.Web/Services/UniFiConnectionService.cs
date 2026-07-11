@@ -64,15 +64,169 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     /// </summary>
     public event Action? OnConnectionChanged;
 
-    public UniFiConnectionService(ILogger<UniFiConnectionService> logger, ILoggerFactory loggerFactory, IServiceProvider serviceProvider, ICredentialProtectionService credentialProtection)
+    /// <summary>
+    /// Slug of the site this connection instance is bound to. The DI-constructed
+    /// singleton is the default site; SiteConnectionRegistry creates additional
+    /// instances for other sites with their slug.
+    /// </summary>
+    public string SiteSlug { get; }
+
+    public UniFiConnectionService(ILogger<UniFiConnectionService> logger, ILoggerFactory loggerFactory, IServiceProvider serviceProvider, ICredentialProtectionService credentialProtection,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
         _serviceProvider = serviceProvider;
         _credentialProtection = credentialProtection;
+        SiteSlug = siteSlug;
 
         // Start initialization in background (non-blocking)
         StartInitializationAsync();
+    }
+
+    /// <summary>
+    /// Creates a DI scope pinned to this instance's site so scoped services
+    /// (repositories, DbContext) hit this site's database. Scopes created by a
+    /// singleton have no HTTP context and would otherwise resolve to the
+    /// default site.
+    /// </summary>
+    private IServiceScope CreateSiteScope()
+    {
+        var scope = _serviceProvider.CreateScope();
+        scope.ServiceProvider.GetRequiredService<SiteContextService>().OverrideSite(SiteSlug);
+        return scope;
+    }
+
+    /// <summary>Per-site setting key: reach this site's console through its agent tunnel.</summary>
+    public const string ConsoleViaAgentKey = "console.via_agent";
+
+    /// <summary>Shown while a site's agent-tunneled console waits for the agent to come online.</summary>
+    private const string AwaitingAgentMessage =
+        "This site's console connects through its on-site agent, which isn't online yet. It'll connect automatically as soon as the agent comes online.";
+
+    /// <summary>Per-site setting key: the UniFi Console's display name (system.name).</summary>
+    public const string ConsoleNameKey = "console.name";
+
+    /// <summary>
+    /// Fetches the console's display name from the controller and caches it in the
+    /// current site's database so the Sites listing and wizard can show it without
+    /// a live call. Best-effort: failures leave the previous value untouched.
+    /// </summary>
+    private async Task RefreshConsoleNameAsync()
+    {
+        try
+        {
+            if (_client == null)
+                return;
+            var name = await _client.GetConsoleNameAsync();
+            if (string.IsNullOrWhiteSpace(name))
+                return;
+
+            using var scope = CreateSiteScope();
+            var db = scope.ServiceProvider.GetRequiredService<NetworkOptimizerDbContext>();
+            var setting = await db.SystemSettings.FindAsync(ConsoleNameKey);
+            if (setting == null)
+                db.SystemSettings.Add(new SystemSetting { Key = ConsoleNameKey, Value = name.Trim() });
+            else
+            {
+                setting.Value = name.Trim();
+                setting.UpdatedAt = DateTime.UtcNow;
+            }
+            await db.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to refresh console name");
+        }
+    }
+
+    /// <summary>The cached UniFi Console display name for this site, if known.</summary>
+    public async Task<string?> GetCachedConsoleNameAsync()
+    {
+        try
+        {
+            using var scope = CreateSiteScope();
+            var db = scope.ServiceProvider.GetRequiredService<NetworkOptimizerDbContext>();
+            var setting = await db.SystemSettings.FindAsync(ConsoleNameKey);
+            return string.IsNullOrWhiteSpace(setting?.Value) ? null : setting.Value;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Whether this site's console is configured to be reached through its agent tunnel.</summary>
+    public async Task<bool> IsConsoleViaAgentAsync()
+    {
+        try
+        {
+            using var scope = CreateSiteScope();
+            var db = scope.ServiceProvider.GetRequiredService<NetworkOptimizerDbContext>();
+            var setting = await db.SystemSettings.FindAsync(ConsoleViaAgentKey);
+            return bool.TryParse(setting?.Value, out var enabled) && enabled;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Whether an on-site agent tunnel is currently connected for this site.</summary>
+    private bool IsAgentOnline()
+    {
+        var registry = _serviceProvider.GetService<AgentTunnelRegistry>();
+        return registry != null && registry.GetForSite(SiteSlug).Count > 0;
+    }
+
+    /// <summary>
+    /// Called when this site's agent tunnel drops. When the console is reached
+    /// through that tunnel, flip straight to the awaiting-agent state: the client
+    /// stays "connected" otherwise, and every console call dials the dead loopback
+    /// proxy and burns through the transient-failure retry backoff (~14 s per
+    /// call), which reads as a frozen UI on any page of this site while the agent
+    /// is down. The agent-connected hook re-establishes the console when the
+    /// tunnel returns.
+    /// </summary>
+    public async Task OnAgentTunnelDroppedAsync()
+    {
+        if (IsAgentOnline()) return; // another agent still carries the site
+        if (!_isConnected && _client == null) return;
+        if (!await IsConsoleViaAgentAsync()) return;
+
+        // Re-check after the await: a fast agent bounce can reconnect (and the
+        // connected hook re-establish the console) while the DB read above was in
+        // flight - disposing the fresh client here would fabricate an up-to-60s
+        // "awaiting agent" outage on a healthy tunnel.
+        if (IsAgentOnline()) return;
+
+        _logger.LogInformation(
+            "Agent tunnel for site {Slug} dropped; marking its console as awaiting the agent", SiteSlug);
+        _client?.Dispose();
+        _client = null;
+        _isConnected = false;
+        _awaitingAgent = true;
+        _lastError = AwaitingAgentMessage;
+        OnConnectionChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// When the site's console is reached through its agent tunnel, rewrites
+    /// the controller URL to the loopback proxy endpoint that forwards over
+    /// the tunnel. Callers must also force ignore-SSL for proxied connections:
+    /// the console's certificate can never match 127.0.0.1.
+    /// </summary>
+    private string ResolveControllerUrl(string controllerUrl, bool viaAgent)
+    {
+        if (!viaAgent) return controllerUrl;
+        var proxy = _serviceProvider.GetService<AgentTunnelProxyService>();
+        if (proxy == null || !Uri.TryCreate(controllerUrl, UriKind.Absolute, out var uri))
+            return controllerUrl;
+        var port = uri.IsDefaultPort ? (uri.Scheme == Uri.UriSchemeHttps ? 443 : 80) : uri.Port;
+        var localPort = proxy.GetOrCreateEndpoint(SiteSlug, uri.Host, port);
+        _logger.LogInformation("Console for site {Slug} routed via agent tunnel (127.0.0.1:{LocalPort} -> {Host}:{Port})",
+            SiteSlug, localPort, uri.Host, port);
+        return $"{uri.Scheme}://127.0.0.1:{localPort}";
     }
 
     /// <summary>
@@ -107,7 +261,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     {
         try
         {
-            using var scope = _serviceProvider.CreateScope();
+            using var scope = CreateSiteScope();
             var repository = scope.ServiceProvider.GetRequiredService<IUniFiRepository>();
 
             var settings = await repository.GetUniFiConnectionSettingsAsync();
@@ -122,8 +276,30 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 // Auto-connect if we have credentials and RememberCredentials is true
                 if (settings.RememberCredentials && settings.HasCredentials)
                 {
-                    await Task.Delay(1000); // Brief wait for app startup
-                    await ConnectWithSettingsAsync(settings);
+                    // Only the default site connects at process startup and benefits from a brief
+                    // settle delay. A secondary site's connection service is created on demand when
+                    // the user switches to it (app already running), so the delay there just adds
+                    // latency to the site switch.
+                    if (SiteSlug == SiteManagementService.DefaultSiteSlug)
+                        await Task.Delay(1000);
+
+                    // If this site's console is reached through its agent tunnel and no
+                    // agent has connected yet, defer: dialing the loopback proxy with no
+                    // agent behind it fails with a spurious SSL/EOF error on the dashboard.
+                    // OnAgentConnectedAsync establishes the console connection as soon as
+                    // the tunnel comes up (often 20-30s after startup).
+                    if (await IsConsoleViaAgentAsync() && !IsAgentOnline())
+                    {
+                        _awaitingAgent = true;
+                        _lastError = AwaitingAgentMessage;
+                        _logger.LogInformation(
+                            "Console for site {Slug} routes via its agent tunnel, which isn't connected yet; deferring connect until the agent comes online",
+                            SiteSlug);
+                    }
+                    else
+                    {
+                        await ConnectWithSettingsAsync(settings);
+                    }
                 }
             }
         }
@@ -157,6 +333,15 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     public bool IsConnected => _isConnected && _client != null;
     public bool IsInitialized { get; private set; }
     public string? LastError => _lastError;
+
+    private bool _awaitingAgent;
+
+    /// <summary>
+    /// True when this site's console is reached through its agent tunnel and that tunnel
+    /// isn't up yet - a transient "waiting for the agent" state, not a misconfiguration.
+    /// The UI should prompt to wait/refresh rather than steering to connection setup.
+    /// </summary>
+    public bool IsAwaitingAgent => _awaitingAgent && !_isConnected;
     public DateTime? LastConnectedAt => _lastConnectedAt;
     public bool IsUniFiOs => _client?.IsUniFiOs ?? false;
 
@@ -237,7 +422,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             return _settings;
         }
 
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<IUniFiRepository>();
 
         var settings = await repository.GetUniFiConnectionSettingsAsync();
@@ -283,16 +468,27 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             _client = null;
             _isConnected = false;
             _lastError = null;
+            _awaitingAgent = false;
 
             // Create new client
+            var viaAgent = await IsConsoleViaAgentAsync();
+            if (viaAgent && !IsAgentOnline())
+            {
+                // Reached through the agent tunnel, which isn't up. Dialing the loopback
+                // proxy now fails with an SSL/EOF error that gets misreported as a
+                // certificate problem, so surface the real reason.
+                _awaitingAgent = true;
+                _lastError = AwaitingAgentMessage;
+                return false;
+            }
             var clientLogger = _loggerFactory.CreateLogger<UniFiApiClient>();
             _client = new UniFiApiClient(
                 clientLogger,
-                config.ControllerUrl,
+                ResolveControllerUrl(config.ControllerUrl, viaAgent),
                 config.Username,
                 config.Password,
                 config.Site,
-                config.IgnoreControllerSSLErrors,
+                config.IgnoreControllerSSLErrors || viaAgent,
                 config.ApiKey
             );
 
@@ -317,6 +513,9 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
                 // Save configuration to database
                 await SaveSettingsAsync(config);
+
+                // Cache the console's display name for the Sites listing / wizard.
+                await RefreshConsoleNameAsync();
 
                 // Clear cached data from previous connection/site
                 ClearCaches();
@@ -394,16 +593,27 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             _client = null;
             _isConnected = false;
             _lastError = null;
+            _awaitingAgent = false;
 
             // Create new client
+            var viaAgent = await IsConsoleViaAgentAsync();
+            if (viaAgent && !IsAgentOnline())
+            {
+                // Reached through the agent tunnel, which isn't up. Dialing the loopback
+                // proxy now fails with an SSL/EOF error that gets misreported as a
+                // certificate problem, so surface the real reason.
+                _awaitingAgent = true;
+                _lastError = AwaitingAgentMessage;
+                return false;
+            }
             var clientLogger = _loggerFactory.CreateLogger<UniFiApiClient>();
             _client = new UniFiApiClient(
                 clientLogger,
-                config.ControllerUrl,
+                ResolveControllerUrl(config.ControllerUrl, viaAgent),
                 config.Username,
                 config.Password,
                 config.Site,
-                config.IgnoreControllerSSLErrors,
+                config.IgnoreControllerSSLErrors || viaAgent,
                 config.ApiKey
             );
 
@@ -425,8 +635,12 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                 _isConnected = true;
                 _lastConnectedAt = DateTime.UtcNow;
 
+                // Cache the console's display name on auto-reconnect too, so the
+                // Sites listing shows it without a manual Connect/Test.
+                await RefreshConsoleNameAsync();
+
                 // Update last connected timestamp in DB
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = CreateSiteScope();
                 var repository = scope.ServiceProvider.GetRequiredService<IUniFiRepository>();
                 var dbSettings = await repository.GetUniFiConnectionSettingsAsync();
                 if (dbSettings != null)
@@ -437,7 +651,17 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
                     await repository.SaveUniFiConnectionSettingsAsync(dbSettings);
                 }
 
+                // Clear cached data from the previous (failed/disconnected) state
+                ClearCaches();
+
                 _logger.LogInformation("Successfully connected to UniFi controller (UniFi OS: {IsUniFiOs}, API Key: {UseApiKey})", _client.IsUniFiOs, _client.UseApiKey);
+
+                // Notify subscribers (e.g. the Dashboard) so they reload their data.
+                // Critical for agent-tunneled consoles: when a site's console was
+                // unreachable at initial load and the agent tunnel later comes up,
+                // this reconnect fires the event that triggers the dashboard refresh.
+                OnConnectionChanged?.Invoke();
+
                 return true;
             }
             else
@@ -477,7 +701,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     {
         try
         {
-            using var scope = _serviceProvider.CreateScope();
+            using var scope = CreateSiteScope();
             var repository = scope.ServiceProvider.GetRequiredService<IUniFiRepository>();
 
             var settings = await repository.GetUniFiConnectionSettingsAsync() ?? new UniFiConnectionSettings
@@ -582,14 +806,24 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         UniFiApiClient? testClient = null;
         try
         {
+            var viaAgent = await IsConsoleViaAgentAsync();
+            if (viaAgent && !IsAgentOnline())
+            {
+                // The console is reached through the agent tunnel, which isn't up. Dialing
+                // the loopback proxy now fails with an SSL/EOF error that gets misreported
+                // as a certificate problem, so return the real reason instead.
+                return (false,
+                    "This site's console is reached through its on-site agent tunnel, which isn't connected yet. Start the site's agent (or wait for it to come online), then test again.",
+                    null);
+            }
             var clientLogger = _loggerFactory.CreateLogger<UniFiApiClient>();
             testClient = new UniFiApiClient(
                 clientLogger,
-                config.ControllerUrl,
+                ResolveControllerUrl(config.ControllerUrl, viaAgent),
                 config.Username,
                 config.Password,
                 config.Site,
-                config.IgnoreControllerSSLErrors,
+                config.IgnoreControllerSSLErrors || viaAgent,
                 config.ApiKey
             );
 
@@ -649,14 +883,15 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
         UniFiApiClient? testClient = null;
         try
         {
+            var viaAgent = await IsConsoleViaAgentAsync();
             var clientLogger = _loggerFactory.CreateLogger<UniFiApiClient>();
             testClient = new UniFiApiClient(
                 clientLogger,
-                config.ControllerUrl,
+                ResolveControllerUrl(config.ControllerUrl, viaAgent),
                 config.Username,
                 config.Password,
                 config.Site,
-                config.IgnoreControllerSSLErrors,
+                config.IgnoreControllerSSLErrors || viaAgent,
                 config.ApiKey
             );
 
@@ -716,7 +951,9 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
 
         if (!settings.IsConfigured || !settings.HasCredentials)
         {
-            _lastError = "No saved configuration";
+            _lastError = SiteSlug == SiteManagementService.DefaultSiteSlug
+                ? "The UniFi Console isn't connected yet. Set up the connection in Settings to view network data."
+                : "This site's UniFi Console isn't connected yet. Set up its connection in Settings - a console that isn't directly reachable from this server connects through the site's on-site agent.";
             return false;
         }
 
@@ -751,6 +988,14 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
             return false;
         }
 
+        // If this site's console is reached through an agent tunnel that isn't up yet, don't
+        // block: the console connects asynchronously once the agent comes online
+        // (OnAgentConnectedAsync), and pages reload via OnConnectionChanged. Polling the full
+        // timeout here would stall the page render on every agent-site load or switch, which
+        // is the single biggest cause of "the page takes forever to appear" on those sites.
+        if (await IsConsoleViaAgentAsync() && !IsAgentOnline())
+            return false;
+
         var startTime = DateTime.UtcNow;
         while (DateTime.UtcNow - startTime < timeout)
         {
@@ -767,7 +1012,7 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     /// </summary>
     public async Task ClearCredentialsAsync()
     {
-        using var scope = _serviceProvider.CreateScope();
+        using var scope = CreateSiteScope();
         var repository = scope.ServiceProvider.GetRequiredService<IUniFiRepository>();
 
         var settings = await repository.GetUniFiConnectionSettingsAsync();
@@ -1101,6 +1346,14 @@ public class UniFiConnectionService : IUniFiClientProvider, IDisposable
     }
 
     public void Dispose()
+    {
+        // Instances are owned by SiteConnectionRegistry but handed out through a
+        // scoped forwarding registration, so the container calls Dispose whenever a
+        // request/circuit scope ends. Only the registry may tear down the shared
+        // connection, via DisposeOwned.
+    }
+
+    internal void DisposeOwned()
     {
         _client?.Dispose();
     }

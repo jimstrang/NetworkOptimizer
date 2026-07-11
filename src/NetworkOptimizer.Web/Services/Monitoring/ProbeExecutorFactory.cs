@@ -23,6 +23,9 @@ public class ProbeExecutorFactory
     private readonly SshClientService _sshClient;
     private readonly ICredentialProtectionService _credentialProtection;
     private readonly UniFiConnectionService _connection;
+    private readonly AgentProbeService _agentProbe;
+    private readonly SiteContextService _siteContext;
+    private readonly SiteTunnelRouting _tunnelRouting;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<ProbeExecutorFactory> _logger;
 
@@ -33,6 +36,9 @@ public class ProbeExecutorFactory
         SshClientService sshClient,
         ICredentialProtectionService credentialProtection,
         UniFiConnectionService connection,
+        AgentProbeService agentProbe,
+        SiteContextService siteContext,
+        SiteTunnelRouting tunnelRouting,
         ILoggerFactory loggerFactory,
         ILogger<ProbeExecutorFactory> logger)
     {
@@ -42,11 +48,30 @@ public class ProbeExecutorFactory
         _sshClient = sshClient;
         _credentialProtection = credentialProtection;
         _connection = connection;
+        _agentProbe = agentProbe;
+        _siteContext = siteContext;
+        _tunnelRouting = tunnelRouting;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
 
-    public IProbeExecutor GetServer() => _local;
+    /// <summary>
+    /// The "server" vantage. On a secondary site with an online agent that's the on-site
+    /// agent host (the central server can't reach the site's network) - it runs the
+    /// identical LocalProbeExecutor over the tunnel. Falls back to the local server on the
+    /// default site or when no agent is online.
+    /// </summary>
+    public IProbeExecutor GetServer()
+    {
+        if (!_siteContext.IsDefault && _agentProbe.HasAgentForSite(_siteContext.Slug))
+            return new AgentProbeExecutor(_agentProbe, _siteContext.Slug,
+                _loggerFactory.CreateLogger<AgentProbeExecutor>());
+        return _local;
+    }
+
+    /// <summary>Whether the "server" vantage resolves to the on-site agent for the current site.</summary>
+    public bool ServerVantageIsAgent =>
+        !_siteContext.IsDefault && _agentProbe.HasAgentForSite(_siteContext.Slug);
 
     /// <summary>
     /// Build an executor that runs probes from the chosen UniFi device via SSH. Returns
@@ -102,6 +127,13 @@ public class ProbeExecutorFactory
 
                 connection = SshConnectionInfo.FromUniFiSettings(sshSettings, device.DisplayIpAddress, decryptedPassword);
             }
+
+            // Route the device SSH through the agent tunnel on secondary sites: the
+            // device's LAN IP is unreachable from the central server, so rewrite host:port
+            // to the site agent's loopback proxy (the same routing gateway/device SSH use
+            // via GatewaySshService.MaybeRouteViaAgentAsync). No-op on the default site.
+            (connection.Host, connection.Port) = await _tunnelRouting.RouteAsync(
+                _siteContext.Slug, connection.Host, connection.Port);
 
             return new SshProbeExecutor(
                 _sshClient,

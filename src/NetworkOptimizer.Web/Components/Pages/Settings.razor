@@ -1,5 +1,6 @@
 @page "/settings"
 @rendermode InteractiveServer
+@implements IDisposable
 @using NetworkOptimizer.Web.Services
 @using NetworkOptimizer.Web.Services.Ssh
 @using NetworkOptimizer.Storage.Models
@@ -10,6 +11,7 @@
 @using NetworkOptimizer.UniFi.Models
 @using Microsoft.EntityFrameworkCore
 @inject UniFiConnectionService ConnectionService
+@inject SiteContextService SiteContext
 @inject IGatewaySshService GatewaySshService
 @inject IAuditRepository AuditRepository
 @inject ISpeedTestRepository SpeedTestRepository
@@ -30,6 +32,11 @@
 @inject NetworkOptimizer.Storage.Services.ICredentialProtectionService CredentialService
 @inject IHttpClientFactory HttpClientFactory
 @inject NavigationManager NavigationManager
+@inject SiteManagementService SiteManagement
+@inject AgentEnrollmentService AgentEnrollment
+@inject AgentServerUrlProvider AgentServerUrl
+@inject AgentTunnelRegistry TunnelRegistry
+@inject NetworkOptimizer.Storage.Services.SiteDbContextFactory SiteDb
 @inject SnmpDetectionService SnmpDetection
 @inject MonitoringInfluxClient InfluxClient
 @inject CableModemMonitorService CmMonitorService
@@ -42,15 +49,63 @@
 
 <div class="page-header">
     <h1>Settings</h1>
+    @if (_multiSiteEnabled && !string.IsNullOrEmpty(_currentSiteName))
+    {
+        <span class="status-badge site-context-badge" data-tooltip="These settings apply to the selected site">@_currentSiteName</span>
+    }
     <p class="page-description">Configure Network Optimizer connections and preferences</p>
 </div>
 
-<div class="settings-container">
+<div class="wifi-view-tabs-wrapper">
+    <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-left" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: -200, behavior: 'smooth'})">&#8249;</button>
+    <div class="wifi-view-tabs">
+        <button class="wifi-view-tab @(_activeTab == "connection" ? "active" : "")"
+                @onclick="@(() => SetActiveTab("connection"))">
+            Connection
+        </button>
+        <button class="wifi-view-tab @(_activeTab == "monitoring" ? "active" : "")"
+                @onclick="@(() => SetActiveTab("monitoring"))">
+            Monitoring
+        </button>
+        @* Speed Tests settings are global (instance-wide), but the tab stays on every
+           site: it's deep-linked from the Client WAN Speed Test and LAN Speed Test pages
+           (which exist per-site), so hiding it would break those "Configure" links. The
+           "Global" badges on the cards signal the settings are instance-wide. *@
+        <button class="wifi-view-tab @(_activeTab == "speedtests" ? "active" : "")"
+                @onclick="@(() => SetActiveTab("speedtests"))">
+            Speed Tests
+        </button>
+        <button class="wifi-view-tab @(_activeTab == "security" ? "active" : "")"
+                @onclick="@(() => SetActiveTab("security"))">
+            Security &amp; Alerts
+        </button>
+        @if (SiteContext.IsDefault)
+        {
+            <button class="wifi-view-tab @(_activeTab == "application" ? "active" : "")"
+                    @onclick="@(() => SetActiveTab("application"))">
+                Application
+            </button>
+        }
+        <button class="wifi-view-tab @(_activeTab == "multisite" ? "active" : "")"
+                @onclick="@(() => SetActiveTab("multisite"))">
+            Multi-Site
+        </button>
+    </div>
+    <button class="wifi-tabs-scroll-btn wifi-tabs-scroll-right" onclick="this.parentElement.querySelector('.wifi-view-tabs').scrollBy({left: 200, behavior: 'smooth'})">&#8250;</button>
+</div>
+
+<div class="settings-container settings-tabbed active-@_activeTab">
     <!-- 1. UniFi Console Connection -->
-    <div class="card">
+    <div class="card settings-tab-connection" id="console-connection">
         <div class="card-header">
             <h2 class="card-title">UniFi Console (Controller) Connection</h2>
-            <span class="status-badge status-@controllerStatus.ToLower()">@controllerStatus</span>
+            <div class="card-header-badges">
+                @if (_currentSiteConsoleViaAgent)
+                {
+                    <span class="status-badge badge-agent" data-tooltip="This site's console is reached through its on-site agent tunnel, not a direct connection from this server">Via Site Agent</span>
+                }
+                <span class="status-badge status-@controllerStatus.ToLower()">@controllerStatus</span>
+            </div>
         </div>
         <div class="card-body">
             <div class="form-group">
@@ -233,13 +288,22 @@
         </div>
     </div>
 
+    @* Admin login is instance-wide, so the password is only managed on the main site. *@
+    @if (SiteContext.IsDefault)
+    {
     <!-- 2. Admin Password -->
-    <div class="card" id="admin-password">
+    <div class="card settings-tab-application" id="admin-password">
         <div class="card-header">
             <h2 class="card-title">Admin Password</h2>
-            <span class="status-badge status-@(adminPasswordSource == AdminPasswordSource.None ? "disconnected" : "connected")">
-                @GetAdminPasswordSourceLabel()
-            </span>
+            <div class="card-header-badges">
+                @if (_multiSiteEnabled)
+                {
+                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                }
+                <span class="status-badge status-@(adminPasswordSource == AdminPasswordSource.None ? "disconnected" : "connected")">
+                    @GetAdminPasswordSourceLabel()
+                </span>
+            </div>
         </div>
         <div class="card-body">
             <p class="section-description">
@@ -307,14 +371,21 @@
             }
         </div>
     </div>
+    }
 
     <!-- 3. Gateway SSH -->
-    <div class="card" id="gateway-ssh">
+    <div class="card settings-tab-connection" id="gateway-ssh">
         <div class="card-header">
             <h2 class="card-title">Gateway SSH (Optional)</h2>
-            <span class="status-badge status-@(gatewaySettings?.Enabled == true ? "connected" : "disconnected")">
-                @(gatewaySettings?.Enabled == true ? "Configured" : "Not Configured")
-            </span>
+            <div class="card-header-badges">
+                @if (_currentSiteSshViaAgent)
+                {
+                    <span class="status-badge badge-agent" data-tooltip="This site's SSH connections are made through its on-site agent tunnel, not directly from this server">Via Site Agent</span>
+                }
+                <span class="status-badge status-@(gatewaySettings?.Enabled == true ? "connected" : "disconnected")">
+                    @(gatewaySettings?.Enabled == true ? "Configured" : "Not Configured")
+                </span>
+            </div>
         </div>
         <div class="card-body">
             <p class="section-description">
@@ -475,12 +546,18 @@
     </div>
 
     <!-- 4. Device SSH -->
-    <div class="card" id="device-ssh">
+    <div class="card settings-tab-connection" id="device-ssh">
         <div class="card-header">
             <h2 class="card-title">Device SSH (Optional)</h2>
-            <span class="status-badge status-@(sshSettings?.Enabled == true ? "connected" : "disconnected")">
-                @(sshSettings?.Enabled == true ? "Configured" : "Not Configured")
-            </span>
+            <div class="card-header-badges">
+                @if (_currentSiteSshViaAgent)
+                {
+                    <span class="status-badge badge-agent" data-tooltip="This site's SSH connections are made through its on-site agent tunnel, not directly from this server">Via Site Agent</span>
+                }
+                <span class="status-badge status-@(sshSettings?.Enabled == true ? "connected" : "disconnected")">
+                    @(sshSettings?.Enabled == true ? "Configured" : "Not Configured")
+                </span>
+            </div>
         </div>
         <div class="card-body">
             <p class="section-description">
@@ -583,8 +660,232 @@
         </div>
     </div>
 
+    <!-- Monitoring Configuration -->
+    <div class="card settings-tab-monitoring" id="monitoring">
+        <div class="card-header">
+            <h2 class="card-title">Monitoring</h2>
+            @if (_monitoringSettings?.SnmpDetectionState == SnmpDetectionState.EnabledV2c || _monitoringSettings?.SnmpDetectionState == SnmpDetectionState.EnabledV3Only || _monitoringSettings?.SnmpDetectionState == SnmpDetectionState.Working)
+            {
+                <span class="status-badge status-connected">@(_monitoringSettings.SnmpDetectionState == SnmpDetectionState.EnabledV2c ? "v2c" : _monitoringSettings.SnmpDetectionState == SnmpDetectionState.EnabledV3Only ? "v3" : "Active")</span>
+            }
+            else if (_monitoringSettings?.SnmpDetectionState == SnmpDetectionState.Disabled)
+            {
+                <span class="status-badge status-disconnected">Disabled</span>
+            }
+        </div>
+        <div class="card-body">
+            <p class="section-description">
+                Network Optimizer collects per-port SNMP counters and per-device health to
+                drive the dashboard's live device cards, the upcoming diagnostic views, and
+                the 3D LAN map. SNMP credentials are read directly from your UniFi Console,
+                so you don't need to copy them by hand. InfluxDB stores the time-series data;
+                use your existing instance if you already run one.
+            </p>
+
+            <div class="form-group">
+                <label class="form-label">SNMP Status</label>
+                <div class="form-value">
+                    @switch (_monitoringSettings?.SnmpDetectionState)
+                    {
+                        case SnmpDetectionState.EnabledV2c:
+                            <span class="status-indicator status-active"></span>
+                            <span>Configured (v2c)</span>
+                            break;
+                        case SnmpDetectionState.EnabledV3Only:
+                            <span class="status-indicator status-active"></span>
+                            <span>Configured (v3)</span>
+                            break;
+                        case SnmpDetectionState.Working:
+                            <span class="status-indicator status-active"></span>
+                            <span>Active</span>
+                            break;
+                        case SnmpDetectionState.PollFailing:
+                            <span class="status-indicator status-danger"></span>
+                            <span>Poll failures</span>
+                            break;
+                        case SnmpDetectionState.Disabled:
+                            <span class="status-indicator status-inactive"></span>
+                            <span>SNMP not enabled on UniFi Console</span>
+                            break;
+                        default:
+                            <span class="status-indicator status-inactive"></span>
+                            <span>Not checked</span>
+                            break;
+                    }
+                </div>
+            </div>
+
+            @if (_monitoringSettings?.LastSnmpDetection != null)
+            {
+                <div class="form-group">
+                    <label class="form-label">Last Detected</label>
+                    <div class="form-value">@_monitoringSettings.LastSnmpDetection.Value.ToString("g")</div>
+                </div>
+            }
+
+            <h3 style="margin-top: 1.5rem;">InfluxDB</h3>
+            @if (SiteContext.IsDefault)
+            {
+                <p class="section-description">
+                    Time-series storage for monitoring data. If you don't already run InfluxDB,
+                    the easiest path is the setup helper on the
+                    <a href="/monitoring">Monitoring</a> page; it'll detect what's available,
+                    install InfluxDB if needed, and provision the buckets and an API token for
+                    you. If you already run InfluxDB 2.x, point this at it; the
+                    bucket names below are NO-specific so they can't collide with other data.
+                </p>
+            }
+
+            <div class="form-group">
+                <label class="form-label">InfluxDB Status</label>
+                <div class="form-value">
+                    @if (_monitoringSettings?.InfluxDbReachable == true)
+                    {
+                        <span class="status-indicator status-active"></span>
+                        <span>Connected</span>
+                    }
+                    else if (_monitoringSettings?.InfluxDbReachable == false)
+                    {
+                        <span class="status-indicator status-danger"></span>
+                        <span>@(_monitoringSettings?.LastInfluxDbError ?? "Not reachable")</span>
+                    }
+                    else
+                    {
+                        <span class="status-indicator status-inactive"></span>
+                        <span>Not configured</span>
+                    }
+                </div>
+            </div>
+
+            @if (SiteContext.IsDefault)
+            {
+                <div class="form-group">
+                    <label class="form-label">InfluxDB URL</label>
+                    <input type="text" class="form-control" @bind="_influxUrl" placeholder="http://localhost:8086" />
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">API Token</label>
+                    <input type="password" class="form-control" @bind="_influxToken" placeholder="@(_influxTokenIsSet ? "(saved, leave blank to keep)" : "Paste an InfluxDB API token")" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Organization</label>
+                    <input type="text" class="form-control" @bind="_influxOrg" placeholder="network-optimizer" />
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Primary Bucket</label>
+                    <input type="text" class="form-control" @bind="_influxBucket" placeholder="network_monitoring" />
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Long-term Bucket</label>
+                    <input type="text" class="form-control" @bind="_influxLongtermBucket" placeholder="network_monitoring_longterm" />
+                </div>
+            }
+            else if (!_mainInfluxConfigured)
+            {
+                @* State 3: neither the shared InfluxDB nor this site is set up. *@
+                <p class="section-description">
+                    InfluxDB isn't set up yet. It's configured once on the main site and shared
+                    across all sites - switch to the main site to set it up, or run the setup
+                    helper on the <a href="/monitoring?tab=setup">Monitoring</a> page.
+                </p>
+            }
+            else if (_monitoringSettings?.InfluxDbReachable == true)
+            {
+                @* State 1: the shared connection is up and this site's buckets are reachable.
+                   Server URL and org are shared with the main site (read-only); the bucket
+                   names are this site's own and can be edited. *@
+                <p class="section-description">
+                    This site uses the main site's shared InfluxDB server and organization. Only its
+                    buckets are its own, named for the site so they never mix with another site's data.
+                </p>
+                <div class="form-group">
+                    <label class="form-label">InfluxDB URL</label>
+                    <div class="form-value">@_sharedInfluxUrl</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Organization</label>
+                    <div class="form-value">@_sharedInfluxOrg</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Primary Bucket</label>
+                    <input type="text" class="form-control" @bind="_siteInfluxPrimaryBucket" placeholder="@($"{SiteContext.Slug}-network_monitoring")" />
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Long-term Bucket</label>
+                    <input type="text" class="form-control" @bind="_siteInfluxLongtermBucket" placeholder="@($"{SiteContext.Slug}-network_monitoring_longterm")" />
+                </div>
+            }
+            else
+            {
+                @* State 2: the shared InfluxDB exists on main, but this site's buckets don't yet. *@
+                <p class="section-description">
+                    This site stores monitoring data in the shared InfluxDB. Run the setup helper
+                    on the <a href="/monitoring?tab=setup">Monitoring</a> page to create this
+                    site's buckets.
+                </p>
+            }
+
+            <div class="action-buttons" style="margin-top: 1rem;">
+                <button class="btn btn-secondary" @onclick="RedetectSnmp" disabled="@_redetectingSnmp">
+                    @if (_redetectingSnmp)
+                    {
+                        <span class="spinner-sm"></span>
+                        <span>Detecting...</span>
+                    }
+                    else
+                    {
+                        <span>Re-detect SNMP</span>
+                    }
+                </button>
+                @if (SiteContext.IsDefault)
+                {
+                    <button class="btn btn-primary" @onclick="SaveInfluxSettings" disabled="@_savingInflux">
+                        @if (_savingInflux)
+                        {
+                            <span class="spinner-sm"></span>
+                            <span>Saving...</span>
+                        }
+                        else
+                        {
+                            <span>Save &amp; Test InfluxDB</span>
+                        }
+                    </button>
+                }
+                else if (_mainInfluxConfigured && _monitoringSettings?.InfluxDbReachable == true)
+                {
+                    @* State 1 only: save this site's (editable) bucket names. *@
+                    <button class="btn btn-primary" @onclick="SaveExternalInfluxBuckets" disabled="@_savingInflux">
+                        @if (_savingInflux)
+                        {
+                            <span class="spinner-sm"></span>
+                            <span>Saving...</span>
+                        }
+                        else
+                        {
+                            <span>Save &amp; Test InfluxDB</span>
+                        }
+                    </button>
+                }
+            </div>
+
+            @if (!string.IsNullOrEmpty(_monitoringMessage))
+            {
+                <div class="alert alert-@_monitoringMessageClass" style="margin-top: 1rem;">
+                    @_monitoringMessage
+                </div>
+            }
+        </div>
+    </div>
+
     <!-- 5. Adaptive SQM Monitor -->
-    <div class="card" id="sqm-monitor">
+    <div class="card settings-tab-monitoring" id="sqm-monitor">
         <div class="card-header">
             <h2 class="card-title">Adaptive SQM Monitor (Optional)</h2>
             <span class="status-badge status-@tcMonitorStatus.ToLower()">@tcMonitorStatus</span>
@@ -636,7 +937,7 @@
     </div>
 
     <!-- 6. Cellular Modem -->
-    <div class="card" id="cellular-modem">
+    <div class="card settings-tab-monitoring" id="cellular-modem">
         <div class="card-header">
             <h2 class="card-title">Cellular Modem (5G/LTE)</h2>
             <span class="status-badge status-@modemStatus.ToLower()">@modemStatus</span>
@@ -937,7 +1238,7 @@
     </div>
 
     <!-- Cable Modem Monitoring -->
-    <div class="card" id="cable-modem">
+    <div class="card settings-tab-monitoring" id="cable-modem">
         <div class="card-header">
             <h2 class="card-title">Cable Modem Monitoring</h2>
             <span class="status-badge status-@_cmStatus.ToLower()">@_cmStatus</span>
@@ -1110,7 +1411,7 @@
     </div>
 
     <!-- ONT Device Monitoring -->
-    <div class="card" id="ont-monitoring">
+    <div class="card settings-tab-monitoring" id="ont-monitoring">
         <div class="card-header">
             <h2 class="card-title">ONT Device Monitoring</h2>
             <span class="status-badge status-@_ontStatus.ToLower()">@_ontStatus</span>
@@ -1194,6 +1495,7 @@
                                 <option value="realtek-ont">Realtek ONT Stick (HTTP)</option>
                                 <option value="8311">8311 Community Firmware (HTTP)</option>
                                 <option value="quantum-q1000k">Quantum Fiber Q1000K (HTTP)</option>
+                                <option value="telekom-modem2">Telekom Glasfaser-Modem 2 (HTTP)</option>
                                 <option value="generic-http-ont">Generic HTTP ONT</option>
                             </select>
                         </div>
@@ -1282,9 +1584,13 @@
     </div>
 
     <!-- 7. Speed Test Settings -->
-    <div class="card" id="speed-test-settings">
+    <div class="card settings-tab-speedtests" id="speed-test-settings">
         <div class="card-header">
             <h2 class="card-title">Speed Test Settings</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            }
         </div>
         <div class="card-body">
             <p class="section-description">Configure iperf3 speed test parameters. Parallel streams can be configured per device type.</p>
@@ -1336,9 +1642,13 @@
     </div>
 
     <!-- 8. External Speed Test Servers -->
-    <div class="card" id="external-speedtest-settings">
+    <div class="card settings-tab-speedtests" id="external-speedtest-settings">
         <div class="card-header">
             <h2 class="card-title">External Speed Test Servers</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            }
         </div>
         <div class="card-body">
             <p class="section-description">Configure external OpenSpeedTest servers for WAN speed testing. Deploy the speed test container to remote servers (e.g., VPS instances) and clients can test their internet speed through them. Results are reported back here automatically.</p>
@@ -1492,63 +1802,35 @@
         </div>
     </div>
 
-    @* License Information - hidden for now
-    <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">License</h2>
-        </div>
-        <div class="card-body">
-            <div class="license-info">
-                <div class="info-row">
-                    <span class="info-label">License Type:</span>
-                    <span class="info-value">@licenseType</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Licensed To:</span>
-                    <span class="info-value">@licensedTo</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Controller ID:</span>
-                    <span class="info-value">@controllerId</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Activation Date:</span>
-                    <span class="info-value">@activationDate</span>
-                </div>
-                <div class="info-row">
-                    <span class="info-label">Status:</span>
-                    <span class="info-value status-@licenseStatus.ToLower()">@licenseStatus</span>
-                </div>
-            </div>
-
-            @if (licenseStatus == "Grace Period")
-            {
-                <div class="alert alert-warning">
-                    <strong>Grace Period Active:</strong> Controller ID changed. You have @gracePeriodDays days remaining to re-activate your license.
-                </div>
-            }
-
-            <div class="action-buttons">
-                <button class="btn btn-primary" @onclick="ActivateLicense">
-                    Enter License Key
-                </button>
-                <button class="btn btn-secondary" @onclick="RequestReactivation">
-                    Request Re-activation
-                </button>
-            </div>
-        </div>
-    </div>
-    *@
+    @* Instance-wide settings below are only shown on the main site. *@
+    @if (SiteContext.IsDefault)
+    {
+    <LicensingSettingsCard />
 
     <!-- 10. Application Settings -->
-    <div class="card">
+    <div class="card settings-tab-application" id="application-settings">
         <div class="card-header">
             <h2 class="card-title">Application Settings</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            }
         </div>
         <div class="card-body">
             <div class="form-group">
                 <label class="form-label">Alert Retention (days)</label>
                 <input type="number" class="form-control" @bind="alertRetention" min="1" max="365" />
+            </div>
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" @bind="receivePrereleaseUpdates" @bind:after="SavePrereleaseSetting" />
+                    Receive pre-release update notifications
+                </label>
+                <p class="form-help">
+                    Shows a banner when a preview (beta) build is available so you can try new
+                    features early. Stable update notifications are unaffected either way.
+                </p>
             </div>
 
             <div class="action-buttons">
@@ -1558,9 +1840,10 @@
             </div>
         </div>
     </div>
+    }
 
     <!-- 11. Security Audit -->
-    <div class="card" id="security-audit">
+    <div class="card settings-tab-security" id="security-audit">
         <div class="card-header">
             <h2 class="card-title">Security Audit</h2>
         </div>
@@ -1670,19 +1953,56 @@
         </div>
     </div>
 
+    @* Alert Channels are global (instance-wide) but shown on EVERY site: the per-site
+       Alerts page's "Notification Channels" button deep-links here (#alert-channels), so
+       hiding it on secondary sites would break that link. The card carries a Global badge. *@
     <!-- Alert Channels Configuration -->
-    <div class="card" id="alert-channels">
+    <div class="card settings-tab-security" id="alert-channels">
         <div class="card-header">
-            <h2 class="card-title">Alert Channels</h2>
-            @if (alertChannels?.Count > 0)
-            {
-                <span class="status-badge status-active">@alertChannels.Count configured</span>
-            }
+            <h2 class="card-title">@(SiteContext.IsDefault ? "Alert Channels" : "Site-Specific Alert Channels")</h2>
+            <div class="card-header-badges">
+                @if (_multiSiteEnabled && SiteContext.IsDefault)
+                {
+                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                }
+                @if (alertChannels?.Count > 0)
+                {
+                    <span class="status-badge status-active">@alertChannels.Count configured</span>
+                }
+            </div>
         </div>
         <div class="card-body">
-            <p class="section-description">
-                Configure notification channels for the alert engine. Alerts are delivered via email, webhooks, Slack, Discord, Microsoft Teams, or ntfy.sh.
-            </p>
+            @if (SiteContext.IsDefault)
+            {
+                <p class="section-description">
+                    Configure notification channels for the alert engine. Alerts are delivered via email, webhooks, Slack, Discord, Microsoft Teams, or ntfy.sh.
+                </p>
+            }
+            else
+            {
+                <div class="site-config-section">
+                    <div class="site-config-section-title">Global channels</div>
+                    @if (_globalChannels?.Count > 0)
+                    {
+                        @foreach (var gch in _globalChannels)
+                        {
+                            <div class="global-channel-row">
+                                <span class="status-dot @(gch.IsEnabled ? "online" : "offline")"></span>
+                                <strong>@gch.Name</strong>
+                                <span class="status-badge status-neutral">@gch.ChannelType</span>
+                            </div>
+                        }
+                    }
+                    else
+                    {
+                        <p class="section-description" style="margin: 0;">None configured on the main site.</p>
+                    }
+                    <p class="form-help">Managed on the main site; they fire for every site. Switch to the main site to change them.</p>
+                </div>
+                <p class="section-description">
+                    Channels below are specific to this site - they fire in addition to the global channels above.
+                </p>
+            }
 
             @if (alertChannels?.Count > 0)
             {
@@ -1691,7 +2011,7 @@
                     <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 0; border-bottom: 1px solid var(--bg-tertiary);">
                         <div>
                             <strong style="color: var(--text-primary);">@ch.Name</strong>
-                            <span class="status-badge" style="margin-left: 0.5rem;">@ch.ChannelType</span>
+                            <span class="status-badge status-neutral" style="margin-left: 0.5rem;">@ch.ChannelType</span>
                             @if (!ch.IsEnabled)
                             {
                                 <span style="color: var(--text-muted); margin-left: 0.5rem;">(disabled)</span>
@@ -1952,10 +2272,14 @@
         </div>
     </div>
 
+    @* The main site IS the global context: with multi-site enabled it shows the full
+       card (titled Global) with the shared settings; a secondary site gets only its
+       own enable toggle plus a pointer to the main site. Multi-site disabled renders
+       today's single combined card unchanged. *@
     <!-- Threat Intelligence Configuration -->
-    <div class="card" id="threat-intelligence">
+    <div class="card settings-tab-security" id="threat-intelligence">
         <div class="card-header">
-            <h2 class="card-title">Threat Intelligence</h2>
+            <h2 class="card-title">@(_multiSiteEnabled && SiteContext.IsDefault ? "Global Threat Intelligence" : "Threat Intelligence")</h2>
         </div>
         <div class="card-body">
             <p class="section-description">
@@ -1969,6 +2293,15 @@
                 </label>
             </div>
 
+            @if (!SiteContext.IsDefault)
+            {
+                <p class="section-description">
+                    Global settings (background collection interval, data retention, MaxMind GeoIP databases,
+                    and CrowdSec enrichment) are managed on the main site.
+                </p>
+            }
+            else
+            {
             <div class="form-group">
                 <label class="form-label">Background Collection Interval</label>
                 <select class="form-control" @bind="threatPollInterval">
@@ -1991,51 +2324,7 @@
                     <option value="365">1 year</option>
                 </select>
             </div>
-
-            <div id="maxmind" style="margin-top: 1.25rem; padding: 1rem; background: var(--bg-primary); border-radius: 8px;">
-                <div class="info-row">
-                    <span class="info-label">GeoLite2 Database:</span>
-                    <span class="info-value" style="color: var(--text-secondary);">@threatGeoStatus</span>
-                </div>
-
-                <div class="form-group" style="margin-top: 0.75rem;">
-                    <label class="form-label">MaxMind Account ID</label>
-                    <input type="text" class="form-control" @bind="maxmindAccountId" autocomplete="off"
-                           placeholder="@(hasMaxmindAccountId ? "Saved - enter new to update" : "Enter MaxMind account ID")"
-                           style="max-width: 200px;"
-                           data-1p-ignore data-lpignore="true" data-bwignore />
-                </div>
-
-                <div class="form-group" style="margin-top: 0.75rem;">
-                    <label class="form-label">MaxMind License Key</label>
-                    <input type="password" class="form-control" @bind="maxmindLicenseKey" autocomplete="new-password"
-                           placeholder="@(hasMaxmindLicenseKey ? "Saved - enter new to update" : "Enter MaxMind license key")"
-                           data-1p-ignore data-lpignore="true" data-bwignore />
-                    <small class="form-help">Get a free account at <a href="https://www.maxmind.com/en/geolite2/signup" target="_blank" rel="noopener noreferrer" style="color: var(--primary-color);">maxmind.com</a> - Account ID and license key are under Account > Manage License Keys</small>
-                </div>
-
-                @if ((hasMaxmindAccountId || !string.IsNullOrEmpty(maxmindAccountId)) && (hasMaxmindLicenseKey || !string.IsNullOrEmpty(maxmindLicenseKey)))
-                {
-                    <button class="btn btn-secondary btn-sm" @onclick="DownloadMaxMindDatabases" disabled="@downloadingMaxmind" style="margin-top: 0.5rem;">
-                        @if (downloadingMaxmind)
-                        {
-                            <span class="spinner-sm"></span>
-                            <span>Downloading...</span>
-                        }
-                        else
-                        {
-                            <span>Download Now</span>
-                        }
-                    </button>
-                }
-
-                @if (!string.IsNullOrEmpty(maxmindMessage))
-                {
-                    <div class="alert alert-@maxmindMessageClass" style="margin-top: 1rem;">
-                        @maxmindMessage
-                    </div>
-                }
-            </div>
+            }
 
             <div class="action-buttons" style="margin-top: 1rem;">
                 <button class="btn btn-primary" @onclick="SaveThreatSettings" disabled="@savingThreatSettings">
@@ -2060,14 +2349,103 @@
         </div>
     </div>
 
+    @* MaxMind GeoIP is global (instance-wide: shared .mmdb files and credentials) and
+       lives on the main site only, like CrowdSec below; a secondary site's Threat
+       Intelligence card points there instead of rendering the shared settings. *@
+    @if (SiteContext.IsDefault)
+    {
+    <!-- MaxMind GeoIP Configuration -->
+    <div class="card settings-tab-security" id="maxmind">
+        <div class="card-header">
+            <h2 class="card-title">MaxMind GeoIP</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            }
+        </div>
+        <div class="card-body">
+            <p class="section-description">
+                MaxMind GeoLite2 databases add country, city, and ASN data to threat sources for geographic analysis. With credentials saved, the databases auto-download and refresh monthly.
+            </p>
+
+            <div class="info-row" style="margin-bottom: 1rem; padding: 0.75rem; background: var(--bg-primary); border-radius: 6px;">
+                <span class="info-label">GeoLite2 Database:</span>
+                <span class="info-value" style="color: var(--text-secondary);">@threatGeoStatus</span>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">MaxMind Account ID</label>
+                <input type="text" class="form-control" @bind="maxmindAccountId" autocomplete="off"
+                       placeholder="@(hasMaxmindAccountId ? "Saved - enter new to update" : "Enter MaxMind account ID")"
+                       style="max-width: 200px;"
+                       data-1p-ignore data-lpignore="true" data-bwignore />
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">MaxMind License Key</label>
+                <input type="password" class="form-control" @bind="maxmindLicenseKey" autocomplete="new-password"
+                       placeholder="@(hasMaxmindLicenseKey ? "Saved - enter new to update" : "Enter MaxMind license key")"
+                       data-1p-ignore data-lpignore="true" data-bwignore />
+                <small class="form-help">Get a free account at <a href="https://www.maxmind.com/en/geolite2/signup" target="_blank" rel="noopener noreferrer" style="color: var(--primary-color);">maxmind.com</a> - Account ID and license key are under Account > Manage License Keys</small>
+            </div>
+
+            <div class="action-buttons" style="margin-top: 1rem;">
+                <button class="btn btn-primary" @onclick="SaveMaxMindSettings" disabled="@savingMaxmindSettings">
+                    @if (savingMaxmindSettings)
+                    {
+                        <span class="spinner"></span>
+                        <span>Saving...</span>
+                    }
+                    else
+                    {
+                        <span>Save</span>
+                    }
+                </button>
+                @if ((hasMaxmindAccountId || !string.IsNullOrEmpty(maxmindAccountId)) && (hasMaxmindLicenseKey || !string.IsNullOrEmpty(maxmindLicenseKey)))
+                {
+                    <button class="btn btn-secondary" @onclick="DownloadMaxMindDatabases" disabled="@downloadingMaxmind">
+                        @if (downloadingMaxmind)
+                        {
+                            <span class="spinner"></span>
+                            <span>Downloading...</span>
+                        }
+                        else
+                        {
+                            <span>Download Now</span>
+                        }
+                    </button>
+                }
+            </div>
+
+            @if (!string.IsNullOrEmpty(maxmindMessage))
+            {
+                <div class="alert alert-@maxmindMessageClass" style="margin-top: 1rem;">
+                    @maxmindMessage
+                </div>
+            }
+        </div>
+    </div>
+    }
+
+    @* CrowdSec CTI is global (instance-wide) and lives with the rest of the global
+       threat settings on the main site only; a secondary site's Threat Intelligence
+       card points there instead of rendering the shared settings. *@
+    @if (SiteContext.IsDefault)
+    {
     <!-- CrowdSec CTI Configuration -->
-    <div class="card" id="crowdsec">
+    <div class="card settings-tab-security" id="crowdsec">
         <div class="card-header">
             <h2 class="card-title">CrowdSec CTI</h2>
-            @if (crowdsecEnabled)
-            {
-                <span class="status-badge status-active">Enabled</span>
-            }
+            <div class="card-header-badges">
+                @if (_multiSiteEnabled)
+                {
+                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                }
+                @if (crowdsecEnabled)
+                {
+                    <span class="status-badge status-active">Enabled</span>
+                }
+            </div>
         </div>
         <div class="card-body">
             <p class="section-description">
@@ -2141,164 +2519,18 @@
             }
         </div>
     </div>
+    }
 
-    <!-- Monitoring Configuration -->
-    <div class="card" id="monitoring">
-        <div class="card-header">
-            <h2 class="card-title">Monitoring</h2>
-            @if (_monitoringSettings?.SnmpDetectionState == SnmpDetectionState.EnabledV2c || _monitoringSettings?.SnmpDetectionState == SnmpDetectionState.EnabledV3Only || _monitoringSettings?.SnmpDetectionState == SnmpDetectionState.Working)
-            {
-                <span class="status-badge status-connected">@(_monitoringSettings.SnmpDetectionState == SnmpDetectionState.EnabledV2c ? "v2c" : _monitoringSettings.SnmpDetectionState == SnmpDetectionState.EnabledV3Only ? "v3" : "Active")</span>
-            }
-            else if (_monitoringSettings?.SnmpDetectionState == SnmpDetectionState.Disabled)
-            {
-                <span class="status-badge status-disconnected">Disabled</span>
-            }
-        </div>
-        <div class="card-body">
-            <p class="section-description">
-                Network Optimizer collects per-port SNMP counters and per-device health to
-                drive the dashboard's live device cards, the upcoming diagnostic views, and
-                the 3D LAN map. SNMP credentials are read directly from your UniFi Console,
-                so you don't need to copy them by hand. InfluxDB stores the time-series data;
-                use your existing instance if you already run one.
-            </p>
-
-            <div class="form-group">
-                <label class="form-label">SNMP Status</label>
-                <div class="form-value">
-                    @switch (_monitoringSettings?.SnmpDetectionState)
-                    {
-                        case SnmpDetectionState.EnabledV2c:
-                            <span class="status-indicator status-active"></span>
-                            <span>Configured (v2c)</span>
-                            break;
-                        case SnmpDetectionState.EnabledV3Only:
-                            <span class="status-indicator status-active"></span>
-                            <span>Configured (v3)</span>
-                            break;
-                        case SnmpDetectionState.Working:
-                            <span class="status-indicator status-active"></span>
-                            <span>Active</span>
-                            break;
-                        case SnmpDetectionState.PollFailing:
-                            <span class="status-indicator status-danger"></span>
-                            <span>Poll failures</span>
-                            break;
-                        case SnmpDetectionState.Disabled:
-                            <span class="status-indicator status-inactive"></span>
-                            <span>SNMP not enabled on UniFi Console</span>
-                            break;
-                        default:
-                            <span class="status-indicator status-inactive"></span>
-                            <span>Not checked</span>
-                            break;
-                    }
-                </div>
-            </div>
-
-            @if (_monitoringSettings?.LastSnmpDetection != null)
-            {
-                <div class="form-group">
-                    <label class="form-label">Last Detected</label>
-                    <div class="form-value">@_monitoringSettings.LastSnmpDetection.Value.ToString("g")</div>
-                </div>
-            }
-
-            <h3 style="margin-top: 1.5rem;">InfluxDB</h3>
-            <p class="section-description">
-                Time-series storage for monitoring data. If you don't already run InfluxDB,
-                the easiest path is the setup helper on the
-                <a href="/monitoring">Monitoring</a> page; it'll detect what's available,
-                install InfluxDB if needed, and provision the buckets and an API token for
-                you. If you already run InfluxDB 2.x, point this at it; the
-                bucket names below are NO-specific so they can't collide with other data.
-            </p>
-
-            <div class="form-group">
-                <label class="form-label">InfluxDB Status</label>
-                <div class="form-value">
-                    @if (_monitoringSettings?.InfluxDbReachable == true)
-                    {
-                        <span class="status-indicator status-active"></span>
-                        <span>Connected</span>
-                    }
-                    else if (_monitoringSettings?.InfluxDbReachable == false)
-                    {
-                        <span class="status-indicator status-danger"></span>
-                        <span>@(_monitoringSettings?.LastInfluxDbError ?? "Not reachable")</span>
-                    }
-                    else
-                    {
-                        <span class="status-indicator status-inactive"></span>
-                        <span>Not configured</span>
-                    }
-                </div>
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">InfluxDB URL</label>
-                <input type="text" class="form-control" @bind="_influxUrl" placeholder="http://localhost:8086" />
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">API Token</label>
-                <input type="password" class="form-control" @bind="_influxToken" placeholder="@(_influxTokenIsSet ? "(saved, leave blank to keep)" : "Paste an InfluxDB API token")" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">Organization</label>
-                <input type="text" class="form-control" @bind="_influxOrg" placeholder="network-optimizer" />
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">Primary Bucket</label>
-                <input type="text" class="form-control" @bind="_influxBucket" placeholder="network_monitoring" />
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">Long-term Bucket</label>
-                <input type="text" class="form-control" @bind="_influxLongtermBucket" placeholder="network_monitoring_longterm" />
-            </div>
-
-            <div class="action-buttons" style="margin-top: 1rem;">
-                <button class="btn btn-secondary" @onclick="RedetectSnmp" disabled="@_redetectingSnmp">
-                    @if (_redetectingSnmp)
-                    {
-                        <span class="spinner-sm"></span>
-                        <span>Detecting...</span>
-                    }
-                    else
-                    {
-                        <span>Re-detect SNMP</span>
-                    }
-                </button>
-                <button class="btn btn-primary" @onclick="SaveInfluxSettings" disabled="@_savingInflux">
-                    @if (_savingInflux)
-                    {
-                        <span class="spinner-sm"></span>
-                        <span>Saving...</span>
-                    }
-                    else
-                    {
-                        <span>Save &amp; Test InfluxDB</span>
-                    }
-                </button>
-            </div>
-
-            @if (!string.IsNullOrEmpty(_monitoringMessage))
-            {
-                <div class="alert alert-@_monitoringMessageClass" style="margin-top: 1rem;">
-                    @_monitoringMessage
-                </div>
-            }
-        </div>
-    </div>
-
+    @if (SiteContext.IsDefault)
+    {
     <!-- 12. UI / Display Settings -->
-    <div class="card">
+    <div class="card settings-tab-application" id="ui-display">
         <div class="card-header">
             <h2 class="card-title">UI / Display Settings</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            }
         </div>
         <div class="card-body">
             <div class="form-group">
@@ -2312,12 +2544,18 @@
     </div>
 
     <!-- 13. Map / Satellite -->
-    <div class="card" id="map">
+    <div class="card settings-tab-application" id="map">
         <div class="card-header">
             <h2 class="card-title">Satellite Imagery</h2>
-            <span class="status-badge status-@(!string.IsNullOrEmpty(_mapboxToken) ? "connected" : "")">
-                @(!string.IsNullOrEmpty(_mapboxToken) ? "Mapbox (commercial)" : "Esri (non-commercial)")
-            </span>
+            <div class="card-header-badges">
+                @if (_multiSiteEnabled)
+                {
+                    <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+                }
+                <span class="status-badge status-@(!string.IsNullOrEmpty(_mapboxToken) ? "connected" : "info")">
+                    @(!string.IsNullOrEmpty(_mapboxToken) ? "Mapbox (commercial)" : "Esri (non-commercial)")
+                </span>
+            </div>
         </div>
         <div class="card-body">
             <p class="section-description">
@@ -2364,27 +2602,14 @@
         </div>
     </div>
 
-    <!-- Software Updates -->
-    <div class="card">
-        <div class="card-header">
-            <h2 class="card-title">Software Updates</h2>
-        </div>
-        <div class="card-body">
-            <label class="checkbox-label">
-                <input type="checkbox" @bind="receivePrereleaseUpdates" @bind:after="SavePrereleaseSetting" />
-                Receive pre-release update notifications
-            </label>
-            <p class="form-help">
-                Shows a banner when a preview (beta) build is available so you can try new features
-                early. Stable update notifications are unaffected either way.
-            </p>
-        </div>
-    </div>
-
     <!-- 14. Data Management -->
-    <div class="card">
+    <div class="card settings-tab-application" id="data-management">
         <div class="card-header">
             <h2 class="card-title">Data Management</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge global-badge" data-tooltip="Applies to all sites (instance-wide)">Global</span>
+            }
         </div>
         <div class="card-body">
             <div class="data-actions">
@@ -2413,7 +2638,13 @@
                             }
                         </button>
                     </div>
-                    <p class="form-hint" style="margin-top: 0.5rem;">Both include controller credentials, SSH keys, and data protection keys. Full adds floor plans, speed test history, audit results, signal logs, etc. Settings Only exports just configuration without history data.</p>
+                    <p class="form-hint" style="margin-top: 0.5rem;">
+                        Both include controller credentials, SSH keys, and data protection keys. Full adds floor plans, speed test history, audit results, signal logs, etc. Settings Only exports just configuration without history data.
+                        @if (_multiSiteEnabled)
+                        {
+                            <text> This backup covers <strong>every managed site</strong>, not just the current one - each site's database is bundled in.</text>
+                        }
+                    </p>
                     @if (!string.IsNullOrEmpty(exportError))
                     {
                         <div class="alert alert-danger" style="margin-top: 0.5rem;">@exportError</div>
@@ -2443,6 +2674,11 @@
                                     {
                                         <span class="text-muted">Data:</span>
                                         <span>@importPreview.TableCounts.Where(t => t.Value > 0).Count() tables with data</span>
+                                    }
+                                    @if (importPreview.SiteDatabaseCount > 0)
+                                    {
+                                        <span class="text-muted">Sites:</span>
+                                        <span>Main site + @importPreview.SiteDatabaseCount managed site@(importPreview.SiteDatabaseCount == 1 ? "" : "s")</span>
                                     }
                                 </div>
 
@@ -2549,6 +2785,281 @@
             </div>
         </div>
     </div>
+    }
+
+    <!-- Multi-Site -->
+    <div class="card settings-tab-multisite" id="multi-site">
+        <div class="card-header">
+            <h2 class="card-title">Multi-Site Management</h2>
+            @if (_multiSiteEnabled)
+            {
+                <span class="status-badge status-connected">Enabled</span>
+            }
+        </div>
+        <div class="card-body">
+            @if (_multiSiteEnabled)
+            {
+                <SitesOverviewCard />
+            }
+            <p class="section-description">
+                Manage multiple sites from this Network Optimizer instance. Each site gets its own
+                isolated database with per-site monitoring, speed testing, and UniFi Console connection
+                settings.
+            </p>
+
+            @if (!_multiSiteEnabled)
+            {
+                <div class="form-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" checked="@_multiSiteEnabled" @onchange="OnMultiSiteEnabledChanged" />
+                        <span>Enable multi-site management</span>
+                    </label>
+                </div>
+            }
+
+            @if (_multiSiteEnabled)
+            {
+                <div class="form-group">
+                    <label class="form-label">Sites</label>
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Site ID</th>
+                                    <th class="hide-mobile">Created</th>
+                                    <th></th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var site in _sites)
+                                {
+                                    <tr>
+                                        <td>
+                                            @if (_editingSiteId == site.Id)
+                                            {
+                                                <div class="site-name-edit">
+                                                    <input type="text" class="form-control" @bind="_editSiteName" @bind:event="oninput"
+                                                           @onkeydown="@(e => SiteNameEditKey(e, site))" autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore />
+                                                    <button type="button" class="btn btn-primary btn-sm" @onclick="() => SaveSiteName(site)"
+                                                            disabled="@string.IsNullOrWhiteSpace(_editSiteName)">Save</button>
+                                                    <button type="button" class="btn btn-secondary btn-sm" @onclick="CancelSiteNameEdit">Cancel</button>
+                                                </div>
+                                            }
+                                            else
+                                            {
+                                                <span class="site-name-cell">
+                                                    <span>@site.Name</span>
+                                                    <button type="button" class="site-name-edit-btn" data-tooltip="Rename site"
+                                                            aria-label="Rename site" @onclick="() => StartSiteNameEdit(site)">
+                                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                                                            <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                                                        </svg>
+                                                    </button>
+                                                </span>
+                                            }
+                                        </td>
+                                        <td><code>@site.Slug</code></td>
+                                        <td class="hide-mobile">@(site.IsDefault ? "" : site.CreatedAt.ToLocalTime().ToString("MMM d, yyyy"))</td>
+                                        <td>
+                                            @if (site.IsDefault)
+                                            {
+                                                <span class="status-badge">Default</span>
+                                            }
+                                            else
+                                            {
+                                                var agentStatus = SiteAgentStatus(site.Id);
+                                                <span class="agent-status-inline" data-tooltip="@agentStatus.Tooltip">
+                                                    <span class="status-dot @agentStatus.Dot"></span>
+                                                    @agentStatus.Label
+                                                </span>
+                                            }
+                                        </td>
+                                        <td>
+                                            <div class="btn-group-wrap">
+                                                <button type="button" class="btn btn-secondary btn-sm" @onclick="() => ToggleAgents(site.Id)">
+                                                    Configuration
+                                                </button>
+                                                @if (site.Slug != SiteContext.Slug)
+                                                {
+                                                    <button type="button" class="btn btn-primary btn-sm" @onclick="() => SwitchToSiteAsync(site)">
+                                                        Switch to Site
+                                                    </button>
+                                                }
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    @if (_expandedSiteId == site.Id)
+                                    {
+                                        var agents = AgentsFor(site.Id).ToList();
+                                        <tr class="history-details-row site-config-row">
+                                            <td colspan="5">
+                                                <div class="site-config-panel">
+                                                    <div class="site-config-section">
+                                                        <div class="site-config-section-title">Agent</div>
+                                                        @if (agents.Count > 0)
+                                                        {
+                                                            @foreach (var agent in agents)
+                                                            {
+                                                                <div class="site-agent-row">
+                                                                    <span class="status-dot @(TunnelRegistry.IsAgentLive(agent) ? "online" : "offline")"></span>
+                                                                    <span>@agent.Name</span>
+                                                                    <span class="site-agent-status">
+                                                                        @if (!agent.Enabled)
+                                                                        {
+                                                                            <text>Disabled</text>
+                                                                        }
+                                                                        else if (agent.EnrolledAt == null)
+                                                                        {
+                                                                            <text>Awaiting enrollment</text>
+                                                                        }
+                                                                        else if (TunnelRegistry.IsAgentLive(agent))
+                                                                        {
+                                                                            <text>Online@(TunnelRegistry.IsConnected(agent.Id) ? " (tunnel)" : "")@(agent.LastVersion != null ? $" - v{agent.LastVersion}" : "")</text>
+                                                                            @if (AgentVersionOutdated(agent))
+                                                                            {
+                                                                                <span class="status-warning" data-tooltip="A newer agent release (v@(AppVersionInfo.LatestAgentVersion)) is available. Update agents whenever a release calls for it.">
+                                                                                    Update agent
+                                                                                </span>
+                                                                                <button class="btn btn-sm btn-secondary"
+                                                                                        @onclick="() => ToggleUpgradeCommand(agent.Id)"
+                                                                                        data-tooltip="Show the upgrade one-liner">
+                                                                                    @(_upgradeCommandAgentId == agent.Id ? "Hide command" : "Upgrade command")
+                                                                                </button>
+                                                                            }
+                                                                        }
+                                                                        else
+                                                                        {
+                                                                            <text>Last seen @agent.LastSeenAt?.ToLocalTime().ToString("MMM d, h:mm tt")</text>
+                                                                        }
+                                                                    </span>
+                                                                    <button type="button" class="btn btn-secondary btn-sm" @onclick="() => ToggleAgentEnabled(agent)">
+                                                                        @(agent.Enabled ? "Disable" : "Enable")
+                                                                    </button>
+                                                                    <button type="button" class="btn btn-danger btn-sm" @onclick="() => RemoveAgent(agent)">
+                                                                        Remove
+                                                                    </button>
+                                                                </div>
+                                                                @if (_upgradeCommandAgentId == agent.Id)
+                                                                {
+                                                                    <div class="agent-upgrade-cmd">
+                                                                        <p class="form-help">Bare metal (systemd) - enrollment is preserved, only the binaries update:</p>
+                                                                        <pre><code>@NativeUpgradeCommand()</code></pre>
+                                                                        <p class="form-help">
+                                                                            Docker agents instead: <code>cd /opt/network-optimizer-agent &amp;&amp; docker compose pull &amp;&amp; docker compose up -d</code>
+                                                                        </p>
+                                                                    </div>
+                                                                }
+                                                            }
+                                                            <div class="site-agent-actions">
+                                                                @if (!site.IsDefault && NeedsAgentSetup(site.Id))
+                                                                {
+                                                                    <button type="button" class="btn btn-primary btn-sm" @onclick="() => StartAgentSetup(site)">
+                                                                        Finish agent setup
+                                                                    </button>
+                                                                }
+                                                                <button type="button" class="btn btn-secondary btn-sm" @onclick="() => CreateAgent(site)" disabled="@_creatingAgent">
+                                                                    New Agent Token
+                                                                </button>
+                                                            </div>
+                                                        }
+                                                        else
+                                                        {
+                                                            <p class="site-config-empty">
+                                                                @(site.IsDefault
+                                                                    ? "This site is monitored directly by this server. Add an agent only if this server runs off-site."
+                                                                    : "No on-site agent for this site yet. Set one up to reach it without a VPN.")
+                                                            </p>
+                                                            <div class="site-agent-actions">
+                                                                @if (!site.IsDefault)
+                                                                {
+                                                                    <button type="button" class="btn btn-primary btn-sm" @onclick="() => StartAgentSetup(site)">
+                                                                        Set up agent
+                                                                    </button>
+                                                                }
+                                                                else
+                                                                {
+                                                                    <button type="button" class="btn btn-secondary btn-sm" @onclick="() => CreateAgent(site)" disabled="@_creatingAgent">
+                                                                        New Agent Token
+                                                                    </button>
+                                                                }
+                                                            </div>
+                                                        }
+                                                        @if (_newAgentToken != null && _newAgentTokenSiteId == site.Id)
+                                                        {
+                                                            <AgentInstallInstructions Token="@_newAgentToken" LanSpeedTest="false" />
+                                                        }
+                                                    </div>
+
+                                                    @if (!site.IsDefault)
+                                                    {
+                                                        <div class="site-config-section">
+                                                            <div class="site-config-section-title">Settings</div>
+                                                            <label class="checkbox-toggle">
+                                                                <input type="checkbox" checked="@ConsoleViaAgent(site.Id)"
+                                                                       @onchange="e => ToggleConsoleViaAgent(site, (bool)e.Value!)" />
+                                                                Reach this site's UniFi Console through the agent tunnel - no VPN or
+                                                                port-forward to the console needed. Applies on the next connect.
+                                                            </label>
+                                                            <label class="checkbox-toggle">
+                                                                <input type="checkbox" checked="@SshViaAgent(site.Id)"
+                                                                       @onchange="e => ToggleSshViaAgent(site, (bool)e.Value!)" />
+                                                                Reach this site's devices through the agent tunnel: SSH to the gateway
+                                                                and devices, plus modem and ONT status pages. Enables gateway WAN speed
+                                                                tests, LAN speed tests, and modem / ONT monitoring without VPN. Applies within
+                                                                a minute.
+                                                            </label>
+                                                            <div class="form-group site-config-override">
+                                                                <label class="form-label">Client speed test target override (optional)</label>
+                                                                <input type="text" class="form-control"
+                                                                       placeholder="@ClientSpeedTestPlaceholder(site)"
+                                                                       value="@ClientSpeedTestTarget(site.Id)"
+                                                                       @onchange="e => SaveClientSpeedTestTarget(site, e.Value?.ToString())" />
+                                                                <small class="form-help">
+                                                                    Where browsers reach this site's speed test pages. Blank = the
+                                                                    agent's detected LAN IP over https. Enter a full URL for a reverse
+                                                                    proxy or an http agent (AGENT_SPEEDTEST_TLS=0); a bare host uses
+                                                                    https on the agent port. Doesn't affect the network path trace.
+                                                                </small>
+                                                            </div>
+                                                        </div>
+                                                    }
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    }
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="site-agent-setup">
+                    <SiteSetupWizard @ref="_setupWizard" OnSitesChanged="RefreshSites" />
+                </div>
+
+                <details class="setup-guide multisite-disable">
+                    <summary>Disable multi-site management</summary>
+                    <div class="setup-guide-content">
+                        <div class="alert alert-warning">
+                            Multi-site management is enabled with @_sites.Count sites. Turning it off hides every
+                            managed site and returns to single-site mode (no site data is deleted). Do this from the
+                            main site, and only on purpose.
+                        </div>
+                        <button type="button" class="btn btn-danger btn-sm" @onclick="DisableMultiSiteAsync">
+                            Disable multi-site management
+                        </button>
+                    </div>
+                </details>
+            }
+
+            @if (!string.IsNullOrEmpty(_multiSiteMessage))
+            {
+                <div class="alert alert-@_multiSiteMessageClass">@_multiSiteMessage</div>
+            }
+        </div>
+    </div>
 </div>
 
 <SponsorshipBanner AlwaysShow="true" />
@@ -2570,6 +3081,481 @@
 </style>
 
 @code {
+    [SupplyParameterFromQuery(Name = "tab")]
+    public string? TabParam { get; set; }
+
+    private string _activeTab = "connection";
+    private string? _lastTabParam;
+
+    private static readonly HashSet<string> ValidTabs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "connection", "monitoring", "speedtests", "security", "application", "multisite"
+    };
+
+    // Maps card anchors (used by /settings#... deep links across the app) to their tab
+    // so those links keep working: activate the tab, then scroll to and highlight the card.
+    private static readonly Dictionary<string, string> AnchorTabMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["console-connection"] = "connection",
+        ["gateway-ssh"] = "connection",
+        ["device-ssh"] = "connection",
+        ["monitoring"] = "monitoring",
+        ["sqm-monitor"] = "monitoring",
+        ["cellular-modem"] = "monitoring",
+        ["cable-modem"] = "monitoring",
+        ["ont-monitoring"] = "monitoring",
+        ["speed-test-settings"] = "speedtests",
+        ["external-speedtest-settings"] = "speedtests",
+        ["security-audit"] = "security",
+        ["alert-channels"] = "security",
+        ["threat-intelligence"] = "security",
+        ["maxmind"] = "security",
+        ["crowdsec"] = "security",
+        ["admin-password"] = "application",
+        ["licensing"] = "application",
+        ["application-settings"] = "application",
+        ["ui-display"] = "application",
+        ["map"] = "application",
+        ["data-management"] = "application",
+        ["multi-site"] = "multisite",
+    };
+
+    private static string ResolveTab(string? param) =>
+        param != null && ValidTabs.Contains(param) ? param.ToLowerInvariant() : "connection";
+
+    private void SetActiveTab(string tab)
+    {
+        _activeTab = tab;
+        NavigationManager.NavigateTo("/settings?tab=" + tab, forceLoad: false, replace: false);
+        _lastTabParam = tab;
+    }
+
+    protected override void OnParametersSet()
+    {
+        // Handle query param changes when already on this page (Blazor reuses the component)
+        if (TabParam != _lastTabParam && _lastTabParam != null)
+        {
+            var newTab = ResolveTab(TabParam);
+            if (newTab != _activeTab)
+            {
+                _activeTab = newTab;
+                StateHasChanged();
+            }
+        }
+        _lastTabParam = TabParam;
+    }
+
+    private async Task HandleFragmentNavigationAsync()
+    {
+        // The fragment is not part of the HTTP request, so it is only readable client-side.
+        var hash = await JS.InvokeAsync<string>("eval", "window.location.hash");
+        if (string.IsNullOrEmpty(hash))
+            return;
+
+        var anchor = hash.TrimStart('#');
+        if (anchor.Equals("unifi-ssh", StringComparison.OrdinalIgnoreCase))
+            anchor = "device-ssh";
+        if (!AnchorTabMap.TryGetValue(anchor, out var tab))
+            return;
+
+        if (_activeTab != tab)
+        {
+            _activeTab = tab;
+            StateHasChanged();
+        }
+
+        // Let the tab panel render before scrolling; same scroll-and-highlight
+        // pattern as the Monitoring page.
+        await Task.Delay(300);
+        await JS.InvokeVoidAsync("eval", @"
+            (function() {
+                var el = document.getElementById('" + anchor + @"');
+                if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    el.style.transition = 'outline-color 0.3s';
+                    el.style.outline = '2px solid rgba(59, 130, 246, 0.5)';
+                    el.style.outlineOffset = '4px';
+                    el.style.borderRadius = '12px';
+                    setTimeout(function() { el.style.outline = ''; el.style.outlineOffset = ''; }, 2000);
+                }
+            })();");
+    }
+
+    // Multi-Site
+    private bool _multiSiteEnabled = false;
+    private List<Site> _sites = new();
+    private string _multiSiteMessage = "";
+    private string _multiSiteMessageClass = "";
+
+    private async Task LoadMultiSiteSettings()
+    {
+        _multiSiteEnabled = await SiteManagement.IsMultiSiteEnabledAsync();
+        if (_multiSiteEnabled)
+        {
+            _sites = await SiteManagement.GetSitesAsync();
+            await LoadAgentsAsync();
+
+            // Keep the Sites table's agent status current while the page is open -
+            // without this the Status column is a page-load snapshot and disagrees
+            // with the site dropdown / All Sites page after an agent comes or goes.
+            _agentPollTimer ??= new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        await LoadAgentsAsync();
+                        StateHasChanged();
+                    });
+                }
+                catch { /* prevent timer death */ }
+            }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        }
+    }
+
+    private System.Threading.Timer? _agentPollTimer;
+
+    public void Dispose()
+    {
+        _agentPollTimer?.Dispose();
+    }
+
+    private async Task OnMultiSiteEnabledChanged(ChangeEventArgs e)
+    {
+        // The checkbox only shows while multi-site is off, so this path only ever
+        // enables; disabling goes through the guarded collapsible action below.
+        _multiSiteMessage = "";
+        _multiSiteEnabled = e.Value is true;
+        await SiteManagement.SetMultiSiteEnabledAsync(_multiSiteEnabled);
+        if (_multiSiteEnabled)
+            _sites = await SiteManagement.GetSitesAsync();
+    }
+
+    // Disabling multi-site hides every managed site - never a casual one-click.
+    private async Task DisableMultiSiteAsync()
+    {
+        if (!await ConfirmDisableMultiSiteAsync())
+            return;
+
+        _multiSiteMessage = "";
+        _multiSiteEnabled = false;
+        await SiteManagement.SetMultiSiteEnabledAsync(false);
+        StateHasChanged();
+    }
+
+    private async Task<bool> ConfirmDisableMultiSiteAsync()
+    {
+        var count = _sites.Count;
+        return await JS.InvokeAsync<bool>("confirm",
+            $"Disable multi-site management? This hides all {count} site(s) and returns to single-site mode. " +
+            "No site data is deleted and you can re-enable it later. Continue?");
+    }
+
+    private async Task RefreshSites()
+    {
+        _sites = await SiteManagement.GetSitesAsync();
+        await LoadAgentsAsync();
+        StateHasChanged();
+    }
+
+    // Inline site rename (the slug/Site ID stays immutable).
+    private int? _editingSiteId;
+    private string _editSiteName = "";
+
+    private void StartSiteNameEdit(Site site)
+    {
+        _editingSiteId = site.Id;
+        _editSiteName = site.Name;
+    }
+
+    private void CancelSiteNameEdit()
+    {
+        _editingSiteId = null;
+        _editSiteName = "";
+    }
+
+    private async Task SaveSiteName(Site site)
+    {
+        var name = _editSiteName?.Trim();
+        if (string.IsNullOrWhiteSpace(name) || name == site.Name)
+        {
+            CancelSiteNameEdit();
+            return;
+        }
+        site.Name = name;
+        await SiteManagement.UpdateSiteAsync(site);
+        _editingSiteId = null;
+        _editSiteName = "";
+        _sites = await SiteManagement.GetSitesAsync();
+        if (site.Slug == SiteContext.Slug)
+            _currentSiteName = name; // keep the header badge in sync
+    }
+
+    /// <summary>
+    /// Switch the active site to the given one. Site context is cookie-based, so a
+    /// full reload is required for every scoped service to resolve against the new
+    /// site's database (same mechanism as the header site switcher).
+    /// </summary>
+    private async Task SwitchToSiteAsync(Site site)
+    {
+        if (site.Slug == SiteContext.Slug)
+            return;
+        await JS.InvokeVoidAsync("eval",
+            $"document.cookie = '{SiteContextService.CookieName}={site.Slug}; path=/; max-age=31536000; SameSite=Lax'");
+        // Drop any #fragment first: reloading the *same* URL with its fragment is a
+        // same-document navigation the browser won't actually reload, so the new site
+        // cookie would never take effect. The fragment is meaningless on another site anyway.
+        var target = NavigationManager.Uri;
+        var fragmentAt = target.IndexOf('#');
+        NavigationManager.NavigateTo(fragmentAt >= 0 ? target[..fragmentAt] : target, forceLoad: true);
+    }
+
+    private async Task SiteNameEditKey(KeyboardEventArgs e, Site site)
+    {
+        if (e.Key == "Enter")
+            await SaveSiteName(site);
+        else if (e.Key == "Escape")
+            CancelSiteNameEdit();
+    }
+
+    // Site agents (registry data, keyed by site id)
+    private Dictionary<int, List<SiteAgent>> _agentsBySite = new();
+    private int? _expandedSiteId;
+    private bool _creatingAgent;
+    private string? _newAgentToken;
+    private int? _newAgentTokenSiteId;
+    private SiteSetupWizard? _setupWizard;
+
+    // A site still needs agent setup until one of its agents has enrolled;
+    // pending (never-enrolled) tokens don't count. Drives the "Set up agent" /
+    // "Finish agent setup" button that drops back into the wizard's agent step.
+    private bool NeedsAgentSetup(int siteId) => !AgentsFor(siteId).Any(a => a.EnrolledAt != null);
+
+    private async Task StartAgentSetup(Site site)
+    {
+        _setupWizard?.StartAgentSetupFor(site);
+        // Let the wizard render at the agent step, then bring it into view.
+        await Task.Delay(50);
+        await JS.InvokeVoidAsync("eval", @"
+            (function() {
+                var el = document.getElementById('site-agent-setup');
+                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            })();");
+    }
+
+    private async Task LoadAgentsAsync()
+    {
+        _agentsBySite = (await AgentEnrollment.GetAllAgentsAsync())
+            .GroupBy(a => a.SiteId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(a => a.CreatedAt).ToList());
+    }
+
+    private List<SiteAgent> AgentsFor(int siteId) =>
+        _agentsBySite.TryGetValue(siteId, out var agents) ? agents : new List<SiteAgent>();
+
+    private int AgentCount(int siteId) => AgentsFor(siteId).Count;
+
+    // At-a-glance agent state for a site's row in the Sites table. Uses the
+    // shared IsAgentLive definition (tunnel-connected or heartbeat-fresh) and is
+    // kept current by the agent poll timer, so it agrees with the other status
+    // surfaces instead of freezing at whatever page load saw.
+    private (string Dot, string Label, string Tooltip) SiteAgentStatus(int siteId)
+    {
+        var agents = AgentsFor(siteId);
+        if (agents.Count == 0)
+            return ("offline", "No agent", "No agent set up for this site");
+        if (agents.Any(a => a.Enabled && a.EnrolledAt != null && TunnelRegistry.IsAgentLive(a)))
+            return ("online", "Online", "An agent is enrolled and connected");
+        if (agents.Any(a => a.EnrolledAt != null))
+            return ("offline", "Offline", "An agent is enrolled but not currently connected");
+        return ("offline", "Awaiting", "Enrollment token created; waiting for the agent to enroll");
+    }
+
+    private async Task ToggleAgents(int siteId)
+    {
+        _expandedSiteId = _expandedSiteId == siteId ? null : siteId;
+        _newAgentToken = null;
+        if (_expandedSiteId != null)
+        {
+            await LoadAgentsAsync();
+            var site = _sites.FirstOrDefault(s => s.Id == siteId);
+            if (site != null)
+            {
+                await LoadConsoleViaAgentAsync(site);
+                await LoadSshViaAgentAsync(site);
+                await LoadClientSpeedTestTargetAsync(site);
+            }
+        }
+    }
+
+    // Per-site "console via agent tunnel" flag, stored in the site's own database
+    private readonly Dictionary<int, bool> _consoleViaAgent = new();
+
+    private bool ConsoleViaAgent(int siteId) => _consoleViaAgent.TryGetValue(siteId, out var enabled) && enabled;
+
+    private async Task LoadConsoleViaAgentAsync(Site site)
+    {
+        await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+        var setting = await db.SystemSettings.FindAsync(UniFiConnectionService.ConsoleViaAgentKey);
+        _consoleViaAgent[site.Id] = bool.TryParse(setting?.Value, out var enabled) && enabled;
+    }
+
+    private async Task ToggleConsoleViaAgent(Site site, bool value)
+    {
+        await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+        var setting = await db.SystemSettings.FindAsync(UniFiConnectionService.ConsoleViaAgentKey);
+        if (setting == null)
+        {
+            db.SystemSettings.Add(new SystemSetting { Key = UniFiConnectionService.ConsoleViaAgentKey, Value = value.ToString() });
+        }
+        else
+        {
+            setting.Value = value.ToString();
+            setting.UpdatedAt = DateTime.UtcNow;
+        }
+        await db.SaveChangesAsync();
+        _consoleViaAgent[site.Id] = value;
+    }
+
+    // Per-site "SSH via agent tunnel" flag (gateway + device SSH), stored in the site's own database
+    private readonly Dictionary<int, bool> _sshViaAgent = new();
+
+    private bool SshViaAgent(int siteId) => _sshViaAgent.TryGetValue(siteId, out var enabled) && enabled;
+
+    private async Task LoadSshViaAgentAsync(Site site)
+    {
+        await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+        var setting = await db.SystemSettings.FindAsync(SiteTunnelRouting.DevicesViaAgentKey);
+        _sshViaAgent[site.Id] = bool.TryParse(setting?.Value, out var enabled) && enabled;
+    }
+
+    private async Task ToggleSshViaAgent(Site site, bool value)
+    {
+        await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+        var setting = await db.SystemSettings.FindAsync(SiteTunnelRouting.DevicesViaAgentKey);
+        if (setting == null)
+        {
+            db.SystemSettings.Add(new SystemSetting { Key = SiteTunnelRouting.DevicesViaAgentKey, Value = value.ToString() });
+        }
+        else
+        {
+            setting.Value = value.ToString();
+            setting.UpdatedAt = DateTime.UtcNow;
+        }
+        await db.SaveChangesAsync();
+        _sshViaAgent[site.Id] = value;
+    }
+
+    // Per-site Client Speed Test target override (IP/host or full URL), stored in the
+    // site's own database. Client-facing only - never affects the server-side path trace.
+    private readonly Dictionary<int, string?> _clientSpeedTestTarget = new();
+
+    private string? ClientSpeedTestTarget(int siteId) =>
+        _clientSpeedTestTarget.TryGetValue(siteId, out var v) ? v : null;
+
+    // An online agent reporting an older version than the manually-tracked
+    // latest agent release gets an "Update agent" callout. Tracked manually
+    // (AppVersionInfo.LatestAgentVersion) rather than compared to the server
+    // build: server releases without agent changes leave agents intentionally
+    // lagging, and that must not nag.
+    private static bool AgentVersionOutdated(SiteAgent agent) =>
+        NetworkOptimizer.Core.Helpers.VersionUtilities.IsOlderThan(agent.LastVersion, AppVersionInfo.LatestAgentVersion);
+
+    // Which agent row is showing its upgrade one-liner. The install script
+    // preserves an enrolled agent.json, so the upgrade command is the install
+    // one-liner without a token.
+    private int? _upgradeCommandAgentId;
+
+    private void ToggleUpgradeCommand(int agentId) =>
+        _upgradeCommandAgentId = _upgradeCommandAgentId == agentId ? null : agentId;
+
+    private string NativeUpgradeCommand()
+    {
+        var server = string.IsNullOrWhiteSpace(AgentServerUrl.Url)
+            ? "https://your-network-optimizer" : AgentServerUrl.Url!.TrimEnd('/');
+        return "curl -fsSL https://raw.githubusercontent.com/Ozark-Connect/NetworkOptimizer/main/scripts/agent/install-native.sh"
+            + $" | sudo bash -s -- --server \"{server}\""
+            + "\n# add --lan-speed-test if this agent hosts the LAN speed test page";
+    }
+
+    // Placeholder shows what a blank override resolves to - the online agent's
+    // detected LAN IP on the agent's https port (same pick as
+    // SiteSpeedTestTargetResolver) - so the operator can see the auto value
+    // they'd be overriding. Generic example when no agent has reported in.
+    private string ClientSpeedTestPlaceholder(Site site)
+    {
+        var lanIp = AgentsFor(site.Id)
+            .Where(a => a.Enabled && !string.IsNullOrEmpty(a.LanIp) && TunnelRegistry.IsAgentLive(a))
+            .OrderByDescending(a => a.LastSeenAt)
+            .Select(a => a.LanIp)
+            .FirstOrDefault();
+        return lanIp != null
+            ? $"auto: https://{lanIp}:{SiteSpeedTestTargetResolver.AgentOpenSpeedTestPort} (agent's detected LAN IP)"
+            : "e.g. 192.168.1.50 or https://speed.example.com";
+    }
+
+    private async Task LoadClientSpeedTestTargetAsync(Site site)
+    {
+        await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+        var setting = await db.SystemSettings.FindAsync(SystemSettingKeys.ClientSpeedTestTargetOverride);
+        _clientSpeedTestTarget[site.Id] = setting?.Value;
+    }
+
+    private async Task SaveClientSpeedTestTarget(Site site, string? value)
+    {
+        var trimmed = value?.Trim();
+        if (string.IsNullOrEmpty(trimmed)) trimmed = null;
+        await using var db = SiteDb.CreateForSite(site.Slug, site.IsDefault);
+        var setting = await db.SystemSettings.FindAsync(SystemSettingKeys.ClientSpeedTestTargetOverride);
+        if (setting == null)
+        {
+            if (trimmed != null)
+                db.SystemSettings.Add(new SystemSetting { Key = SystemSettingKeys.ClientSpeedTestTargetOverride, Value = trimmed });
+        }
+        else
+        {
+            setting.Value = trimmed;
+            setting.UpdatedAt = DateTime.UtcNow;
+        }
+        await db.SaveChangesAsync();
+        _clientSpeedTestTarget[site.Id] = trimmed;
+    }
+
+    private async Task CreateAgent(Site site)
+    {
+        _creatingAgent = true;
+        try
+        {
+            var (agent, token) = await AgentEnrollment.CreateAgentAsync(site.Id, $"Agent {AgentCount(site.Id) + 1}");
+            _newAgentToken = token;
+            _newAgentTokenSiteId = site.Id;
+            await LoadAgentsAsync();
+        }
+        finally
+        {
+            _creatingAgent = false;
+        }
+    }
+
+    private async Task ToggleAgentEnabled(SiteAgent agent)
+    {
+        await AgentEnrollment.SetEnabledAsync(agent.Id, !agent.Enabled);
+        await LoadAgentsAsync();
+    }
+
+    private async Task RemoveAgent(SiteAgent agent)
+    {
+        if (!await JS.InvokeAsync<bool>("confirm",
+                $"Remove agent \"{agent.Name}\"? Its enrollment token/key stops working and it disappears from this list."))
+            return;
+
+        await AgentEnrollment.DeleteAgentAsync(agent.Id);
+        if (_newAgentTokenSiteId == agent.SiteId)
+            _newAgentToken = null;
+        await LoadAgentsAsync();
+        StateHasChanged();
+    }
+
     // UniFi Controller
     private string controllerUrl = "https://192.168.1.1";
     private string controllerUsername = "";
@@ -2580,6 +3566,9 @@
     private bool rememberCredentials = true;
     private bool ignoreControllerSSLErrors = true;
     private string controllerStatus = "Disconnected";
+    private bool _currentSiteConsoleViaAgent;
+    private bool _currentSiteSshViaAgent;
+    private string? _currentSiteName;
     private bool testingController = false;
     private string controllerMessage = "";
     private string controllerMessageClass = "";
@@ -2725,7 +3714,7 @@
 
     // Application Settings
     private int alertRetention = 30;
-    private bool receivePrereleaseUpdates = true; // default ON; dismissing the preview banner opts out
+    private bool receivePrereleaseUpdates = true; // default ON; global (instance-wide); dismissing the preview banner opts out
 
     // Security Audit Settings
     private bool allowAppleStreamingOnMainNetwork = false;
@@ -2745,6 +3734,8 @@
 
     // Alert Channels
     private List<DeliveryChannel>? alertChannels;
+    // Global (main-site) channels, loaded read-only on secondary sites for reference.
+    private List<DeliveryChannel>? _globalChannels;
     private bool showChannelForm = false;
     private int? editingChannelId = null;
     private string channelFormName = "";
@@ -2798,6 +3789,7 @@
     private bool hasMaxmindAccountId = false;
     private string maxmindLicenseKey = "";
     private bool hasMaxmindLicenseKey = false;
+    private bool savingMaxmindSettings = false;
     private bool downloadingMaxmind = false;
     private string maxmindMessage = "";
     private string maxmindMessageClass = "";
@@ -2816,6 +3808,16 @@
     private string _influxBucket = "network_monitoring";
     private string _influxLongtermBucket = "network_monitoring_longterm";
     private bool _savingInflux = false;
+
+    // External-site InfluxDB display (read-only). Secondary sites share the default
+    // site's server, org, and token; only their slug-prefixed buckets differ and are
+    // auto-derived by MonitoringInfluxClient. These hold the inherited server/org and
+    // this site's derived bucket names for a read-only view - never edited or saved here.
+    private bool _mainInfluxConfigured;
+    private string _sharedInfluxUrl = string.Empty;
+    private string _sharedInfluxOrg = string.Empty;
+    private string _siteInfluxPrimaryBucket = string.Empty;
+    private string _siteInfluxLongtermBucket = string.Empty;
 
     // CrowdSec Settings
     private bool crowdsecEnabled = false;
@@ -2843,6 +3845,7 @@
         {
             _kioskMode = await JS.InvokeAsync<bool>("getKioskMode");
             StateHasChanged();
+            await HandleFragmentNavigationAsync();
         }
     }
 
@@ -2854,6 +3857,13 @@
 
     protected override async Task OnInitializedAsync()
     {
+        _activeTab = ResolveTab(TabParam);
+        _lastTabParam = TabParam;
+
+        // Pre-release update notifications default ON (global/instance-wide); only an explicit "false" opts out.
+        var prereleaseSetting = await SystemSettings.GetGlobalAsync("updates.include_prereleases");
+        receivePrereleaseUpdates = prereleaseSetting is null || (bool.TryParse(prereleaseSetting, out var prPre) && prPre);
+
         // Load saved configuration if available
         if (ConnectionService.CurrentConfig != null)
         {
@@ -2870,13 +3880,14 @@
         var connectionSettings = await ConnectionService.GetSettingsAsync();
         hasControllerPassword = !string.IsNullOrEmpty(connectionSettings.Password);
         hasControllerApiKey = connectionSettings.HasApiKey;
+        _currentSiteConsoleViaAgent = await ConnectionService.IsConsoleViaAgentAsync();
+        await using (var sshAgentDb = SiteDb.CreateForSite(SiteContext.Slug, SiteContext.IsDefault))
+        {
+            var sshAgentSetting = await sshAgentDb.SystemSettings.FindAsync(SiteTunnelRouting.DevicesViaAgentKey);
+            _currentSiteSshViaAgent = bool.TryParse(sshAgentSetting?.Value, out var sshViaAgent) && sshViaAgent;
+        }
 
         UpdateControllerStatus();
-
-        // Pre-release update notifications default ON (null); only an explicit "false" opts out.
-        var prereleaseSetting = await SystemSettings.GetAsync("updates.include_prereleases");
-        receivePrereleaseUpdates = prereleaseSetting is null || (bool.TryParse(prereleaseSetting, out var prPre) && prPre);
-
         await LoadGatewaySettings();
         await LoadSshSettings();
         await LoadModemConfigs();
@@ -2891,6 +3902,14 @@
         await LoadThreatSettings();
         await LoadMonitoringSettings();
         await LoadMapboxToken();
+        await LoadMultiSiteSettings();
+
+        if (_multiSiteEnabled)
+            _currentSiteName = _sites.FirstOrDefault(s => s.Slug == SiteContext.Slug)?.Name ?? SiteContext.Slug;
+
+        // The Application tab is main-site only; never leave a managed site parked on it.
+        if (_activeTab == "application" && !SiteContext.IsDefault)
+            _activeTab = "connection";
     }
 
     private async Task LoadIperf3Settings()
@@ -4455,11 +5474,6 @@
         _editingOnt.Port = GetOntProviderDefaultPort(provider);
     }
 
-    private async Task SavePrereleaseSetting()
-    {
-        await SystemSettings.SetAsync("updates.include_prereleases", receivePrereleaseUpdates ? "true" : "false");
-    }
-
     private static int GetOntProviderDefaultPort(string provider) => provider switch
     {
         "8311" => 443,
@@ -4473,6 +5487,7 @@
         "realtek-ont" => "Realtek ONT Stick (HTTP)",
         "8311" => "8311 Community Firmware (HTTP)",
         "quantum-q1000k" => "Quantum Fiber Q1000K (HTTP)",
+        "telekom-modem2" => "Telekom Glasfaser-Modem 2 (HTTP)",
         "generic-http-ont" => "Generic HTTP ONT",
         _ => provider,
     };
@@ -4481,6 +5496,12 @@
     {
         // TODO: Implement save
         await Task.CompletedTask;
+    }
+
+    private async Task SavePrereleaseSetting()
+    {
+        // Instance-wide: written to the main DB so it applies across all sites.
+        await SystemSettings.SetGlobalAsync("updates.include_prereleases", receivePrereleaseUpdates ? "true" : "false");
     }
 
     // Config export state
@@ -4839,8 +5860,21 @@
 
     private async Task LoadAlertChannels()
     {
+        // On a secondary site the scoped repository reads this site's own channels; those
+        // are site-specific and fire only for this site. The global channels (managed on
+        // the main site) fire everywhere, so load them read-only for reference.
         try { alertChannels = await AlertRepository.GetChannelsAsync(); }
         catch { alertChannels = new(); }
+
+        if (!SiteContext.IsDefault)
+        {
+            try
+            {
+                await using var mainDb = SiteDb.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true);
+                _globalChannels = await mainDb.DeliveryChannels.AsNoTracking().OrderBy(c => c.Name).ToListAsync();
+            }
+            catch { _globalChannels = new(); }
+        }
     }
 
     private void OnSmtpSslChanged(ChangeEventArgs e)
@@ -5326,17 +6360,27 @@
         StateHasChanged();
     }
 
+    // The collector reads all threat settings from the MAIN database via the main-pinned
+    // IThreatSettingsAccessor, so this card reads/writes through the Global accessors.
+    // The enable flag is PER SITE, namespaced the same way the collector's SiteScopedKey
+    // does: the bare key for the default site (single-site unchanged), "threats.enabled:<slug>"
+    // for secondary sites. Interval/retention/MaxMind/CrowdSec are one global value.
+    private string ThreatsEnabledKey => SiteContext.IsDefault
+        ? "threats.enabled"
+        : $"threats.enabled:{SiteContext.Slug}";
+
     private async Task LoadThreatSettings()
     {
         try
         {
-            var enabled = await SystemSettings.GetAsync("threats.enabled");
+            // Unset defaults to ON (opt-out), so a new secondary site collects until turned off.
+            var enabled = await SystemSettings.GetGlobalAsync(ThreatsEnabledKey);
             threatCollectionEnabled = enabled != "false";
 
-            var interval = await SystemSettings.GetAsync("threats.poll_interval_minutes");
+            var interval = await SystemSettings.GetGlobalAsync("threats.poll_interval_minutes");
             if (int.TryParse(interval, out var i)) threatPollInterval = i;
 
-            var retention = await SystemSettings.GetAsync("threats.retention_days");
+            var retention = await SystemSettings.GetGlobalAsync("threats.retention_days");
             if (int.TryParse(retention, out var r)) threatRetentionDays = r;
 
             // Build geo database status from service properties
@@ -5349,18 +6393,18 @@
             else
                 threatGeoStatus = "Not found - add a MaxMind license key below to auto-download";
 
-            var mmAcct = await SystemSettings.GetAsync("maxmind.account_id");
+            var mmAcct = await SystemSettings.GetGlobalAsync("maxmind.account_id");
             hasMaxmindAccountId = !string.IsNullOrEmpty(mmAcct);
 
-            var mmKey = await SystemSettings.GetAsync("maxmind.license_key");
+            var mmKey = await SystemSettings.GetGlobalAsync("maxmind.license_key");
             hasMaxmindLicenseKey = !string.IsNullOrEmpty(mmKey);
 
-            var csEnabled = await SystemSettings.GetAsync("crowdsec.enabled");
+            var csEnabled = await SystemSettings.GetGlobalAsync("crowdsec.enabled");
             crowdsecEnabled = csEnabled == "true";
-            var csKey = await SystemSettings.GetAsync("crowdsec.api_key");
+            var csKey = await SystemSettings.GetGlobalAsync("crowdsec.api_key");
             hasCrowdsecApiKey = !string.IsNullOrEmpty(csKey);
 
-            var csQuota = await SystemSettings.GetAsync("crowdsec.daily_quota");
+            var csQuota = await SystemSettings.GetGlobalAsync("crowdsec.daily_quota");
             if (!string.IsNullOrEmpty(csQuota) && int.TryParse(csQuota, out var quota) && quota >= 1)
                 crowdsecDailyQuota = quota;
 
@@ -5382,24 +6426,14 @@
 
         try
         {
-            await SystemSettings.SetAsync("threats.enabled", threatCollectionEnabled ? "true" : "false");
-            await SystemSettings.SetAsync("threats.poll_interval_minutes", threatPollInterval.ToString());
-            await SystemSettings.SetAsync("threats.retention_days", threatRetentionDays.ToString());
+            await SystemSettings.SetGlobalAsync(ThreatsEnabledKey, threatCollectionEnabled ? "true" : "false");
 
-            if (!string.IsNullOrEmpty(maxmindAccountId))
+            // Global settings render (and save) only on the main site; a secondary
+            // site's card carries just its own enable toggle.
+            if (SiteContext.IsDefault)
             {
-                var encAcct = CredentialService.Encrypt(maxmindAccountId);
-                await SystemSettings.SetAsync("maxmind.account_id", encAcct);
-                hasMaxmindAccountId = true;
-                maxmindAccountId = "";
-            }
-
-            if (!string.IsNullOrEmpty(maxmindLicenseKey))
-            {
-                var encrypted = CredentialService.Encrypt(maxmindLicenseKey);
-                await SystemSettings.SetAsync("maxmind.license_key", encrypted);
-                hasMaxmindLicenseKey = true;
-                maxmindLicenseKey = "";
+                await SystemSettings.SetGlobalAsync("threats.poll_interval_minutes", threatPollInterval.ToString());
+                await SystemSettings.SetGlobalAsync("threats.retention_days", threatRetentionDays.ToString());
             }
 
             threatSettingsMessage = "Threat intelligence settings saved.";
@@ -5416,6 +6450,44 @@
         }
     }
 
+    private async Task SaveMaxMindSettings()
+    {
+        savingMaxmindSettings = true;
+        maxmindMessage = "";
+        StateHasChanged();
+
+        try
+        {
+            if (!string.IsNullOrEmpty(maxmindAccountId))
+            {
+                var encAcct = CredentialService.Encrypt(maxmindAccountId);
+                await SystemSettings.SetGlobalAsync("maxmind.account_id", encAcct);
+                hasMaxmindAccountId = true;
+                maxmindAccountId = "";
+            }
+
+            if (!string.IsNullOrEmpty(maxmindLicenseKey))
+            {
+                var encrypted = CredentialService.Encrypt(maxmindLicenseKey);
+                await SystemSettings.SetGlobalAsync("maxmind.license_key", encrypted);
+                hasMaxmindLicenseKey = true;
+                maxmindLicenseKey = "";
+            }
+
+            maxmindMessage = "MaxMind settings saved.";
+            maxmindMessageClass = "success";
+        }
+        catch (Exception ex)
+        {
+            maxmindMessage = $"Error saving settings: {ex.Message}";
+            maxmindMessageClass = "danger";
+        }
+        finally
+        {
+            savingMaxmindSettings = false;
+        }
+    }
+
     private async Task DownloadMaxMindDatabases()
     {
         downloadingMaxmind = true;
@@ -5428,7 +6500,7 @@
             var accountId = maxmindAccountId;
             if (string.IsNullOrEmpty(accountId))
             {
-                var encAcct = await SystemSettings.GetAsync("maxmind.account_id");
+                var encAcct = await SystemSettings.GetGlobalAsync("maxmind.account_id");
                 if (!string.IsNullOrEmpty(encAcct))
                     accountId = CredentialService.IsEncrypted(encAcct) ? CredentialService.Decrypt(encAcct) : encAcct;
             }
@@ -5436,7 +6508,7 @@
             var licenseKey = maxmindLicenseKey;
             if (string.IsNullOrEmpty(licenseKey))
             {
-                var encrypted = await SystemSettings.GetAsync("maxmind.license_key");
+                var encrypted = await SystemSettings.GetGlobalAsync("maxmind.license_key");
                 if (!string.IsNullOrEmpty(encrypted))
                     licenseKey = CredentialService.IsEncrypted(encrypted) ? CredentialService.Decrypt(encrypted) : encrypted;
             }
@@ -5452,7 +6524,7 @@
             if (!string.IsNullOrEmpty(maxmindAccountId))
             {
                 var encAcct = CredentialService.Encrypt(maxmindAccountId);
-                await SystemSettings.SetAsync("maxmind.account_id", encAcct);
+                await SystemSettings.SetGlobalAsync("maxmind.account_id", encAcct);
                 hasMaxmindAccountId = true;
                 maxmindAccountId = "";
             }
@@ -5460,7 +6532,7 @@
             if (!string.IsNullOrEmpty(maxmindLicenseKey))
             {
                 var encKey = CredentialService.Encrypt(maxmindLicenseKey);
-                await SystemSettings.SetAsync("maxmind.license_key", encKey);
+                await SystemSettings.SetGlobalAsync("maxmind.license_key", encKey);
                 hasMaxmindLicenseKey = true;
                 maxmindLicenseKey = "";
             }
@@ -5475,7 +6547,7 @@
 
             if (success)
             {
-                await SystemSettings.SetAsync("maxmind.last_download", DateTime.UtcNow.ToString("O"));
+                await SystemSettings.SetGlobalAsync("maxmind.last_download", DateTime.UtcNow.ToString("O"));
                 await LoadThreatSettings(); // Refresh geo status display
             }
         }
@@ -5507,18 +6579,18 @@
 
         try
         {
-            await SystemSettings.SetAsync("crowdsec.enabled", crowdsecEnabled ? "true" : "false");
+            await SystemSettings.SetGlobalAsync("crowdsec.enabled", crowdsecEnabled ? "true" : "false");
 
             var newKeyProvided = !string.IsNullOrEmpty(crowdsecApiKey);
             if (newKeyProvided)
             {
                 var encrypted = CredentialService.Encrypt(crowdsecApiKey);
-                await SystemSettings.SetAsync("crowdsec.api_key", encrypted);
+                await SystemSettings.SetGlobalAsync("crowdsec.api_key", encrypted);
                 hasCrowdsecApiKey = true;
                 crowdsecApiKey = "";
             }
 
-            await SystemSettings.SetAsync("crowdsec.daily_quota", crowdsecDailyQuota.ToString());
+            await SystemSettings.SetGlobalAsync("crowdsec.daily_quota", crowdsecDailyQuota.ToString());
 
             // Update the rate limiter. Reset counter when a new API key is saved
             // since the new key has its own fresh quota on CrowdSec's side.
@@ -5548,7 +6620,7 @@
 
         try
         {
-            var stored = await SystemSettings.GetAsync("crowdsec.api_key");
+            var stored = await SystemSettings.GetGlobalAsync("crowdsec.api_key");
             if (string.IsNullOrEmpty(stored))
             {
                 crowdsecMessage = "No CTI API key configured.";
@@ -5582,7 +6654,7 @@
 
     private async Task LoadMapboxToken()
     {
-        _mapboxToken = await SystemSettings.GetAsync(SystemSettingKeys.MapboxApiKey) ?? "";
+        _mapboxToken = await SystemSettings.GetGlobalAsync(SystemSettingKeys.MapboxApiKey) ?? "";
     }
 
     private async Task SaveMapboxToken()
@@ -5592,7 +6664,7 @@
         StateHasChanged();
         try
         {
-            await SystemSettings.SetAsync(SystemSettingKeys.MapboxApiKey, string.IsNullOrWhiteSpace(_mapboxToken) ? null : _mapboxToken.Trim());
+            await SystemSettings.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, string.IsNullOrWhiteSpace(_mapboxToken) ? null : _mapboxToken.Trim());
             _mapboxTokenMessage = "Mapbox token saved. Reload any open maps to apply.";
             _mapboxTokenMessageClass = "success";
         }
@@ -5615,7 +6687,7 @@
         StateHasChanged();
         try
         {
-            await SystemSettings.SetAsync(SystemSettingKeys.MapboxApiKey, null);
+            await SystemSettings.SetGlobalAsync(SystemSettingKeys.MapboxApiKey, null);
             _mapboxToken = "";
             _mapboxTokenMessage = "Mapbox token cleared.";
             _mapboxTokenMessageClass = "success";
@@ -5646,6 +6718,9 @@
                 _influxTokenIsSet = !string.IsNullOrEmpty(_monitoringSettings.InfluxDbToken);
                 _influxToken = string.Empty;
             }
+
+            if (!SiteContext.IsDefault)
+                await LoadExternalInfluxDisplayAsync();
         }
         catch
         {
@@ -5653,8 +6728,193 @@
         }
     }
 
+    /// <summary>
+    /// External sites share the default site's InfluxDB server, org, and token; only
+    /// their buckets differ (slug-prefixed, auto-derived by MonitoringInfluxClient).
+    /// Loads the shared server/org from the main database and derives this site's bucket
+    /// names for a read-only display - the connection is never editable or written here.
+    /// </summary>
+    private async Task LoadExternalInfluxDisplayAsync()
+    {
+        try
+        {
+            await using var mainDb = SiteDb.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true);
+            var main = await mainDb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
+            _mainInfluxConfigured = main != null
+                && !string.IsNullOrWhiteSpace(main.InfluxDbUrl)
+                && !string.IsNullOrWhiteSpace(main.InfluxDbToken)
+                && !string.IsNullOrWhiteSpace(main.InfluxDbOrg)
+                && !string.IsNullOrWhiteSpace(main.InfluxDbBucket);
+            if (_mainInfluxConfigured)
+            {
+                _sharedInfluxUrl = main!.InfluxDbUrl!.Trim();
+                _sharedInfluxOrg = main.InfluxDbOrg!.Trim();
+                // Show the buckets the client ACTUALLY reads/writes (slug-prefixed;
+                // collisions with main are corrected), not the raw site-row value, which
+                // can still hold the model's default unprefixed name (network_monitoring).
+                if (!InfluxClient.IsConfigured)
+                    await InfluxClient.ReconfigureAsync();
+                _siteInfluxPrimaryBucket = !string.IsNullOrWhiteSpace(InfluxClient.PrimaryBucket)
+                    ? InfluxClient.PrimaryBucket!
+                    : $"{SiteContext.Slug}-{main.InfluxDbBucket!.Trim()}";
+                _siteInfluxLongtermBucket = string.IsNullOrWhiteSpace(main.InfluxDbLongtermBucket)
+                    ? string.Empty
+                    : (!string.IsNullOrWhiteSpace(InfluxClient.LongtermBucket)
+                        ? InfluxClient.LongtermBucket!
+                        : $"{SiteContext.Slug}-{main.InfluxDbLongtermBucket.Trim()}");
+            }
+        }
+        catch
+        {
+            _mainInfluxConfigured = false;
+        }
+    }
+
+    /// <summary>
+    /// Saves this site's (editable) bucket names to its own row and re-tests. External
+    /// sites inherit the server, org, and token from main, so only the bucket names are
+    /// written here - the row keeps no URL/token/org, so MonitoringInfluxClient still
+    /// derives the connection from main and just honors these bucket overrides.
+    /// </summary>
+    private async Task SaveExternalInfluxBuckets()
+    {
+        if (SiteContext.IsDefault) return;
+
+        _savingInflux = true;
+        _monitoringMessage = "";
+        StateHasChanged();
+
+        try
+        {
+            var primary = (_siteInfluxPrimaryBucket ?? "").Trim();
+            var longterm = (_siteInfluxLongtermBucket ?? "").Trim();
+
+            if (string.IsNullOrEmpty(primary))
+            {
+                _monitoringMessage = "Primary bucket name is required.";
+                _monitoringMessageClass = "danger";
+                return;
+            }
+            if (longterm.Length > 0 && string.Equals(primary, longterm, StringComparison.OrdinalIgnoreCase))
+            {
+                _monitoringMessage = "Primary and long-term buckets must be different.";
+                _monitoringMessageClass = "danger";
+                return;
+            }
+
+            // A bucket name may be custom, but it must belong to THIS site alone - never
+            // the main site's or another site's buckets, or this site would read and write
+            // another site's series.
+            var takenByOthers = await GatherBucketsOwnedByOtherSitesAsync();
+            var clash = takenByOthers.Contains(primary) ? primary
+                : (longterm.Length > 0 && takenByOthers.Contains(longterm)) ? longterm
+                : null;
+            if (clash != null)
+            {
+                _monitoringMessage = $"The bucket \"{clash}\" belongs to the main site or another site. Pick a name unique to this site.";
+                _monitoringMessageClass = "danger";
+                return;
+            }
+
+            await using (var db = SiteDb.CreateForSite(SiteContext.Slug, isDefault: false))
+            {
+                var row = await db.MonitoringSettings.FirstOrDefaultAsync();
+                if (row == null)
+                {
+                    row = new MonitoringSettings();
+                    db.MonitoringSettings.Add(row);
+                }
+                row.InfluxDbBucket = primary;
+                row.InfluxDbLongtermBucket = longterm;
+                row.UpdatedAt = DateTime.UtcNow;
+                await db.SaveChangesAsync();
+            }
+
+            await InfluxClient.ReconfigureAsync();
+            var health = await InfluxClient.CheckHealthAsync();
+
+            await LoadMonitoringSettings();
+
+            if (health.Reachable)
+            {
+                _monitoringMessage = "Bucket names saved; connection successful.";
+                _monitoringMessageClass = "success";
+            }
+            else
+            {
+                _monitoringMessage = $"Saved, but InfluxDB is unreachable: {health.Error}";
+                _monitoringMessageClass = "warning";
+            }
+        }
+        catch (Exception ex)
+        {
+            _monitoringMessage = $"Error saving bucket names: {ex.Message}";
+            _monitoringMessageClass = "danger";
+        }
+        finally
+        {
+            _savingInflux = false;
+        }
+    }
+
+    /// <summary>
+    /// Bucket names already owned by the main site or any OTHER site - their explicit
+    /// (custom) names, or the derived {slug}-{base} defaults for sites that haven't
+    /// customized. Used to stop this site reusing a name that would read or write another
+    /// site's series. Comparison is case-insensitive.
+    /// </summary>
+    private async Task<HashSet<string>> GatherBucketsOwnedByOtherSitesAsync()
+    {
+        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var mainPrimaryBase = "network_monitoring";
+        var mainLongtermBase = "network_monitoring_longterm";
+
+        await using (var mainDb = SiteDb.CreateForSite(SiteManagementService.DefaultSiteSlug, isDefault: true))
+        {
+            var main = await mainDb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
+            if (!string.IsNullOrWhiteSpace(main?.InfluxDbBucket))
+            {
+                mainPrimaryBase = main!.InfluxDbBucket!.Trim();
+                taken.Add(mainPrimaryBase);
+            }
+            if (!string.IsNullOrWhiteSpace(main?.InfluxDbLongtermBucket))
+            {
+                mainLongtermBase = main!.InfluxDbLongtermBucket!.Trim();
+                taken.Add(mainLongtermBase);
+            }
+        }
+
+        foreach (var site in _sites)
+        {
+            if (site.Slug == SiteContext.Slug) continue;                       // this site
+            if (site.Slug == SiteManagementService.DefaultSiteSlug) continue;  // main handled above
+
+            string? customPrimary = null, customLongterm = null;
+            try
+            {
+                await using var sdb = SiteDb.CreateForSite(site.Slug, isDefault: false);
+                var s = await sdb.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync();
+                customPrimary = s?.InfluxDbBucket?.Trim();
+                customLongterm = s?.InfluxDbLongtermBucket?.Trim();
+            }
+            catch { /* an unprovisioned site DB contributes only its derived names */ }
+
+            taken.Add(!string.IsNullOrWhiteSpace(customPrimary) ? customPrimary! : $"{site.Slug}-{mainPrimaryBase}");
+            taken.Add(!string.IsNullOrWhiteSpace(customLongterm) ? customLongterm! : $"{site.Slug}-{mainLongtermBase}");
+        }
+
+        return taken;
+    }
+
     private async Task SaveInfluxSettings()
     {
+        // The InfluxDB connection is only editable on the default site. External sites
+        // share it and differ only in (auto-derived) bucket names, so there is nothing
+        // to save here - and this write targets the main database, which must never be
+        // reached from a secondary-site context.
+        if (!SiteContext.IsDefault) return;
+
         _savingInflux = true;
         _monitoringMessage = "";
         StateHasChanged();

@@ -24,9 +24,12 @@ public class IspHealthService
 
     private readonly MonitoringInfluxClient _influx;
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly SiteDbContextFactory _siteDbFactory;
     private readonly UniFiConnectionService _connectionService;
     private readonly PhysicalLinkResolver _physicalLinkResolver;
     private readonly ILogger<IspHealthService> _logger;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
     private readonly IspHealthOptions _options = new();
     private const int MaxCustomWindowHours = 720;  // 30-day cap on the date/time filter, matching the UI
     private readonly SemaphoreSlim _computeLock = new(1, 1);
@@ -54,17 +57,38 @@ public class IspHealthService
     private volatile int _configuredWindowHours;
 
     public IspHealthService(
-        MonitoringInfluxClient influx,
+        MonitoringInfluxRegistry influxRegistry,
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
-        UniFiConnectionService connectionService,
+        SiteDbContextFactory siteDbFactory,
+        SiteConnectionRegistry siteConnections,
         PhysicalLinkResolver physicalLinkResolver,
-        ILogger<IspHealthService> logger)
+        ILogger<IspHealthService> logger,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
-        _influx = influx;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _influx = influxRegistry.GetFor(_siteSlug);
         _dbFactory = dbFactory;
-        _connectionService = connectionService;
+        _siteDbFactory = siteDbFactory;
+        _connectionService = siteConnections.GetFor(_siteSlug);
         _physicalLinkResolver = physicalLinkResolver;
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Every site (the home site included) reads its expected ISP plan speeds from the UniFi
+    /// Console, so computing ISP Health before that connection is up would cache a report with
+    /// an unscored Speed vs Plan factor. Gates every compute entry point; a managed site's
+    /// connection simply comes up later (over its agent tunnel) than the home site's.
+    /// </summary>
+    private bool CanCompute => _connectionService.IsConnected;
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
     }
 
     /// <summary>
@@ -74,7 +98,7 @@ public class IspHealthService
     /// </summary>
     public async Task SetPhysicalLinkSourceAsync(string? sourceKey, CancellationToken ct = default)
     {
-        await using (var db = await _dbFactory.CreateDbContextAsync(ct))
+        await using (var db = await CreateSiteDbAsync(ct))
         {
             var settings = await db.MonitoringSettings.FirstOrDefaultAsync(ct);
             if (settings == null) return;
@@ -96,7 +120,7 @@ public class IspHealthService
     /// </summary>
     public async Task SetAccessTechnologyAsync(AccessTechnology technology, CancellationToken ct = default)
     {
-        await using (var db = await _dbFactory.CreateDbContextAsync(ct))
+        await using (var db = await CreateSiteDbAsync(ct))
         {
             // Primary WAN context, wan-first like the reader's ordering - but NOT filtered to
             // non-Unknown: setting it when it is currently unset is the whole point. Create it if
@@ -117,6 +141,51 @@ public class IspHealthService
         await GetReportAsync(forceRefresh: true, ct);
     }
 
+    /// <summary>
+    /// Marks the outage starting at <paramref name="outageStartUtc"/> as user-caused ("that
+    /// was me" - their own maintenance, e.g. pulling the coax to add a pad), which excludes it
+    /// from the score and the findings, then recomputes. Keyed on the onset time and matched
+    /// by tolerance (<see cref="IspHealthOptions.OutageAckMatchToleranceSeconds"/>), because a
+    /// recompute can shift a detected outage's boundaries by a bucket.
+    /// </summary>
+    public async Task AcknowledgeOutageAsync(DateTime outageStartUtc, CancellationToken ct = default)
+    {
+        await using (var db = await CreateSiteDbAsync(ct))
+        {
+            var tolerance = TimeSpan.FromSeconds(_options.OutageAckMatchToleranceSeconds);
+            var exists = (await db.OutageAcknowledgements.AsNoTracking().ToListAsync(ct))
+                .Any(a => (a.OutageStartUtc - outageStartUtc).Duration() <= tolerance);
+            if (!exists)
+            {
+                db.OutageAcknowledgements.Add(new OutageAcknowledgement
+                {
+                    OutageStartUtc = outageStartUtc,
+                    AcknowledgedAt = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        await GetReportAsync(forceRefresh: true, ct);
+    }
+
+    /// <summary>Removes a "that was me" acknowledgement (tolerance-matched) and recomputes.</summary>
+    public async Task UnacknowledgeOutageAsync(DateTime outageStartUtc, CancellationToken ct = default)
+    {
+        await using (var db = await CreateSiteDbAsync(ct))
+        {
+            var tolerance = TimeSpan.FromSeconds(_options.OutageAckMatchToleranceSeconds);
+            var matches = (await db.OutageAcknowledgements.ToListAsync(ct))
+                .Where(a => (a.OutageStartUtc - outageStartUtc).Duration() <= tolerance)
+                .ToList();
+            if (matches.Count > 0)
+            {
+                db.OutageAcknowledgements.RemoveRange(matches);
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        await GetReportAsync(forceRefresh: true, ct);
+    }
+
     public IspHealthOptions Options => _options;
 
     /// <summary>
@@ -132,6 +201,13 @@ public class IspHealthService
         var report = _cached?.Report;
         if (report != null && DateTime.UtcNow - report.ComputedAt < _options.DashboardScoreTtl)
             return new IspHealthSnapshot(IspHealthStatus.Ready, report.OverallScore, report.ComputedAt);
+
+        // Managed site whose console isn't up yet: serve any stale report, but don't kick a
+        // compute until the connection lands (expected ISP speeds come from the console).
+        if (!CanCompute)
+            return report != null
+                ? new IspHealthSnapshot(IspHealthStatus.Ready, report.OverallScore, report.ComputedAt)
+                : new IspHealthSnapshot(IspHealthStatus.AwaitingConnection, null, null);
 
         if (!_computing)
         {
@@ -153,6 +229,15 @@ public class IspHealthService
         var cached = _cached?.Report;
         if (!forceRefresh && cached != null && DateTime.UtcNow - cached.ComputedAt < _options.CacheTtl)
             return cached;
+
+        // Defer computing until the console connection is up (expected ISP speeds come from
+        // it). Serve any existing report; otherwise publish AwaitingConnection for the funnels.
+        if (!CanCompute)
+        {
+            if (cached == null)
+                _status = IspHealthStatus.AwaitingConnection;
+            return cached;
+        }
 
         await _computeLock.WaitAsync(ct);
         try
@@ -293,7 +378,7 @@ public class IspHealthService
     {
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSiteDbAsync(ct);
             var settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
             var hours = settings?.IspHealthScoreWindowHours ?? _options.ScoreWindowHours;
             return hours >= _options.MinDataHours ? hours : _options.ScoreWindowHours;
@@ -327,6 +412,11 @@ public class IspHealthService
     public async Task<(IspHealthReport? Report, List<AsnSeries> ChartClusters)> ComputeForWindowAsync(
         DateTime windowStart, DateTime windowEnd, bool forceRefresh = false, CancellationToken ct = default)
     {
+        // No console connection means no expected ISP speeds to score against; skip the heavy
+        // compute rather than cache a plan-less custom-window report.
+        if (!CanCompute)
+            return (null, new List<AsnSeries>());
+
         // Enforce the filter's window bounds on the real data path. The UI clamps too, but this is the
         // single chokepoint every custom-window caller (report and chart endpoint) funnels through, so a
         // sub-minimum (or over-max) request can't slip past into an empty result. Pin the end and expand
@@ -401,7 +491,10 @@ public class IspHealthService
         // (the trace map landed post-launch), where the caller falls back to RTT.
         Dictionary<string, int> hopNumberByTargetId;
         bool hopOrderKnown;
-        await using (var db = await _dbFactory.CreateDbContextAsync(ct))
+        // Onsets of outages the user marked "that was me", stamped onto the detected events
+        // below (tolerance-matched; a recompute can shift a boundary by a bucket).
+        List<DateTime> ackedOutageStarts;
+        await using (var db = await CreateSiteDbAsync(ct))
         {
             var settings = await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
             if (settings == null || !settings.Enabled)
@@ -451,6 +544,10 @@ public class IspHealthService
                 .Where(d => targetIdById.ContainsKey(d.MonitoringTargetId!.Value))
                 .GroupBy(d => targetIdById[d.MonitoringTargetId!.Value])
                 .ToDictionary(g => g.Key, g => g.Min(d => d.HopNumber));
+
+            ackedOutageStarts = await db.OutageAcknowledgements.AsNoTracking()
+                .Select(a => a.OutageStartUtc)
+                .ToListAsync(ct);
         }
 
         var ispTargets = targets.Where(t => t.TargetType == MonitoringTargetType.AccessIsp).ToList();
@@ -561,6 +658,21 @@ public class IspHealthService
             if (internetDeltas.Count > 0) internetMedianDelta = SeriesStats.Median(internetDeltas);
         }
 
+        // Windows where a transit target sat at total loss for minutes: a routing/BGP change
+        // (the hop left the forwarding path), not access-layer loss. Carved out of THAT
+        // target's loss-pool contribution below - every other access/transit/DNS series keeps
+        // feeding the pool through the same span, so pooled loss stays usable on paths with
+        // several upstream ASNs - and surfaced as path events after outage detection. The
+        // ASN's own grade uses the unfiltered grading series, so it still takes the hit.
+        var transitDarkWindows = transitTargets
+            .Where(t => transitSeries.ContainsKey(t.TargetId))
+            .SelectMany(t => TransitUnreachableDetector.Detect(
+                t.TargetId, t.AsnNumber ?? 0, AsnNameCleanup.Clean(t.AsnName), transitSeries[t.TargetId], _options))
+            .ToList();
+        var darkByTargetId = transitDarkWindows
+            .GroupBy(w => w.TargetId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
         // Loss pool: ALL enabled AccessIsp + Transit targets plus well-known anycast DNS.
         // Every probe crosses the access link before reaching its target, so loss on ANY
         // of these is a signal of access-layer loss - including under load, where the
@@ -569,9 +681,13 @@ public class IspHealthService
         // access-loss signal than one sparse hop. (Latency, by contrast, uses only the
         // nearest hop because far-hop RTT carries transit variance that isn't the access
         // link's loaded behavior - see PickFirstCleanHop / spec "Measurement sources".)
+        // Transit series enter minus their unreachable windows (see transitDarkWindows above).
         var lossPool = new List<List<LatencySample>>();
         lossPool.AddRange(ispTargets.Where(t => ispSeries.ContainsKey(t.TargetId)).Select(t => ispSeries[t.TargetId]));
-        lossPool.AddRange(transitTargets.Where(t => transitSeries.ContainsKey(t.TargetId)).Select(t => transitSeries[t.TargetId]));
+        lossPool.AddRange(transitTargets.Where(t => transitSeries.ContainsKey(t.TargetId)).Select(t =>
+            darkByTargetId.TryGetValue(t.TargetId, out var dark)
+                ? transitSeries[t.TargetId].Where(s => !dark.Any(w => s.Time >= w.Start && s.Time <= w.End)).ToList()
+                : transitSeries[t.TargetId]));
         lossPool.AddRange(targets
             .Where(t => t.TargetType == MonitoringTargetType.InternetService
                 && AnycastDnsIps.Contains(t.Address)
@@ -742,14 +858,15 @@ public class IspHealthService
                 TargetIds = { t.TargetId },
                 Samples = ispSeries[t.TargetId],
                 HopIps = { t.Address }
-            }, Groupable: true, AsnLabel: AsnNameCleanup.Clean(t.AsnName) ?? accessAsnName))
-            .Concat(transitChart.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)TransitLabel(s))))
-            .Concat(displayInternet.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)null)));
+            }, Groupable: true, AsnLabel: AsnNameCleanup.Clean(t.AsnName) ?? accessAsnName, IsInternet: false))
+            .Concat(transitChart.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)TransitLabel(s), IsInternet: false)))
+            .Concat(displayInternet.Select(s => (Series: s, Groupable: false, AsnLabel: (string?)null, IsInternet: true)));
         var orderedWanHops = outageSources
             .Select(x => new
             {
                 x.Groupable,
                 x.AsnLabel,
+                x.IsInternet,
                 Name = x.Series.AsnName ?? x.Series.TargetIds.FirstOrDefault() ?? "hop",
                 Series = (IReadOnlyList<LatencySample>)x.Series.Samples,
                 HopNumber = ClusterHopNumber(x.Series),
@@ -764,9 +881,15 @@ public class IspHealthService
                 0, gatewaySamples, Groupable: false, AsnLabel: null, IsGateway: true)
             : null;
         var baseDepth = gatewayHop != null ? 1 : 0;
+        // Rows without a persisted hop number sorted to the end above - that Depth is a sort
+        // position, not a path position, so they carry KnownPosition: false and never anchor
+        // the detector's "break upstream of X" attribution (e.g. a hostname-based ISP target
+        // the discovery traces never mapped). Internet endpoint rows are likewise flagged so
+        // a destination can never be named as the hop the break sat beyond.
         var outageHops = (gatewayHop != null ? new[] { gatewayHop } : Array.Empty<OutageDetector.Hop>())
             .Concat(orderedWanHops.Select((x, i) =>
-                new OutageDetector.Hop(x.Name, baseDepth + i, x.Series, x.Groupable, x.AsnLabel)))
+                new OutageDetector.Hop(x.Name, baseDepth + i, x.Series, x.Groupable, x.AsnLabel,
+                    KnownPosition: x.HopNumber != int.MaxValue, IsInternet: x.IsInternet)))
             .ToList();
         ct.ThrowIfCancellationRequested();
         var outages = OutageDetector.Detect(internetTriggerTargets, outageHops, _options);
@@ -775,6 +898,34 @@ public class IspHealthService
         var partialDisruptions = OutageDetector.DetectPartial(
             outageHops, outages.Select(o => (o.Start, o.End)).ToList(), _options);
         outages = outages.Concat(partialDisruptions).OrderBy(o => o.Start).ToList();
+
+        // Surface the transit-unreachable windows as path events, merged per ASN - unless the
+        // span mostly sat inside a blackout outage, where the whole path was dark and the
+        // outage machinery already owns the story (its window is masked from the loss factors
+        // anyway). Informational like RTT-step shifts; the score effect is the loss-pool
+        // carve-out above, never the event itself.
+        var blackoutSpans = outages.Where(o => !o.IsPartial).Select(o => (o.Start, o.End)).ToList();
+        double OverlapSeconds(DateTime s, DateTime e) => blackoutSpans.Sum(b =>
+            Math.Max(0, (new DateTime(Math.Min(e.Ticks, b.End.Ticks)) - new DateTime(Math.Max(s.Ticks, b.Start.Ticks))).TotalSeconds));
+        var unreachableEvents = TransitUnreachableDetector.MergeByAsn(transitDarkWindows, _options)
+            .Where(e => OverlapSeconds(e.Start, e.End) < (e.End - e.Start).TotalSeconds * 0.5)
+            .Select(e => new PathShiftEvent
+            {
+                Time = e.Start,
+                AsnNumber = e.AsnNumber > 0 ? e.AsnNumber : null,
+                AsnName = e.AsnName,
+                IsUnreachable = true,
+                UnreachableEnd = e.End,
+                CorrelatedTargetCount = e.TargetCount
+            })
+            .ToList();
+        if (unreachableEvents.Count > 0)
+        {
+            foreach (var e in unreachableEvents)
+                _logger.LogDebug("ISP Health: transit unreachable {Asn} {Start:HH:mm:ss} - {End:HH:mm:ss} ({Targets} target(s)); loss excluded from the access-layer pool",
+                    e.AsnName ?? $"AS{e.AsnNumber}", e.Time, e.UnreachableEnd, e.CorrelatedTargetCount);
+            pathShifts = pathShifts.Concat(unreachableEvents).OrderBy(p => p.Time).ToList();
+        }
 
         // Weight each outage by the time-of-day usage fingerprint so a drop during heavy-usage hours
         // counts in full and one during typically-idle hours dings less. Null fingerprint (weighting
@@ -786,6 +937,15 @@ public class IspHealthService
             foreach (var o in outages)
                 o.UsageWeight = UsageWeighting.Weight(
                     usageFingerprint, UsageWeighting.LocalHoursSpanned(o.Start, o.End, usageZone), _options.UsageWeightFloor);
+        }
+
+        // Stamp the user's "that was me" acknowledgements onto the detected events so the
+        // scorer leaves them out of the penalty and the findings.
+        if (ackedOutageStarts.Count > 0)
+        {
+            var ackTolerance = TimeSpan.FromSeconds(_options.OutageAckMatchToleranceSeconds);
+            foreach (var o in outages)
+                o.Acknowledged = ackedOutageStarts.Any(a => (a - o.Start).Duration() <= ackTolerance);
         }
 
         // chartClusters (one line per cluster) is the chart view computed from the same
@@ -988,7 +1148,7 @@ public class IspHealthService
     /// </summary>
     public async Task<List<string>> GetLossPoolTargetIdsAsync(CancellationToken ct = default)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteDbAsync(ct);
         var targets = await db.MonitoringTargets.AsNoTracking()
             .Where(t => t.Enabled && (t.TargetType == MonitoringTargetType.AccessIsp
                 || t.TargetType == MonitoringTargetType.Transit
@@ -1032,7 +1192,7 @@ public class IspHealthService
 
         if (down == null || up == null)
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSiteDbAsync(ct);
             var sqmWan = await db.SqmWanConfigurations.AsNoTracking()
                 .OrderBy(c => c.WanNumber)
                 .FirstOrDefaultAsync(ct);
@@ -1062,7 +1222,7 @@ public class IspHealthService
     {
         if (string.IsNullOrEmpty(primaryWanInterface)) return new List<(DateTime, DateTime)>();
 
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteDbAsync(ct);
         var sqmConfigs = await db.SqmWanConfigurations.AsNoTracking()
             .Where(c => c.Enabled)
             .ToListAsync(ct);
@@ -1116,7 +1276,7 @@ public class IspHealthService
     private async Task<bool> IsAdaptiveSqmEnabledAsync(string? primaryWanInterface, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(primaryWanInterface)) return false;
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteDbAsync(ct);
         var sqmConfigs = await db.SqmWanConfigurations.AsNoTracking()
             .Where(c => c.Enabled)
             .ToListAsync(ct);
@@ -1138,7 +1298,7 @@ public class IspHealthService
             // yields a recent capacity number. Bounded above by windowEnd for historical windows.
             var fallbackStart = windowEnd.AddDays(-_options.SpeedTestFallbackDays);
             var since = windowStart < fallbackStart ? windowStart : fallbackStart;
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSiteDbAsync(ct);
             var results = await db.Iperf3Results.AsNoTracking()
                 .Where(r => r.Success
                     && r.TestTime >= since
@@ -1158,7 +1318,11 @@ public class IspHealthService
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "ISP Health could not load WAN speed test results");
+            // Warning, not Debug: an empty pool here renders as "No recent WAN speed
+            // test" in the report - indistinguishable from genuinely having none - and
+            // the report is then cached for CacheTtl. Post-restart DB contention can
+            // land exactly here, so the failure must be visible in default logs.
+            _logger.LogWarning(ex, "ISP Health could not load WAN speed test results; Speed vs Plan will show no tests until the next recompute");
             return new List<SpeedTestSample>();
         }
     }

@@ -88,6 +88,21 @@ public class TransitAsnCandidate
     public double? VerifiedRttMs { get; set; }
     /// <summary>For PathProxy tier: the CDN endpoint we monitor as a proxy for this ASN.</summary>
     public string? PathProxyTarget { get; set; }
+
+    /// <summary>
+    /// Trace hop number of this candidate, used by post-verification auto-selection
+    /// to order an ASN's hops and split them into RTT clumps (an ASN's run typically
+    /// spans its ingress POP and, several ms later, a distant egress POP).
+    /// </summary>
+    public int HopNumber { get; set; }
+
+    /// <summary>
+    /// True when this candidate matched an existing monitoring target during
+    /// reconcile and inherited its enabled state. Post-verification auto-selection
+    /// skips ASNs with preserved members so rediscovery never overrides the user's
+    /// stored choices.
+    /// </summary>
+    public bool PreservedFromExisting { get; set; }
 }
 
 /// <summary>One CDN traceroute summary for the live progress UI.</summary>

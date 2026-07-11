@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -26,11 +27,13 @@ public class AlertProcessingService : BackgroundService
     private readonly AlertCorrelationService _correlationService;
     private readonly IEnumerable<IAlertDeliveryChannel> _deliveryChannels;
     private readonly AlertCooldownTracker _cooldownTracker;
+    private readonly IAlertSiteNameResolver _siteNameResolver;
     private readonly string? _appBaseUrl;
 
     // In-memory rule cache (refreshed periodically)
-    private List<AlertRule> _cachedRules = [];
-    private DateTime _rulesCachedAt = DateTime.MinValue;
+    // Enabled rules cached per originating site ("" = default/main). Site DBs have
+    // independent rule id sequences, so caches must never be shared across sites.
+    private readonly ConcurrentDictionary<string, (List<AlertRule> Rules, DateTime CachedAt)> _rulesBySite = new();
     private static readonly TimeSpan RuleCacheDuration = TimeSpan.FromSeconds(60);
     private DateTime _lastCooldownCleanup = DateTime.UtcNow;
     private static readonly TimeSpan CooldownCleanupInterval = TimeSpan.FromMinutes(30);
@@ -43,6 +46,7 @@ public class AlertProcessingService : BackgroundService
         AlertCorrelationService correlationService,
         IEnumerable<IAlertDeliveryChannel> deliveryChannels,
         AlertCooldownTracker cooldownTracker,
+        IAlertSiteNameResolver siteNameResolver,
         IConfiguration configuration)
     {
         _logger = logger;
@@ -52,6 +56,7 @@ public class AlertProcessingService : BackgroundService
         _correlationService = correlationService;
         _deliveryChannels = deliveryChannels;
         _cooldownTracker = cooldownTracker;
+        _siteNameResolver = siteNameResolver;
 
         // Build base URL using same priority as canonical host redirect in Program.cs:
         // REVERSE_PROXIED_HOST_NAME (https) > HOST_NAME (http:8042) > HOST_IP (http:8042)
@@ -102,10 +107,14 @@ public class AlertProcessingService : BackgroundService
     private async Task ProcessEventAsync(AlertEvent alertEvent, CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
+        // Pin the scope to the site this alert came from BEFORE the repository resolves its
+        // DbContext, so rules and history read/write that site's database. A null slug is
+        // the default (main) site, so single-site installs are unaffected.
+        scope.ServiceProvider.GetRequiredService<IAlertSiteScope>().UseSite(alertEvent.SiteSlug);
         var repository = scope.ServiceProvider.GetRequiredService<IAlertRepository>();
 
-        // Refresh rule cache if stale
-        await RefreshRuleCacheAsync(repository, cancellationToken);
+        var siteKey = alertEvent.SiteSlug ?? "";
+        var rules = await GetRulesAsync(repository, siteKey, cancellationToken);
 
         // Periodic cooldown cleanup to prevent unbounded growth
         if ((DateTime.UtcNow - _lastCooldownCleanup) > CooldownCleanupInterval)
@@ -114,11 +123,12 @@ public class AlertProcessingService : BackgroundService
             _lastCooldownCleanup = DateTime.UtcNow;
         }
 
-        // Evaluate event against rules
-        var matchingRules = _ruleEvaluator.Evaluate(alertEvent, _cachedRules);
+        // Evaluate event against this site's rules
+        var matchingRules = _ruleEvaluator.Evaluate(alertEvent, rules);
         if (matchingRules.Count == 0)
         {
-            _logger.LogWarning("No matching rules for event {EventType}", alertEvent.EventType);
+            _logger.LogDebug("No matching rules for event {EventType} (site {Site})",
+                alertEvent.EventType, siteKey.Length == 0 ? "main" : siteKey);
             return;
         }
 
@@ -153,7 +163,7 @@ public class AlertProcessingService : BackgroundService
             DeviceId = alertEvent.DeviceId,
             DeviceName = alertEvent.DeviceName,
             DeviceIp = alertEvent.DeviceIp,
-            SourceUrl = ResolveSourceUrl(alertEvent.SourceUrl),
+            SourceUrl = ResolveSourceUrl(alertEvent.SourceUrl, alertEvent.SiteSlug),
             RuleId = rule.Id,
             TriggeredAt = DateTime.UtcNow,
             ContextJson = alertEvent.Context.Count > 0
@@ -179,8 +189,23 @@ public class AlertProcessingService : BackgroundService
             return;
         }
 
-        // Deliver to matching channels (use resolved absolute URL for delivery)
+        // Deliver to matching channels (use resolved absolute URL for delivery). For a
+        // non-default site, label the delivered copy with the site's name so external
+        // channels - which have no site column - name their origin. The in-app history
+        // row is already scoped to the site's own database, so only this copy is relabeled.
         var deliveryEvent = alertEvent with { SourceUrl = historyEntry.SourceUrl };
+        if (!string.IsNullOrEmpty(alertEvent.SiteSlug))
+        {
+            var siteName = await _siteNameResolver.ResolveNameAsync(alertEvent.SiteSlug, cancellationToken)
+                ?? alertEvent.SiteSlug;
+            deliveryEvent = deliveryEvent with
+            {
+                Title = $"[{siteName}] {alertEvent.Title}",
+                Context = new Dictionary<string, string> { ["Site"] = siteName }
+                    .Concat(alertEvent.Context.Where(kv => kv.Key != "Site"))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value)
+            };
+        }
         await DeliverAsync(deliveryEvent, historyEntry, repository, cancellationToken);
     }
 
@@ -190,7 +215,18 @@ public class AlertProcessingService : BackgroundService
         IAlertRepository repository,
         CancellationToken cancellationToken)
     {
+        // Deliver to this site's own channels plus the global (main-site) channels. For an
+        // alert from the default site the two are the same set, so there's no extra query.
         var channels = await repository.GetEnabledChannelsAsync(cancellationToken);
+        if (!string.IsNullOrEmpty(alertEvent.SiteSlug))
+        {
+            using var mainScope = _scopeFactory.CreateScope();
+            mainScope.ServiceProvider.GetRequiredService<IAlertSiteScope>().UseSite(null);
+            var mainRepo = mainScope.ServiceProvider.GetRequiredService<IAlertRepository>();
+            var globalChannels = await mainRepo.GetEnabledChannelsAsync(cancellationToken);
+            channels = channels.Concat(globalChannels).ToList();
+        }
+
         var deliveredTo = new List<int>();
         var errors = new List<string>();
 
@@ -242,37 +278,49 @@ public class AlertProcessingService : BackgroundService
         await repository.UpdateAlertAsync(historyEntry, cancellationToken);
     }
 
-    private async Task RefreshRuleCacheAsync(IAlertRepository repository, CancellationToken cancellationToken)
+    private async Task<List<AlertRule>> GetRulesAsync(IAlertRepository repository, string siteKey, CancellationToken cancellationToken)
     {
-        if ((DateTime.UtcNow - _rulesCachedAt) < RuleCacheDuration)
-            return;
+        var hasCache = _rulesBySite.TryGetValue(siteKey, out var cached);
+        if (hasCache && (DateTime.UtcNow - cached.CachedAt) < RuleCacheDuration)
+            return cached.Rules;
 
         try
         {
-            _cachedRules = await repository.GetEnabledRulesAsync(cancellationToken);
-            _rulesCachedAt = DateTime.UtcNow;
-            _logger.LogDebug("Refreshed alert rule cache ({Count} enabled rules)", _cachedRules.Count);
+            var rules = await repository.GetEnabledRulesAsync(cancellationToken);
+            _rulesBySite[siteKey] = (rules, DateTime.UtcNow);
+            return rules;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to refresh alert rule cache");
+            _logger.LogError(ex, "Failed to refresh alert rule cache for site {Site}",
+                siteKey.Length == 0 ? "main" : siteKey);
             // Keep using stale cache rather than failing
+            return hasCache ? cached.Rules : [];
         }
     }
 
     /// <summary>
     /// Resolves a relative SourceUrl (e.g., "/audit") to an absolute URL using the app's
     /// configured hostname. Falls back to the relative path if no hostname is configured.
+    /// For an alert from a non-default site, appends ?site=&lt;slug&gt; so the "View" link
+    /// lands on that site (the selection middleware persists it to the session cookie).
     /// </summary>
-    private string? ResolveSourceUrl(string? relativeUrl)
+    private string? ResolveSourceUrl(string? relativeUrl, string? siteSlug)
     {
         if (string.IsNullOrEmpty(relativeUrl))
             return null;
 
-        if (_appBaseUrl != null)
-            return $"{_appBaseUrl}{relativeUrl}";
+        var url = relativeUrl;
+        if (!string.IsNullOrEmpty(siteSlug))
+        {
+            var separator = url.Contains('?') ? '&' : '?';
+            url = $"{url}{separator}site={Uri.EscapeDataString(siteSlug)}";
+        }
 
-        return relativeUrl;
+        if (_appBaseUrl != null)
+            return $"{_appBaseUrl}{url}";
+
+        return url;
     }
 
     private void CleanupCooldowns()

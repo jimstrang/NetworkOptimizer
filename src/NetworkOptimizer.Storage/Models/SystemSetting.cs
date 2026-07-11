@@ -37,6 +37,25 @@ public static class SystemSettingKeys
     public const string Iperf3LocalVersion = "iperf3.local_version";
     public const string Iperf3LocalLastChecked = "iperf3.local_last_checked";
 
+    // Multi-site management
+    public const string MultiSiteEnabled = "multisite.enabled";
+
+    // Licensing: stable anonymous id this installation sends with license checks
+    // (created on first activation), and the license server base URL override
+    // (default https://licensing.ozarkconnect.net; editable for testing).
+    public const string LicensingInstallationId = "licensing.installation_id";
+    public const string LicensingServerUrl = "licensing.server_url";
+
+    // Internal bookkeeping: JSON map of site slug -> UTC timestamp when the site
+    // lost license coverage, anchoring the uncovered-site grace countdown.
+    public const string LicensingUncoveredSince = "licensing.uncovered_since";
+
+    // Per-site Client Speed Test target override (agent sites only): an IP/host or a
+    // full URL the browser should hit for the LAN speed test, used when the agent's
+    // auto-detected LAN IP isn't its client-facing address (e.g. behind a reverse
+    // proxy). Client-facing only - the path trace always uses the agent's real LAN IP.
+    public const string ClientSpeedTestTargetOverride = "clientspeedtest.target_override";
+
     // UI preferences (legacy - no longer used)
     public const string SponsorshipBannerDismissed = "ui.sponsorship_banner_dismissed";
 

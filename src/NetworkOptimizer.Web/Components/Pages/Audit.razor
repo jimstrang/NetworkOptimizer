@@ -7,6 +7,8 @@
 @using AuditSeverity = NetworkOptimizer.Audit.Models.AuditSeverity
 @inject AuditService AuditService
 @inject UniFiConnectionService ConnectionService
+@inject NetworkOptimizer.Web.Services.Licensing.LicenseStateService LicenseState
+@inject SiteContextService SiteContext
 @inject IJSRuntime JSRuntime
 @inject ILogger<Audit> Logger
 @inject NavigationManager NavigationManager
@@ -20,6 +22,8 @@
     <h1>Security Audit</h1>
     <p class="page-description">Comprehensive network security analysis</p>
 </div>
+
+<RestrictedSiteNotice />
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
 {
@@ -48,7 +52,7 @@
     <div class="card">
         <div class="card-body">
             <div class="audit-controls">
-                <button class="btn btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected)" style="min-width: 140px;">
+                <button class="btn btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected || IsLicenseRestricted)" style="min-width: 140px;">
                     @if (isRunning)
                     {
                         <span class="spinner"></span>
@@ -876,6 +880,8 @@
 </div>
 
 @code {
+    private bool IsLicenseRestricted => !LicenseState.IsSiteOperational(SiteContext.Slug);
+
     private static string FormatCoveringRules(IReadOnlyList<CoveringRuleInfo> rules)
     {
         return string.Join("; ", rules.Select(r =>
@@ -937,6 +943,11 @@
     {
         PtrState.RefreshCallback = async () => { if (hasResults) await RunAudit(); };
         PtrState.NotifyStateChanged = StateHasChanged;
+
+        // Dismiss the console-connection banner (and enable Run Audit) once the
+        // connection comes up, like the other pages. Running an audit is a manual
+        // action, so this handler only re-renders - it never triggers an audit.
+        ConnectionService.OnConnectionChanged += HandleConnectionChanged;
 
         // Wait for auto-connect to complete (if credentials are saved)
         // This prevents the "Not Connected" banner from flashing after page reload
@@ -1387,7 +1398,9 @@
         if (string.IsNullOrEmpty(text))
             return new MarkupString("");
 
-        var formatted = text;
+        // Encode first so controller-derived names (SSIDs, network/VLAN and firewall-rule
+        // names) can't inject HTML; the trusted link substitutions below are added after.
+        var formatted = System.Text.Encodings.Web.HtmlEncoder.Default.Encode(text);
 
         // Convert "UPnP Inspector" to a link
         formatted = formatted.Replace(
@@ -1537,8 +1550,17 @@
         timer.Start();
     }
 
+    // Re-render only, so the banner clears and Run Audit enables when the console
+    // connection comes up. Deliberately does not start an audit (manual action).
+    private void HandleConnectionChanged() => _ = InvokeAsync(() =>
+    {
+        try { StateHasChanged(); }
+        catch { /* circuit may be tearing down */ }
+    });
+
     public void Dispose()
     {
+        ConnectionService.OnConnectionChanged -= HandleConnectionChanged;
         foreach (var timer in _purposeSavedTimers.Values)
         {
             timer.Stop();

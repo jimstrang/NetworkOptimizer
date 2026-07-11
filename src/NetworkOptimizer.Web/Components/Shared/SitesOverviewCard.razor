@@ -1,0 +1,99 @@
+@using NetworkOptimizer.Storage.Models
+@using NetworkOptimizer.Web.Services
+@implements IDisposable
+@inject SiteManagementService SiteManagement
+@inject AgentEnrollmentService AgentEnrollment
+@inject AgentTunnelRegistry TunnelRegistry
+@inject NavigationManager NavigationManager
+
+@* Reusable multi-site summary card. Renders nothing until multi-site is enabled
+   and more than one site exists, so it can sit on the Dashboard unconditionally.
+   Uses the monitoring stat-tile design language (centered value over label). *@
+@if (_sites.Count > 1)
+{
+    <div class="card sites-overview-card @(LinkToSwitcher ? "clickable-card" : "")" @onclick="HandleCardClick">
+        <div class="sites-overview-header">
+            <h3 class="sites-overview-heading">Sites</h3>
+            @if (LinkToSwitcher)
+            {
+                <span class="sites-overview-cta">
+                    Open site switcher
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
+                        <path fill-rule="evenodd" d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z" clip-rule="evenodd" />
+                    </svg>
+                </span>
+            }
+        </div>
+        <div class="sites-overview-tiles">
+            <div class="monitoring-stat-card sites-tile sites-tile-teal">
+                <div class="stat-value">@_sites.Count</div>
+                <div class="stat-label">Sites</div>
+            </div>
+            <div class="monitoring-stat-card sites-tile sites-tile-emerald">
+                <div class="stat-value">@_sites.Count(s => s.Enabled)</div>
+                <div class="stat-label">Enabled</div>
+            </div>
+            <div class="monitoring-stat-card sites-tile sites-tile-blue">
+                <div class="stat-value">@EnrolledAgents</div>
+                <div class="stat-label">Agents</div>
+            </div>
+            <div class="monitoring-stat-card sites-tile sites-tile-purple">
+                <div class="stat-value">@OnlineAgents</div>
+                <div class="stat-label">Agents Online</div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    /// <summary>
+    /// When true (default) the card links through to the /sites switcher and shows
+    /// the "Open site switcher" call to action. The /sites page itself passes false
+    /// so it stays a plain summary rather than a link back to itself.
+    /// </summary>
+    [Parameter]
+    public bool LinkToSwitcher { get; set; } = true;
+
+    private List<Site> _sites = new();
+    private List<SiteAgent> _agents = new();
+
+    private int EnrolledAgents => _agents.Count(a => a.EnrolledAt != null);
+    private int OnlineAgents => _agents.Count(a => TunnelRegistry.IsAgentLive(a));
+
+    private void HandleCardClick()
+    {
+        if (LinkToSwitcher)
+            NavigationManager.NavigateTo("/sites");
+    }
+
+    private System.Threading.Timer? _pollTimer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        if (await SiteManagement.IsMultiSiteEnabledAsync())
+        {
+            _sites = await SiteManagement.GetSitesAsync();
+            _agents = await AgentEnrollment.GetAllAgentsAsync();
+
+            // Same 10s refresh as the Sites and Settings pages, so the Agents
+            // Online tile can't drift from the other status surfaces.
+            _pollTimer = new System.Threading.Timer(async _ =>
+            {
+                try
+                {
+                    await InvokeAsync(async () =>
+                    {
+                        _agents = await AgentEnrollment.GetAllAgentsAsync();
+                        StateHasChanged();
+                    });
+                }
+                catch { /* prevent timer death */ }
+            }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        }
+    }
+
+    public void Dispose()
+    {
+        _pollTimer?.Dispose();
+    }
+}

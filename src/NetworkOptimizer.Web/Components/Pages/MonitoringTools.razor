@@ -1,5 +1,6 @@
 @page "/network-tools"
 @rendermode InteractiveServer
+@implements IDisposable
 @using NetworkOptimizer.Web.Services
 @using NetworkOptimizer.Web.Services.Monitoring
 @using NetworkOptimizer.Monitoring.Probes
@@ -10,6 +11,8 @@
 @inject ProbeExecutorFactory ExecutorFactory
 @inject UniFiConnectionService ConnectionService
 @inject ISqmService SqmService
+@inject SiteContextService SiteContext
+@inject SiteTunnelRouting TunnelRouting
 
 <PageTitle>Network Tools - Network Optimizer</PageTitle>
 
@@ -23,6 +26,14 @@
     </p>
 </div>
 
+@if (_siteAgentOffline)
+{
+    <div class="alert alert-warning">
+        This site's probes run through its on-site agent, which isn't connected right now.
+        Ping and traceroute can resume when the agent reconnects.
+    </div>
+}
+
 <div class="card">
     <div class="card-header">
         <h2 class="card-title">Run a probe</h2>
@@ -31,7 +42,7 @@
         <div class="form-group">
             <label class="form-label">From (vantage)</label>
             <select class="form-control" value="@_fromKey" @onchange="OnVantageChanged">
-                <option value="server">Network Optimizer server</option>
+                <option value="server">@(ExecutorFactory.ServerVantageIsAgent ? "On-site agent" : "Network Optimizer server")</option>
                 @foreach (var d in _devices)
                 {
                     <option value="@($"device:{d.Mac}")">@LabelForDevice(d)</option>
@@ -40,14 +51,21 @@
             @if (_fromKey == "server")
             {
                 <p class="page-description" style="margin-top: 0.5rem;">
-                    Probes from this server. Capabilities: @_localCapabilities.
+                    @if (ExecutorFactory.ServerVantageIsAgent)
+                    {
+                        @:Probes run from this site's on-site agent (on the site's own network), not the central server.
+                    }
+                    else
+                    {
+                        @:Probes from this server. Capabilities: @_localCapabilities.
+                    }
                 </p>
             }
             else if (_sshCredentialsMissing)
             {
                 <div class="alert alert-warning">
                     Network Optimizer doesn't have working SSH credentials for this device
-                    yet. Configure them in <a href="/settings#unifi-ssh">Settings &gt; UniFi SSH</a>
+                    yet. Configure them in <a href="/settings#device-ssh">Settings &gt; Device SSH</a>
                     to run probes from this vantage.
                 </div>
             }
@@ -100,7 +118,7 @@
             <label class="form-label">Probe Mode</label>
             <select class="form-control" @bind="_probeMode">
                 <option value="@ProbeMode.Icmp">ICMP</option>
-                <option value="@ProbeMode.Tcp">TCP (connect)</option>
+                <option value="@ProbeMode.Tcp">TCP</option>
                 <option value="@ProbeMode.Udp">UDP (traceroute only)</option>
             </select>
         </div>
@@ -119,11 +137,12 @@
         }
 
         <div class="action-buttons" style="margin-top: 1rem;">
-            <button class="btn btn-primary" @onclick="RunPing" disabled="@(_running || !CanRun)">
+            <button class="btn btn-primary" @onclick="RunPing" disabled="@(_running || !CanPing)"
+                    data-tooltip="@(_probeMode == ProbeMode.Udp ? "Ping runs over ICMP or TCP - UDP is traceroute-only." : null)">
                 @if (_running && _runningKind == "ping") { <span class="spinner-sm"></span> <span>Pinging...</span> }
                 else { <span>Ping</span> }
             </button>
-            <button class="btn btn-secondary" @onclick="RunTraceroute" disabled="@(_running || !CanRun)">
+            <button class="btn btn-secondary" @onclick="RunTraceroute" disabled="@(_running || !CanTraceroute)">
                 @if (_running && _runningKind == "trace") { <span class="spinner-sm"></span> <span>Tracing...</span> }
                 else { <span>Traceroute</span> }
             </button>
@@ -144,7 +163,7 @@
         <div class="card-body">
             <div class="form-group">
                 <label class="form-label">From</label>
-                <div class="form-value">@_pingResult.Vantage.Id</div>
+                <div class="form-value">@VantageLabel(_pingResult.Vantage.Id)</div>
             </div>
             <div class="form-group">
                 <label class="form-label">Target</label>
@@ -182,7 +201,7 @@
         <div class="card-body">
             <div class="form-group">
                 <label class="form-label">From</label>
-                <div class="form-value">@_traceResult.Vantage.Id</div>
+                <div class="form-value">@VantageLabel(_traceResult.Vantage.Id)</div>
             </div>
             <div class="table-responsive">
             <table class="data-table">
@@ -248,6 +267,18 @@
 
     private bool CanRun => !string.IsNullOrWhiteSpace(_targetAddress) && !_sshCredentialsMissing;
 
+    // Ping supports ICMP and TCP (there is no UDP ping); traceroute supports all three
+    // modes (ICMP, UDP, TCP). Both also need the site's agent online on an agent-backed site.
+    private bool CanPing => CanRun && !_siteAgentOffline && _probeMode != ProbeMode.Udp;
+    private bool CanTraceroute => CanRun && !_siteAgentOffline;
+
+    // Agent-backed secondary site whose on-site agent isn't currently connected. Probes run
+    // through that agent (server vantage over the tunnel, device vantages over SSH), so they
+    // can't run until it reconnects; the poll re-enables them and reloads the device list.
+    private bool _siteAgentOffline;
+    private bool _consoleDataLoaded;
+    private System.Threading.Timer? _agentStatusTimer;
+
     protected override async Task OnInitializedAsync()
     {
         var capTask = LocalProbe.GetCapabilityAsync();
@@ -255,6 +286,62 @@
         var wanTask = LoadWanInterfacesAsync();
         await Task.WhenAll(capTask, devicesTask, wanTask);
         _localCapabilities = capTask.Result.Describe();
+        _consoleDataLoaded = ConnectionService.IsConnected;
+
+        await RefreshAgentAvailabilityAsync();
+        StartAgentStatusPolling();
+    }
+
+    /// <summary>
+    /// Recomputes whether this site's on-site agent is offline. Probes route through the
+    /// agent for an agent-backed secondary site, so an offline agent locks them out; the
+    /// poll re-enables them when it reconnects. The default site never routes via agent.
+    /// </summary>
+    private async Task RefreshAgentAvailabilityAsync()
+    {
+        _siteAgentOffline = !SiteContext.IsDefault
+            && await TunnelRouting.IsViaAgentAsync(SiteContext.Slug)
+            && !TunnelRouting.IsAgentOnline(SiteContext.Slug);
+    }
+
+    /// <summary>
+    /// Polls the site's agent tunnel so probes re-enable on their own once the agent
+    /// reconnects, and loads the console-dependent device list the moment the console
+    /// (which follows the agent) comes back. Only agent-backed secondary sites poll.
+    /// </summary>
+    private void StartAgentStatusPolling()
+    {
+        if (SiteContext.IsDefault) return;
+        _agentStatusTimer = new System.Threading.Timer(async _ =>
+        {
+            try
+            {
+                await InvokeAsync(async () =>
+                {
+                    var before = _siteAgentOffline;
+                    await RefreshAgentAvailabilityAsync();
+                    var changed = before != _siteAgentOffline;
+
+                    if (!_consoleDataLoaded && ConnectionService.IsConnected)
+                    {
+                        await LoadDevicesAsync();
+                        await LoadWanInterfacesAsync();
+                        _consoleDataLoaded = true;
+                        changed = true;
+                    }
+
+                    if (changed)
+                        StateHasChanged();
+                });
+            }
+            catch { /* keep the timer alive */ }
+        }, null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
+
+    public void Dispose()
+    {
+        _agentStatusTimer?.Dispose();
+        _agentStatusTimer = null;
     }
 
     private async Task LoadDevicesAsync()
@@ -405,6 +492,24 @@
             _runningKind = string.Empty;
             StateHasChanged();
         }
+    }
+
+    /// <summary>
+    /// Friendly label for a probe result's vantage id ("server" or "device:{mac}"):
+    /// the device's name/type when known, or the server/on-site-agent label.
+    /// </summary>
+    private string VantageLabel(string vantageId)
+    {
+        if (string.IsNullOrEmpty(vantageId)) return "Unknown";
+        if (vantageId.StartsWith("device:"))
+        {
+            var mac = vantageId.Substring("device:".Length);
+            var device = _devices.FirstOrDefault(d => d.Mac == mac);
+            return device != null ? LabelForDevice(device) : mac;
+        }
+        if (vantageId == "server")
+            return ExecutorFactory.ServerVantageIsAgent ? "On-site agent" : "Network Optimizer server";
+        return vantageId;
     }
 
     private static string LabelForDevice(DiscoveredDevice d)

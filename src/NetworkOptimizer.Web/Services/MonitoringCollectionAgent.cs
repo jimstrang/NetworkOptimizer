@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.Net;
 using Microsoft.EntityFrameworkCore;
 using NetworkOptimizer.Core.Enums;
-using NetworkOptimizer.Core.Helpers;
 using NetworkOptimizer.Monitoring;
 using NetworkOptimizer.Monitoring.Models;
 using NetworkOptimizer.Monitoring.Probes;
@@ -29,10 +28,20 @@ namespace NetworkOptimizer.Web.Services;
 ///
 /// Credentials come from MonitoringSettings (populated by SnmpDetectionService); the agent
 /// itself never stores them independently.
+///
+/// One instance exists per site, owned by <see cref="MonitoringCollectionRegistry"/>.
+/// A non-default instance reads settings, targets, and relational rows from its own
+/// site's database and writes to that site's Influx buckets, console connection, and
+/// live-stats cache. When the site has a connected on-site agent, the tunnel relay
+/// already covers latency probing and SNMP polling from inside that network, so the
+/// local loops skip those and keep only the console-API-driven work (WiFi client
+/// snapshots, SFP DDM, API health fallback, fabric target reconciliation).
 /// </summary>
 public class MonitoringCollectionAgent : BackgroundService
 {
     private readonly IDbContextFactory<NetworkOptimizerDbContext> _dbFactory;
+    private readonly SiteDbContextFactory _siteDbFactory;
+    private readonly AgentTunnelRegistry _tunnelRegistry;
     private readonly UniFiConnectionService _connectionService;
     private readonly MonitoringInfluxClient _influx;
     private readonly MonitoringLiveStats _liveStats;
@@ -43,18 +52,21 @@ public class MonitoringCollectionAgent : BackgroundService
     private readonly NetworkOptimizer.Web.Services.Monitoring.DeviceHealthAlertEvaluator _deviceHealthAlertEvaluator;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<MonitoringCollectionAgent> _logger;
+    private readonly Licensing.LicenseStateService _licenseState;
+    private readonly string _siteSlug;
+    private readonly bool _isDefault;
+
+    // Throttles the agent-site console reconnect done inside ReconcileFabricTargetsAsync.
+    private DateTime _lastConsoleEnsureAt;
 
     // Counter delta cache for server-side rate computation. Key = "deviceMac/ifName".
     private readonly ConcurrentDictionary<string, InterfaceRateCalculator.State> _counterCache = new();
     // Per-target last-probed time, for per-target poll intervals on a shared loop.
     private readonly ConcurrentDictionary<int, DateTime> _targetLastProbed = new();
 
-    // SNMP gating. We only poll devices UniFi reports as SNMP-enabled, so repeated
-    // failures likely mean a transient outage (firmware upgrade, reboot) rather than
-    // "device doesn't speak SNMP". Short exclusion avoids hammering unresponsive
-    // devices while covering a typical ~3 min firmware upgrade cycle.
-    private readonly ConcurrentDictionary<string, int> _snmpFailures = new();
-    private readonly ConcurrentDictionary<string, DateTime> _snmpExcluded = new();
+    // SNMP failure counting + temporary exclusion (see SnmpFailureTracker for the
+    // rationale). Keyed by normalized device MAC.
+    private readonly SnmpFailureTracker _snmpFailures = new();
     // Last successful SNMP poll per device (normalized MAC -> UTC). Drives the
     // "last polled" column and "not yet polled" state on the Setup dashboard.
     private readonly ConcurrentDictionary<string, DateTime> _snmpLastPolled = new();
@@ -63,44 +75,129 @@ public class MonitoringCollectionAgent : BackgroundService
     private Dictionary<string, List<CustomOidConfiguration>> _customOidsByDevice = new();
     private DateTime _customOidsLoadedAt = DateTime.MinValue;
     private static readonly TimeSpan CustomOidsCacheTtl = TimeSpan.FromSeconds(30);
-    private const int SnmpFailureThreshold = 5;
-    private static readonly TimeSpan SnmpExclusionDuration = TimeSpan.FromMinutes(5);
     private readonly SemaphoreSlim _snmpGate = new(8);
 
     public MonitoringCollectionAgent(
         IDbContextFactory<NetworkOptimizerDbContext> dbFactory,
-        UniFiConnectionService connectionService,
-        MonitoringInfluxClient influx,
-        MonitoringLiveStats liveStats,
+        SiteDbContextFactory siteDbFactory,
+        AgentTunnelRegistry tunnelRegistry,
+        SiteConnectionRegistry siteConnections,
+        MonitoringInfluxRegistry influxRegistry,
+        MonitoringLiveStatsRegistry liveStatsRegistry,
         ICredentialProtectionService credentialProtection,
         LocalProbeExecutor localProbe,
-        NetworkOptimizer.Web.Services.Monitoring.MonitoringAlertEvaluator alertEvaluator,
-        NetworkOptimizer.Web.Services.Monitoring.SfpAlertEvaluator sfpAlertEvaluator,
-        NetworkOptimizer.Web.Services.Monitoring.DeviceHealthAlertEvaluator deviceHealthAlertEvaluator,
+        MonitoringAlertRegistry alertRegistry,
+        Licensing.LicenseStateService licenseState,
         ILoggerFactory loggerFactory,
-        ILogger<MonitoringCollectionAgent> logger)
+        ILogger<MonitoringCollectionAgent> logger,
+        string siteSlug = SiteManagementService.DefaultSiteSlug)
     {
         _dbFactory = dbFactory;
-        _connectionService = connectionService;
-        _influx = influx;
-        _liveStats = liveStats;
+        _siteDbFactory = siteDbFactory;
+        _tunnelRegistry = tunnelRegistry;
+        _licenseState = licenseState;
+        _siteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        _isDefault = _siteSlug == SiteManagementService.DefaultSiteSlug;
+        _connectionService = siteConnections.GetFor(_siteSlug);
+        _influx = influxRegistry.GetFor(_siteSlug);
+        _liveStats = liveStatsRegistry.GetFor(_siteSlug);
         _credentialProtection = credentialProtection;
         _localProbe = localProbe;
-        _alertEvaluator = alertEvaluator;
-        _sfpAlertEvaluator = sfpAlertEvaluator;
-        _deviceHealthAlertEvaluator = deviceHealthAlertEvaluator;
+        var evaluators = alertRegistry.GetFor(_siteSlug);
+        _alertEvaluator = evaluators.Targets;
+        _sfpAlertEvaluator = evaluators.Sfp;
+        _deviceHealthAlertEvaluator = evaluators.DeviceHealth;
         _loggerFactory = loggerFactory;
         _logger = logger;
     }
 
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    private async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct)
+    {
+        if (!_isDefault)
+            return _siteDbFactory.CreateForSite(_siteSlug, isDefault: false);
+        return await _dbFactory.CreateDbContextAsync(ct);
+    }
+
+    /// <summary>
+    /// Whether a connected on-site agent is collecting for this site right now. The
+    /// tunnel relay handles latency probing and SNMP polling from inside the site's
+    /// network (where the server often has no reach), so the local loops for those
+    /// paths stand down while an agent is connected. Never true for the default site:
+    /// its agents are additional vantage points, not replacements for local collection.
+    /// </summary>
+    private bool AgentCoversCollection() =>
+        !_isDefault && (_tunnelRegistry.GetForSite(_siteSlug).Count > 0 || _siteAgentEnrolled);
+
+    // A secondary site is agent-backed if it has an ENROLLED agent, even while that agent
+    // is momentarily disconnected (app startup, agent reconnect). The NO Server can't reach
+    // such a site's network, so its local latency/SNMP loops must stand down the whole
+    // time - not only while the tunnel is live. Gating solely on a live tunnel meant that on
+    // every NO-server startup, before the agent reconnected, the server probed the site's
+    // targets from its own stack: false LAN packet-loss, and the server's own RTT on shared
+    // (anycast) targets. Refreshed on a throttle from the tier loop.
+    private volatile bool _siteAgentEnrolled;
+    private DateTime _agentCoverageCheckedAt = DateTime.MinValue;
+    private static readonly TimeSpan AgentCoverageTtl = TimeSpan.FromSeconds(30);
+
+    private async Task RefreshAgentCoverageAsync(CancellationToken ct)
+    {
+        if (_isDefault) return;
+        if (DateTime.UtcNow - _agentCoverageCheckedAt < AgentCoverageTtl) return;
+        try
+        {
+            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            var site = await db.Sites.AsNoTracking().FirstOrDefaultAsync(s => s.Slug == _siteSlug, ct);
+            var wasEnrolled = _siteAgentEnrolled;
+            _siteAgentEnrolled = site != null && await db.SiteAgents.AsNoTracking()
+                .AnyAsync(a => a.SiteId == site.Id && a.Enabled && a.EnrolledAt != null, ct);
+            _agentCoverageCheckedAt = DateTime.UtcNow;
+
+            // The moment an external site first gains an agent, activate the default internet
+            // targets that were seeded disabled while it had none - the agent can now probe them
+            // from inside the site (AgentProbeResultSink only pushes enabled targets).
+            if (!wasEnrolled && _siteAgentEnrolled)
+                await EnableSeededDefaultTargetsAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Agent coverage refresh failed for site {Slug}", _siteSlug);
+        }
+    }
+
+    /// <summary>
+    /// No-op. Owned by MonitoringCollectionRegistry (started/stopped via
+    /// Start/StopAsync), but handed to components through a scoped forwarding
+    /// registration - so the DI container would otherwise call Dispose at every
+    /// request/circuit scope end, and BackgroundService.Dispose cancels the
+    /// stopping token, silently killing this site's collection loops. The
+    /// registry owns the real lifecycle.
+    /// </summary>
+    public override void Dispose() { }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Monitoring collection agent starting");
+        _logger.LogInformation("Monitoring collection agent starting (site {Site})", _siteSlug);
+
+        // Resolve agent coverage before seeding so an external (non-default) site seeds its
+        // default internet targets disabled until an agent is deployed - otherwise the central
+        // server, which can't see the site's network, would probe anycast DNS from its own
+        // stack and log that as the site's ISP latency. No-op on the default site (always seeds
+        // enabled), where this returns immediately.
+        await RefreshAgentCoverageAsync(stoppingToken);
 
         // Seed default targets on startup so the latency tier has something to probe even
         // before the upstream wizard runs. Safe to call repeatedly — only inserts if absent.
         try { await SeedDefaultTargetsAsync(stoppingToken); }
         catch (Exception ex) { _logger.LogWarning(ex, "Default target seeding failed"); }
+
+        // Warm the live SFP cache from the latest persisted DDM points so the Optical
+        // tables aren't blank between a restart and the site's first successful slow
+        // tick - up to several minutes on agent-backed sites, whose first tick usually
+        // fires before the tunnel console reconnects. Live readings always win: the
+        // seed never overwrites an entry the slow tier has already recorded.
+        try { await SeedSfpLiveCacheAsync(stoppingToken); }
+        catch (Exception ex) { _logger.LogDebug(ex, "SFP live-cache seeding failed (site {Site})", _siteSlug); }
 
         // Four independent loops, slightly staggered to avoid burst overlap.
         var fastTask = RunTierAsync("fast", GetFastInterval, FastTierCollectAsync, TimeSpan.FromSeconds(5), stoppingToken);
@@ -135,7 +232,7 @@ public class MonitoringCollectionAgent : BackgroundService
             stoppingToken);
 
         await Task.WhenAll(fastTask, mediumTask, slowTask, latencyTask, healthTask, wifiTask);
-        _logger.LogInformation("Monitoring collection agent stopped");
+        _logger.LogInformation("Monitoring collection agent stopped (site {Site})", _siteSlug);
     }
 
     private TimeSpan GetFastInterval(MonitoringSettings s) =>
@@ -163,8 +260,11 @@ public class MonitoringCollectionAgent : BackgroundService
             TimeSpan interval = TimeSpan.FromSeconds(60);
             try
             {
+                // Keep agent-coverage state fresh so a secondary site's local loops stand
+                // down for an enrolled-but-reconnecting agent (no startup false loss).
+                await RefreshAgentCoverageAsync(stoppingToken);
                 var settings = await LoadSettingsAsync(stoppingToken);
-                if (settings == null || !ShouldRunNow(settings))
+                if (settings == null || !await ShouldRunNowAsync(settings, stoppingToken))
                 {
                     // Not enabled or not configured — sleep and re-check
                     interval = TimeSpan.FromSeconds(30);
@@ -181,7 +281,7 @@ public class MonitoringCollectionAgent : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Monitoring {Tier} tier collection failed", tierName);
+                _logger.LogError(ex, "Monitoring {Tier} tier collection failed (site {Site})", tierName, _siteSlug);
                 interval = TimeSpan.FromSeconds(30);
             }
 
@@ -194,7 +294,7 @@ public class MonitoringCollectionAgent : BackgroundService
     {
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSiteDbAsync(ct);
             return await db.MonitoringSettings.AsNoTracking().FirstOrDefaultAsync(ct);
         }
         catch (Exception ex)
@@ -204,21 +304,35 @@ public class MonitoringCollectionAgent : BackgroundService
         }
     }
 
-    private static bool ShouldRunNow(MonitoringSettings settings)
+    private async Task<bool> ShouldRunNowAsync(MonitoringSettings settings, CancellationToken ct)
     {
+        // License enforcement: restricted sites collect nothing. The registry
+        // stops this instance within a reconcile cycle; this closes the window.
+        if (!_licenseState.IsSiteOperational(_siteSlug)) return false;
         if (!settings.Enabled) return false;
         if (settings.SnmpDetectionState != SnmpDetectionState.EnabledV2c
             && settings.SnmpDetectionState != SnmpDetectionState.EnabledV3Only
             && settings.SnmpDetectionState != SnmpDetectionState.Working)
             return false;
-        if (string.IsNullOrEmpty(settings.InfluxDbToken)) return false;
-        return true;
+        // The default site stores its own InfluxDB token. Secondary sites derive
+        // their InfluxDB config from main (shared server/token, per-site buckets),
+        // so their MonitoringSettings token is empty - fall back to whether the
+        // effective per-site client is configured (deriving it if needed). Without
+        // this, every agent site's collection agent (fabric target reconcile, device
+        // and wifi tiers feeding Device Stats) was gated off entirely.
+        if (!string.IsNullOrEmpty(settings.InfluxDbToken)) return true;
+        if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
+        return _influx.IsConfigured;
     }
 
     // ---- Tier collection methods ----
 
     private async Task FastTierCollectAsync(MonitoringSettings settings, CancellationToken ct)
     {
+        // A connected on-site agent streams interface counters over the tunnel; polling
+        // the same devices from here would double-write (and usually can't reach them).
+        if (AgentCoversCollection()) return;
+
         var devices = await GetMonitorableDevicesAsync(ct);
         if (devices.Count == 0) return;
 
@@ -232,7 +346,7 @@ public class MonitoringCollectionAgent : BackgroundService
         // Update the per-port rate cache from the UniFi API port_table for every
         // switch / gateway. Used below to compute AP backhaul rates from the upstream
         // port the AP is plugged into (spec 5.6).
-        UpdatePortRatesFromUnifi(devices, DateTime.UtcNow);
+        _fabric.UpdateUnifiPortRates(devices, DateTime.UtcNow);
 
         // Resolve the gateway LAN IP once per cycle so the SNMP poll targets the
         // LAN-side address (which actually answers) instead of UniFi's reported WAN
@@ -248,7 +362,7 @@ public class MonitoringCollectionAgent : BackgroundService
 
                 // UniFi requires snmp_location or snmp_contact to be set for
                 // SNMP to be enabled on a device. Both empty/null = SNMP off.
-                if (string.IsNullOrEmpty(device.SnmpLocation) && string.IsNullOrEmpty(device.SnmpContact))
+                if (!Monitoring.SnmpDeviceRules.HasSnmpEnabled(device))
                     return;
 
                 if (IsSnmpExcluded(mac))
@@ -275,7 +389,7 @@ public class MonitoringCollectionAgent : BackgroundService
                         if (rateIn.HasValue && rateOut.HasValue)
                         {
                             anyRate = true;
-                            if (IncludeInFabricSum(device.DeviceType, iface.Description))
+                            if (LanFabricAggregator.IncludeInFabricSum(device.DeviceType, iface.Description))
                             {
                                 aggregateInBps += rateIn.Value;
                                 aggregateOutBps += rateOut.Value;
@@ -300,7 +414,7 @@ public class MonitoringCollectionAgent : BackgroundService
                         // fabric I/O total - ShouldMonitor() already strips loopback,
                         // tunnels and bridges, so the surviving interfaces are
                         // physical ports.
-                        _snmpFailures.TryRemove(mac, out _);
+                        _snmpFailures.NoteSuccess(mac);
                         _snmpLastPolled[mac] = now;
                         if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Switch
                             || device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway
@@ -344,333 +458,38 @@ public class MonitoringCollectionAgent : BackgroundService
         // the topology cares about. The trunk/uplink port is the boundary between
         // the device and the rest of the network, which is what the topology pipe
         // actually carries.
-        var nowOverride = DateTime.UtcNow;
-        foreach (var dev in devices.Where(d => d.Uplink != null
-                                               && !string.IsNullOrEmpty(d.Uplink.UplinkMac)
-                                               && (d.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.AccessPoint
-                                                   || d.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Switch)))
-        {
-            var devMac = NormalizeMac(dev.Mac);
-            var parentMac = NormalizeMac(dev.Uplink!.UplinkMac);
-            var portIdx = dev.Uplink.UplinkRemotePort;
-            (double DownBps, double UpBps)? rate = null;
-
-            // Primary path: parent switch port byte delta. Works for wired-uplinked APs
-            // and switches. Direction matches live-stats convention since the port
-            // counter is read from the SWITCH's perspective (TX = toward child).
-            if (portIdx > 0)
-                rate = ComputePortRate(parentMac, portIdx, nowOverride);
-
-            if (rate.HasValue)
-            {
-                _liveStats.RecordInterfaceAggregate(dev.Mac, rate.Value.DownBps, rate.Value.UpBps, nowOverride);
-            }
-            else if (dev.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Switch
-                     && dev.Uplink?.PortIdx is int localUpIdx)
-            {
-                // Parent didn't expose a usable port_table rate (common when
-                // the parent is a mesh AP, whose Ethernet downlink isn't in
-                // its port_table). Read this switch's OWN port_table entry
-                // for its uplink port instead - UniFi populates tx/rx_bytes
-                // on the switch's side of that link too.
-                var ownRate = ComputePortRate(NormalizeMac(dev.Mac), localUpIdx, nowOverride);
-                if (ownRate.HasValue)
-                {
-                    // Direction note: parent.port.tx_bytes captures "bytes the
-                    // connected device transmitted" so the parent-path stores
-                    // child.RateInBps = uploads-from-child. The switch's OWN
-                    // uplink port observes the same physical wire from the
-                    // other side, so its tx_bytes = bytes the PARENT
-                    // transmitted = downloads to this switch. Swap the
-                    // (DownBps, UpBps) args so RateInBps remains "uploads"
-                    // and stays consistent with the primary path.
-                    _liveStats.RecordInterfaceAggregate(dev.Mac, ownRate.Value.UpBps, ownRate.Value.DownBps, nowOverride);
-                }
-            }
-            else if (dev.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.AccessPoint)
-            {
-                // Wired APs without a usable parent-port rate fall back to UniFi's
-                // device-level tx_bytes / rx_bytes delta. Mesh APs get their
-                // aggregate from the SNMP vwiresta interface in the fast-tier
-                // task above; if SNMP failed, this fallback fires for them too.
-                // ComputeDeviceRate returns (down, up) in our convention.
-                var devRate = ComputeDeviceRate(devMac);
-                if (devRate.HasValue)
-                    _liveStats.RecordInterfaceAggregate(dev.Mac, devRate.Value.DownBps, devRate.Value.UpBps, nowOverride);
-            }
-
-            // Switch fabric sum (sum(rx) / sum(tx)) is written by the SNMP
-            // fast tier directly into _liveStats.FabricIngressBps/EgressBps,
-            // since the SNMP per-interface rates are on a clean 5s cadence
-            // (UniFi's PortTable byte counters refresh server-side ~30s and
-            // would produce a one-burst / many-zeroes pattern here).
-        }
-
-        // Second pass: mesh-uplinked APs need a custom aggregate because
-        // UniFi's device-level stat.tx_bytes / rx_bytes doesn't reliably
-        // include traffic shuttled across the wireless backhaul - the
-        // AP-fallback above can read low or zero even when the AP is
-        // relaying a lot of traffic for downstream gear and its own
-        // wireless clients. Wired APs don't need this: their parent
-        // switch port already sees every byte (wireless clients included)
-        // because that traffic exits the AP via Ethernet. Mesh APs have
-        // no such port to read, so we synthesize the aggregate from two
-        // contributors:
-        //   (a) downstream UniFi devices (switch or another AP plugged
-        //       into the mesh AP's Ethernet downlink) - their boundary
-        //       aggregates were just written in the first pass.
-        //   (b) wireless clients directly associated to this mesh AP -
-        //       their TX/RX throughput maps onto the backhaul flow.
-        // NetworkPathAnalyzer treats device.Uplink.Type == "wireless" as
-        // the mesh marker; mirror that here for consistency with how the
-        // speed-test path tracer identifies mesh hops.
-        foreach (var meshAp in devices.Where(d =>
-            d.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.AccessPoint
-            && d.Uplink != null
-            && string.Equals(d.Uplink.Type, "wireless", StringComparison.OrdinalIgnoreCase)))
-        {
-            var meshMac = NormalizeMac(meshAp.Mac);
-            double sumIn = 0, sumOut = 0;
-            bool anyContribution = false;
-
-            // (a) downstream UniFi children on the Ethernet downlink.
-            foreach (var child in devices)
-            {
-                if (child.Uplink == null || string.IsNullOrEmpty(child.Uplink.UplinkMac)) continue;
-                if (!string.Equals(NormalizeMac(child.Uplink.UplinkMac), meshMac, StringComparison.OrdinalIgnoreCase)) continue;
-                var stats = _liveStats.GetForDevice(child.Mac);
-                if (stats == null || !stats.LastRateUpdate.HasValue) continue;
-                sumIn += stats.RateInBps ?? 0;
-                sumOut += stats.RateOutBps ?? 0;
-                anyContribution = true;
-            }
-
-            // (b) wireless clients on the mesh AP itself. TxThroughputBps
-            // is AP -> client (downloads, gateway-relative), Rx is the
-            // reverse (uploads). Sum onto the same RateIn / RateOut sides
-            // the children write so the totals stay direction-consistent.
-            foreach (var wc in _liveStats.GetWifiClientsForAp(meshAp.Mac))
-            {
-                var rx = wc.RxThroughputBps ?? 0;
-                var tx = wc.TxThroughputBps ?? 0;
-                if (rx > 0 || tx > 0)
-                {
-                    sumIn += rx;
-                    sumOut += tx;
-                    anyContribution = true;
-                }
-            }
-
-            // SNMP first-pass (vwiresta) is the most accurate source. Only
-            // overwrite if SNMP didn't get a chance (e.g. AP unreachable via
-            // SNMP) - i.e. the live-stats entry has no aggregate yet.
-            if (anyContribution)
-            {
-                var existing = _liveStats.GetForDevice(meshAp.Mac);
-                bool snmpAlreadySet = existing?.RateInBps.HasValue == true
-                                      || existing?.RateOutBps.HasValue == true;
-                if (!snmpAlreadySet)
-                {
-                    _liveStats.RecordInterfaceAggregate(meshAp.Mac, sumIn, sumOut, nowOverride);
-                }
-            }
-        }
-
-        // Gateways are the top of the topology - no parent switch to read their
-        // uplink rate from. Use the SNMP rate on the gateway's actual WAN
-        // interface (wan1...wan6 uplink_ifname, e.g. eth6.100 for VLAN-tagged
-        // or ppp3 for PPPoE) rather than port_table.IsUplink which may not be
-        // set for non-standard connection types.
-        foreach (var gw in devices.Where(d => d.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway))
-        {
-            var gwMac = NormalizeMac(gw.Mac);
-
-            // SNMP rate on the WAN interface: ppp* tunnel for PPPoE, physical
-            // port otherwise (issue #669). The physical port stays active under
-            // PPPoE and over-counts (overhead + sibling VLANs), while VLAN
-            // sub-interfaces double-count on some kernels. The other name remains
-            // a fallback in case the preferred interface has no SNMP rate yet.
-            var (physIfName, uplinkIfName) = UniFiDiscovery.ResolveActiveWanInterface(gw);
-            var preferred = NetworkUtilities.PreferredWanCounterInterface(physIfName, uplinkIfName);
-            var fallback = preferred == physIfName ? uplinkIfName : physIfName;
-            var portRate = preferred != null ? _liveStats.GetPortRate(gwMac, preferred) : null;
-            if (portRate == null && fallback != null && fallback != preferred)
-                portRate = _liveStats.GetPortRate(gwMac, fallback);
-            if (portRate != null)
-            {
-                // Gateway WAN perspective: port TX (DownBps) = data toward
-                // internet = uploads; port RX (UpBps) = from internet = downloads.
-                _liveStats.RecordInterfaceAggregate(gw.Mac, portRate.DownBps, portRate.UpBps, nowOverride);
-                continue;
-            }
-
-            // Fallback: PortTable IsUplink + PortIdx. Covers gateways where
-            // the raw JSON hasn't been fetched yet or the wan object is missing.
-            (double DownBps, double UpBps)? rate = null;
-            if (gw.PortTable != null)
-            {
-                var wanPort = gw.PortTable.FirstOrDefault(p => p.IsUplink);
-                if (wanPort != null && wanPort.PortIdx > 0)
-                {
-                    rate = ComputePortRate(gwMac, wanPort.PortIdx, nowOverride);
-                    if (rate.HasValue)
-                    {
-                        _liveStats.RecordInterfaceAggregate(gw.Mac, rate.Value.UpBps, rate.Value.DownBps, nowOverride);
-                        continue;
-                    }
-                }
-            }
-
-            // Last resort: device-level tx_bytes / rx_bytes delta. Used when the
-            // gateway's WAN-side is a bond/LAG and neither wan1...wan6 nor
-            // PortTable produced a usable rate.
-            var devRate = ComputeDeviceRate(gwMac);
-            if (devRate.HasValue)
-            {
-                _liveStats.RecordInterfaceAggregate(gw.Mac, devRate.Value.DownBps, devRate.Value.UpBps, nowOverride);
-            }
-        }
-
-        _liveStats.Prune(TimeSpan.FromMinutes(5));
+        // Topology-boundary aggregates: AP/switch uplink-port rates, mesh-AP
+        // synthesis, and gateway WAN rates, with all the direction conventions and
+        // fallbacks. Shared verbatim with the agent-relayed path (AgentProbeResultSink)
+        // via LanFabricAggregator so secondary sites compute identical numbers.
+        _fabric.WriteAggregates(devices, _liveStats, DateTime.UtcNow);
     }
 
-    /// <summary>
-    /// Diff the latest port_table byte counters against the previous reading to compute
-    /// per-port bps rates. Populates _portRateLatest, which AP-rate post-processing
-    /// reads from. Spec 5.6: AP rates come from the switch port they're plugged into,
-    /// not from the AP's own SNMP counters.
-    /// </summary>
-    private void UpdatePortRatesFromUnifi(IReadOnlyList<UniFiDeviceResponse> devices, DateTime now)
-    {
-        foreach (var device in devices)
-        {
-            if (device.PortTable == null || device.PortTable.Count == 0) continue;
-            var mac = NormalizeMac(device.Mac);
-            // Accumulate per-device fabric totals while we walk the port_table.
-            foreach (var port in device.PortTable)
-            {
-                if (port.PortIdx <= 0) continue;
-                var key = (mac, port.PortIdx);
-                var current = new PortByteSnapshot(now, port.TxBytes, port.RxBytes);
-                if (_portBytePrev.TryGetValue(key, out var prev))
-                {
-                    var elapsed = (now - prev.Timestamp).TotalSeconds;
-                    if (elapsed > 0.5)
-                    {
-                        long deltaTx = current.TxBytes - prev.TxBytes;
-                        long deltaRx = current.RxBytes - prev.RxBytes;
-                        if (deltaTx >= 0 && deltaRx >= 0)
-                        {
-                            if (deltaTx == 0 && deltaRx == 0)
-                            {
-                                // Counters unchanged - UniFi hasn't refreshed
-                                // server-side yet. Keep the previous snapshot so
-                                // the next real change computes over the true
-                                // elapsed window.
-                            }
-                            else
-                            {
-                                // Tuple convention is aligned with the SNMP writer
-                                // at WriteInterfaceCounters so downstream consumers
-                                // see stable directions whether SNMP or this UniFi
-                                // PortTable writer was the one that ran last on a
-                                // given cycle: tuple = (rateIn=RX, rateOut=TX).
-                                // NOTE: do NOT mirror into _liveStats per-port cache
-                                // here. UniFi PortTable byte counters update server-
-                                // side ~30s; at our 5s poll cadence that yields a
-                                // burst-then-zeros pattern that would clobber the
-                                // SNMP-fed _liveStats.RecordPortRate writes.
-                                _portRateLatest[key] = (deltaRx * 8.0 / elapsed, deltaTx * 8.0 / elapsed);
-                                _portBytePrev[key] = current;
-                            }
-                        }
-                    }
-                }
-                if (!_portBytePrev.ContainsKey(key))
-                    _portBytePrev[key] = current;
-            }
+    // Owns the per-port / per-device byte-rate caches and the topology-boundary
+    // aggregate computation, shared verbatim with the agent-relayed path
+    // (AgentProbeResultSink) so secondary sites compute identical numbers. This agent
+    // is per-site, so one instance is correct.
+    private readonly LanFabricAggregator _fabric = new();
 
-            // Device-level aggregate: UniFi's stat.tx_bytes / rx_bytes is the
-            // AP-aggregated counter (UniFi normalizes radio + Ethernet into one
-            // honest number). Useful as a fallback for mesh-uplinked APs where
-            // there's no parent switch port to read.
-            if (device.Stats != null)
-            {
-                var devKey = mac;
-                var devCurrent = new PortByteSnapshot(now, device.Stats.TxBytes, device.Stats.RxBytes);
-                if (_deviceBytePrev.TryGetValue(devKey, out var devPrev))
-                {
-                    var elapsed = (now - devPrev.Timestamp).TotalSeconds;
-                    if (elapsed > 0.5)
-                    {
-                        long deltaTx = devCurrent.TxBytes - devPrev.TxBytes;
-                        long deltaRx = devCurrent.RxBytes - devPrev.RxBytes;
-                        if (deltaTx >= 0 && deltaRx >= 0)
-                        {
-                            if (deltaTx == 0 && deltaRx == 0)
-                            {
-                                // Counters unchanged - keep previous snapshot.
-                            }
-                            else
-                            {
-                                // Device perspective: TX = device sends out (upstream away
-                                // from the device); RX = device receives (downstream toward
-                                // the device). Opposite convention vs the port path above.
-                                _deviceByteRateLatest[devKey] = (deltaRx * 8.0 / elapsed, deltaTx * 8.0 / elapsed);
-                                _deviceBytePrev[devKey] = devCurrent;
-                            }
-                        }
-                    }
-                }
-                if (!_deviceBytePrev.ContainsKey(devKey))
-                    _deviceBytePrev[devKey] = devCurrent;
-            }
-        }
-    }
-
-    /// <summary>Returns the latest computed rate for a given switch port, or null.</summary>
-    private (double DownBps, double UpBps)? ComputePortRate(string switchMac, int portIdx, DateTime now)
-    {
-        return _portRateLatest.TryGetValue((switchMac, portIdx), out var v) ? v : null;
-    }
-
-    /// <summary>UniFi device-level byte-counter delta. Fallback for mesh-uplinked APs.</summary>
-    private (double DownBps, double UpBps)? ComputeDeviceRate(string deviceMac)
-    {
-        return _deviceByteRateLatest.TryGetValue(deviceMac, out var v) ? v : null;
-    }
-
-    // Per-port rate state for AP backhaul lookups. _portBytePrev stores the last byte
-    // counter sample so we can diff; _portRateLatest holds the most recent computed
-    // rate keyed identically.
-    private readonly ConcurrentDictionary<(string SwitchMac, int PortIdx), PortByteSnapshot> _portBytePrev = new();
-    private readonly ConcurrentDictionary<(string SwitchMac, int PortIdx), (double DownBps, double UpBps)> _portRateLatest = new();
-    // Device-level byte counters from UniFi's `stat.tx_bytes`/`rx_bytes`. Keyed by
-    // device MAC (normalized). Mirrors the port cache shape; used as the mesh-AP
-    // fallback when no parent switch port rate is available.
-    private readonly ConcurrentDictionary<string, PortByteSnapshot> _deviceBytePrev = new();
-    private readonly ConcurrentDictionary<string, (double DownBps, double UpBps)> _deviceByteRateLatest = new();
-
-    /// <summary>
-    /// Whether an SNMP interface should contribute to the device's fabric ingress/
-    /// egress sum. Switches expose only physical "Port N" entries so they're safe
-    /// to sum wholesale. Gateways expose a zoo of pseudo-interfaces (VLAN sub-
-    /// interfaces like eth5.200, bridges br0/br200/..., bond0, the internal
-    /// switch-chip alias switch0[.X], honeypot*, wgclt*, gre*, *_vti, etc.) that
-    /// all alias counters carried by a physical eth port. Summing those gives
-    /// 3-4x the real total, so we restrict gateway fabric sum to plain ethN.
-    /// </summary>
-    internal static bool IncludeInFabricSum(NetworkOptimizer.Core.Enums.DeviceType type, string ifDescr)
-    {
-        if (type == NetworkOptimizer.Core.Enums.DeviceType.Gateway)
-            return System.Text.RegularExpressions.Regex.IsMatch(ifDescr, @"^eth\d+$");
-        return true;
-    }
 
     private async Task MediumTierCollectAsync(MonitoringSettings settings, CancellationToken ct)
     {
         var devices = await GetMonitorableDevicesAsync(ct);
         if (devices.Count == 0) return;
+
+        // With an on-site agent connected, SNMP health arrives over the tunnel relay.
+        // The local pass keeps only the UniFi-API fallback below, restricted to devices
+        // the agent's SNMP runner won't cover (those without SNMP enabled).
+        var agentCovers = AgentCoversCollection();
+        if (agentCovers)
+        {
+            if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
+            await CollectApiHealthFallbackAsync(settings, devices,
+                snmpHealthHits: new ConcurrentDictionary<string, bool>(),
+                snmpTempHits: new ConcurrentDictionary<string, bool>(),
+                snmpHandledElsewhere: true);
+            return;
+        }
 
         var poller = GetOrBuildPoller(settings);
         if (poller == null) return;
@@ -685,7 +504,7 @@ public class MonitoringCollectionAgent : BackgroundService
             await _snmpGate.WaitAsync(ct);
             try
             {
-                if (string.IsNullOrEmpty(device.SnmpLocation) && string.IsNullOrEmpty(device.SnmpContact))
+                if (!Monitoring.SnmpDeviceRules.HasSnmpEnabled(device))
                     return;
                 if (IsSnmpExcluded(NormalizeMac(device.Mac))) return;
                 var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
@@ -740,15 +559,32 @@ public class MonitoringCollectionAgent : BackgroundService
         });
         await Task.WhenAll(deviceTasks);
 
-        // UniFi API health pass: supplements or replaces SNMP health data.
-        // Non-SNMP devices: full fallback (CPU, mem, temp, uptime).
-        // SNMP devices: fill in gaps only (e.g., temperature on switches where
-        // SNMP doesn't report temp but UniFi API does).
+        await CollectApiHealthFallbackAsync(settings, devices, snmpHealthHits, snmpTempHits,
+            snmpHandledElsewhere: false);
+    }
+
+    /// <summary>
+    /// UniFi API health pass: supplements or replaces SNMP health data.
+    /// Non-SNMP devices: full fallback (CPU, mem, temp, uptime).
+    /// SNMP devices: fill in gaps only (e.g., temperature on switches where
+    /// SNMP doesn't report temp but UniFi API does).
+    /// With <paramref name="snmpHandledElsewhere"/> (site has a connected agent
+    /// relaying SNMP), SNMP-enabled devices are skipped entirely - the relay
+    /// writes their health - and only devices the agent can't poll get API data.
+    /// </summary>
+    private async Task CollectApiHealthFallbackAsync(
+        MonitoringSettings settings,
+        List<UniFiDeviceResponse> devices,
+        ConcurrentDictionary<string, bool> snmpHealthHits,
+        ConcurrentDictionary<string, bool> snmpTempHits,
+        bool snmpHandledElsewhere)
+    {
         var now = DateTime.UtcNow;
         foreach (var device in devices)
         {
             var mac = NormalizeMac(device.Mac);
-            var snmpOn = !string.IsNullOrEmpty(device.SnmpContact) || !string.IsNullOrEmpty(device.SnmpLocation);
+            var snmpOn = Monitoring.SnmpDeviceRules.HasSnmpEnabled(device);
+            if (snmpHandledElsewhere && snmpOn) continue;
             var snmpExcl = IsSnmpExcluded(mac);
             var snmpActive = snmpOn && !snmpExcl;
 
@@ -811,79 +647,41 @@ public class MonitoringCollectionAgent : BackgroundService
         }
     }
 
-    private static double? ParseJsonDouble(System.Text.Json.JsonElement? el)
-    {
-        if (el == null || el.Value.ValueKind == System.Text.Json.JsonValueKind.Undefined) return null;
-        if (el.Value.ValueKind == System.Text.Json.JsonValueKind.Number && el.Value.TryGetDouble(out var num)) return num;
-        if (el.Value.ValueKind == System.Text.Json.JsonValueKind.String)
-        {
-            var s = el.Value.GetString()?.Trim();
-            if (double.TryParse(s, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out var parsed))
-                return parsed;
-        }
-        return null;
-    }
+    private static double? ParseJsonDouble(System.Text.Json.JsonElement? el) =>
+        UniFiDeviceHealthReader.ParseJsonDouble(el);
 
-    private static double? ParseDeviceTemperature(UniFiDeviceResponse device)
-    {
-        // general_temperature: simple numeric field on switches (e.g., 72)
-        if (device.GeneralTemperature.HasValue && device.GeneralTemperature.Value > 0)
-            return device.GeneralTemperature.Value;
-
-        // temperatures: structured array on gateways, bare integer on some devices
-        if (device.Temperatures == null || device.Temperatures.Value.ValueKind == System.Text.Json.JsonValueKind.Undefined)
-            return null;
-
-        var el = device.Temperatures.Value;
-
-        // Gateway: array of { name, type, value } - pick the CPU sensor
-        if (el.ValueKind == System.Text.Json.JsonValueKind.Array)
-        {
-            foreach (var sensor in el.EnumerateArray())
-            {
-                var sType = sensor.TryGetProperty("type", out var t) ? t.GetString() : null;
-                if (string.Equals(sType, "cpu", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (sensor.TryGetProperty("value", out var v) && v.TryGetDouble(out var tempVal))
-                        return tempVal;
-                }
-            }
-            // No CPU sensor found, take the first one
-            foreach (var sensor in el.EnumerateArray())
-            {
-                if (sensor.TryGetProperty("value", out var v) && v.TryGetDouble(out var tempVal))
-                    return tempVal;
-            }
-        }
-
-        // Switch: bare integer
-        if (el.ValueKind == System.Text.Json.JsonValueKind.Number && el.TryGetDouble(out var bare))
-            return bare;
-
-        return null;
-    }
+    private static double? ParseDeviceTemperature(UniFiDeviceResponse device) =>
+        UniFiDeviceHealthReader.ParseDeviceTemperature(device);
 
     private async Task SlowTierCollectAsync(MonitoringSettings settings, CancellationToken ct)
     {
         var devices = await GetMonitorableDevicesAsync(ct);
         if (devices.Count == 0) return;
 
+        // The SFP collection below reads UniFi port_table DDM values, so it works over
+        // any reachable console connection (tunnel-proxied included). The SNMP interface
+        // walk further down needs direct SNMP reach, which a connected agent already
+        // provides from inside the site - skip the local copy in that case.
+        var agentCovers = AgentCoversCollection();
+
         // Network config (cached ~5 min) feeds the WireGuard / OpenVPN / honeypot /
         // bridge interface labels resolved below. Best-effort: a fetch failure just
         // means those families fall back to their raw ifname.
         IReadOnlyList<NetworkInfo> networkConfigs = Array.Empty<NetworkInfo>();
-        try { networkConfigs = await _connectionService.GetNetworksAsync(ct); }
-        catch (Exception ex) { _logger.LogDebug(ex, "networkconf fetch for interface labels failed"); }
+        if (!agentCovers)
+        {
+            try { networkConfigs = await _connectionService.GetNetworksAsync(ct); }
+            catch (Exception ex) { _logger.LogDebug(ex, "networkconf fetch for interface labels failed"); }
+        }
 
-        var poller = GetOrBuildPoller(settings);
-        if (poller == null) return;
+        var poller = agentCovers ? null : GetOrBuildPoller(settings);
+        if (poller == null && !agentCovers) return;
 
         if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
 
         // Reconcile InterfaceNameMap: stable device_mac+ifName → friendly name from UniFi
         // (per spec 3.7).
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteDbAsync(ct);
         var existingMaps = await db.InterfaceNameMaps.ToDictionaryAsync(
             m => (m.DeviceMac, m.IfName), m => m, ct);
         var existingSfps = await db.MonitoredSfps.ToDictionaryAsync(
@@ -926,17 +724,17 @@ public class MonitoringCollectionAgent : BackgroundService
             }
         }
 
-        var gatewayLanIp = await ResolveGatewayLanIpAsync(ct);
-        foreach (var device in devices)
+        var gatewayLanIp = agentCovers ? null : await ResolveGatewayLanIpAsync(ct);
+        foreach (var device in agentCovers ? Enumerable.Empty<UniFiDeviceResponse>() : devices)
         {
-            if (string.IsNullOrEmpty(device.SnmpLocation) && string.IsNullOrEmpty(device.SnmpContact))
+            if (!Monitoring.SnmpDeviceRules.HasSnmpEnabled(device))
                 continue;
             if (IsSnmpExcluded(NormalizeMac(device.Mac))) continue;
             try
             {
                 var pollIp = ResolveSnmpAddress(device, gatewayLanIp);
                 if (!IPAddress.TryParse(pollIp, out var ip)) continue;
-                var interfaces = await poller.GetInterfaceMetricsAsync(ip, device.Name);
+                var interfaces = await poller!.GetInterfaceMetricsAsync(ip, device.Name);
                 if (interfaces.Count == 0)
                 {
                     NoteSnmpFailure(NormalizeMac(device.Mac));
@@ -950,47 +748,23 @@ public class MonitoringCollectionAgent : BackgroundService
                     deviceIfNames.Add(ifName);
                     var key = (NormalizeMac(device.Mac), ifName);
 
-                    // Map SNMP ifIndex to UniFi PortTable.PortIdx. Two strategies:
-                    //  - Switches: ifIndex == PortIdx (verified working on USW devices)
-                    //  - Gateways: ifIndex != PortIdx; PortTable.IfName joins to SNMP
-                    //    iface.Name (Linux name like "eth4"). Direct numeric match
-                    //    first, fall back to ifname match.
-                    // The matched port supplies BOTH the port number and the UniFi
-                    // friendly name, so gateways (which only resolve via the IfName
-                    // fallback) get a friendly name too, not just switches.
-                    SwitchPort? portMatch = null;
-                    if (device.PortTable != null)
-                    {
-                        if (iface.Index > 0)
-                            portMatch = device.PortTable.FirstOrDefault(p => p.PortIdx == iface.Index);
-                        if (portMatch == null && !string.IsNullOrEmpty(ifName))
-                        {
-                            portMatch = device.PortTable.FirstOrDefault(p =>
-                                !string.IsNullOrEmpty(p.IfName)
-                                && string.Equals(p.IfName, ifName, StringComparison.OrdinalIgnoreCase)
-                                && p.PortIdx > 0);
-                        }
-                    }
-                    int? portNumber = portMatch is { PortIdx: > 0 } ? portMatch.PortIdx : null;
-                    var friendlyName = string.IsNullOrEmpty(portMatch?.Name) ? null : portMatch.Name;
-                    var isSfp = portMatch?.SfpFound;
-
-                    // Link speed: "lower of the two wins". SNMP is fresh and correct on
-                    // switches, but a gateway inflates copper ports to their 10G capability
-                    // (ifHighSpeed/ifSpeed both report the max, not the negotiated rate).
-                    // Negotiated speed can never exceed SNMP's reported value, so when
-                    // UniFi's PortTable reports a lower negotiated speed we take it.
-                    int? snmpSpeedMbps = iface.HighSpeed > 0
-                        ? (int)iface.HighSpeed
-                        : (iface.Speed > 0 ? (int)(iface.Speed / 1_000_000) : (int?)null);
-                    int? unifiSpeedMbps = portMatch is { Speed: > 0 } ? portMatch.Speed : (int?)null;
-                    int? linkSpeedMbps = (snmpSpeedMbps, unifiSpeedMbps) switch
-                    {
-                        (null, null) => null,
-                        (null, var u) => u,
-                        (var s, null) => s,
-                        var (s, u) => Math.Min(s.Value, u.Value),
-                    };
+                    // Map SNMP ifIndex to UniFi PortTable.PortIdx via the shared
+                    // correlation helper (switches by ifIndex == PortIdx, gateways by
+                    // PortTable.IfName == the raw SNMP ifName; link speed is "lower of
+                    // the two wins" - see InterfacePortCorrelation). The matched port
+                    // supplies BOTH the port number and the UniFi friendly name, so
+                    // gateways (which only resolve via the IfName join) get a friendly
+                    // name too, not just switches.
+                    var corr = InterfacePortCorrelation.Correlate(
+                        device.PortTable,
+                        iface.Index,
+                        iface.HighSpeed > 0 ? iface.HighSpeed * 1_000_000 : iface.Speed,
+                        iface.PortId,
+                        ifName);
+                    int? portNumber = corr.PortNumber;
+                    var friendlyName = corr.FriendlyName;
+                    var isSfp = corr.IsSfp;
+                    int? linkSpeedMbps = corr.LinkSpeedMbps;
 
                     if (!existingMaps.TryGetValue(key, out var mapping))
                     {
@@ -1018,9 +792,49 @@ public class MonitoringCollectionAgent : BackgroundService
                         mapping.IfAlias = iface.Description;
                         if (linkSpeedMbps.HasValue) mapping.SpeedMbps = linkSpeedMbps;
                         if (!string.IsNullOrEmpty(friendlyName)) mapping.FriendlyName = friendlyName;
-                        if (portNumber.HasValue) mapping.PortNumber = portNumber;
+                        if (portNumber.HasValue)
+                        {
+                            mapping.PortNumber = portNumber;
+                        }
+                        else if (mapping.PortNumber is int stale
+                            && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, mapping.IfName, stale, iface.PortId))
+                        {
+                            // Heal rows written before the numeric ifIndex match was gated
+                            // to entries without an ifname: the stored number (and the
+                            // friendly name / SFP flag copied with it) belongs to the
+                            // interface the port_table entry names, not this one.
+                            mapping.PortNumber = null;
+                            mapping.FriendlyName = null;
+                            mapping.IsSfp = null;
+                        }
                         if (isSfp.HasValue) mapping.IsSfp = isSfp;
                         mapping.LastUpdated = DateTime.UtcNow;
+                    }
+                }
+
+                // Heal rows for interfaces this walk no longer returns (a gateway's
+                // dummy0 / ip_vti0 / bond0 era): a stored port number that provably
+                // belongs to another interface was written before the numeric ifIndex
+                // match was gated to entries without an ifname, and with the interface
+                // gone from the walk the update branch above never revisits the row -
+                // the false claim (and the name/SFP flag copied with it) would stick
+                // forever. Rows whose claim the port table doesn't contradict are
+                // never touched. No rawIfName here BY DESIGN: unwalked rows have no
+                // current sample to supply one, so an alias-keyed row whose interface
+                // has left the walk can be cleared - accepted, since a departed
+                // interface's port claim is stale anyway.
+                var walkedNames = new HashSet<string>(deviceIfNames, StringComparer.OrdinalIgnoreCase);
+                var deviceMacNorm = NormalizeMac(device.Mac);
+                foreach (var ((rowMac, rowIfName), row) in existingMaps)
+                {
+                    if (rowMac != deviceMacNorm || walkedNames.Contains(rowIfName)) continue;
+                    if (row.PortNumber is int staleClaim
+                        && InterfacePortCorrelation.PortNumberBelongsToOtherInterface(device.PortTable, rowIfName, staleClaim))
+                    {
+                        row.PortNumber = null;
+                        row.FriendlyName = null;
+                        row.IsSfp = null;
+                        row.LastUpdated = DateTime.UtcNow;
                     }
                 }
 
@@ -1250,16 +1064,25 @@ public class MonitoringCollectionAgent : BackgroundService
                 LastUpdate = now,
             });
 
-            // Write to InfluxDB for historic playback (skip zero throughput)
+            // Write to InfluxDB for historic playback. Active clients always write;
+            // idle (zero-throughput) clients write only when they carry a switch-port
+            // association - the port-tagged presence is what lets playback show the
+            // Client column for a port even while the client is quiet.
             var swMac = NormalizeMac(c.SwMac ?? string.Empty);
-            if (!string.IsNullOrEmpty(swMac) && ((txBps ?? 0) > 0 || (rxBps ?? 0) > 0))
+            var swPort = c.SwPort is int sp && sp > 0 ? sp : (int?)null;
+            if (!string.IsNullOrEmpty(swMac) && ((txBps ?? 0) > 0 || (rxBps ?? 0) > 0 || swPort.HasValue))
             {
+                var displayName = !string.IsNullOrWhiteSpace(c.Name) ? c.Name
+                    : !string.IsNullOrWhiteSpace(c.Hostname) ? c.Hostname : c.Mac;
                 _ = _influx.WriteWiredClientAsync(
                     switchMac: swMac,
                     clientMac: clientMac,
                     txThroughputBps: txBps,
                     rxThroughputBps: rxBps,
-                    timestamp: now.AddTicks(tickOffset++));
+                    timestamp: now.AddTicks(tickOffset++),
+                    port: swPort,
+                    clientIp: c.BestIp,
+                    clientName: displayName);
             }
         }
 
@@ -1319,22 +1142,43 @@ public class MonitoringCollectionAgent : BackgroundService
         // Reconcile fabric targets with the live device list — gateways, switches, and APs
         // should each have a `fabric` target on their management IP (spec 5.4). New devices
         // add a target; deleted devices leave their targets untouched (history preserved).
+        // This runs even when an agent covers the site: the reconciled targets are what
+        // the tunnel pushes to the agent for probing from inside the network.
         await ReconcileFabricTargetsAsync(ct);
 
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        // Probing itself stands down for every non-default (external) site, agent or not. The
+        // central server can't see the site's network: with an agent connected it double-probes
+        // the WAN path instead of the site's own fabric/WAN view, and with no agent yet it would
+        // log its own anycast RTT as the site's ISP latency. The site's agent probes its enabled
+        // targets from inside once deployed (AgentProbeResultSink). The default site keeps
+        // probing locally as before.
+        if (!_isDefault) return;
+
+        await using var db = await CreateSiteDbAsync(ct);
         var targets = await db.MonitoringTargets
             .AsNoTracking()
             .Where(t => t.Enabled)
             .ToListAsync(ct);
+        var contextsById = await db.WanContexts.AsNoTracking().ToDictionaryAsync(c => c.Id, ct);
 
         var now = DateTime.UtcNow;
-        var dueTargets = targets.Where(t => IsDue(t, now)).ToList();
+        var dueTargets = new List<(MonitoringTarget Target, WanContext? WanContext)>();
+        foreach (var target in targets.Where(t => IsDue(t, now)))
+        {
+            var context = target.WanContextId is int contextId && contextsById.TryGetValue(contextId, out var c)
+                ? c : null;
+            // Targets in an agent-assigned WAN context are probed by that agent
+            // (which sits behind the right WAN); probing them from here would
+            // measure the wrong path.
+            if (context?.AgentId != null) continue;
+            dueTargets.Add((target, context));
+        }
         if (dueTargets.Count == 0) return;
 
         // Probe in parallel but bounded so we don't fan out to dozens of pings at once on a
         // dense fabric. 8 concurrent is well under what the local executor can handle.
         using var concurrency = new SemaphoreSlim(8);
-        var tasks = dueTargets.Select(t => ProbeTargetAsync(t, concurrency, ct));
+        var tasks = dueTargets.Select(x => ProbeTargetAsync(x.Target, x.WanContext, concurrency, ct));
         await Task.WhenAll(tasks);
     }
 
@@ -1345,14 +1189,17 @@ public class MonitoringCollectionAgent : BackgroundService
         return now - last >= interval;
     }
 
-    private async Task ProbeTargetAsync(MonitoringTarget target, SemaphoreSlim concurrency, CancellationToken ct)
+    private async Task ProbeTargetAsync(MonitoringTarget target, WanContext? wanContext, SemaphoreSlim concurrency, CancellationToken ct)
     {
         await concurrency.WaitAsync(ct);
         try
         {
             _targetLastProbed[target.Id] = DateTime.UtcNow;
 
-            var probeTarget = new ProbeTarget(target.Address, target.ProbeMode, target.Port);
+            // A WAN context's probe source IP rides into the probe (ping -I / TCP
+            // socket bind); the gateway policy-routes that source out the WAN
+            // being measured.
+            var probeTarget = new ProbeTarget(target.Address, target.ProbeMode, target.Port, wanContext?.ProbeSourceIp);
             var vantage = string.IsNullOrEmpty(target.VantagePoint) ? "server" : target.VantagePoint;
             // MVP: only server-side probes. Per-device SSH vantages come with the SSH
             // toolbox device picker (planned next).
@@ -1380,7 +1227,8 @@ public class MonitoringCollectionAgent : BackgroundService
                 success: ping.Success,
                 sent: ping.Sent,
                 received: ping.Received,
-                timestamp: ping.Timestamp);
+                timestamp: ping.Timestamp,
+                wanContext: wanContext?.Name);
 
             // Surface fabric probe results on the dashboard's device cards (5.6). Other
             // target types (WAN, transit) feed cloud nodes on the 3D map; the per-device
@@ -1404,7 +1252,7 @@ public class MonitoringCollectionAgent : BackgroundService
                 // the wizard's re-validation (spec 5.5).
                 try
                 {
-                    await using var db = await _dbFactory.CreateDbContextAsync(ct);
+                    await using var db = await CreateSiteDbAsync(ct);
                     var row = await db.MonitoringTargets.FindAsync(new object[] { target.Id }, ct);
                     if (row != null)
                     {
@@ -1428,9 +1276,13 @@ public class MonitoringCollectionAgent : BackgroundService
         }
     }
 
+    // TargetIds of the two default internet targets created by SeedDefaultTargetsAsync. Kept in
+    // sync with the literals in the seed rows below; used by EnableSeededDefaultTargetsAsync.
+    private static readonly string[] DefaultInternetTargetIds = { "wan-cloudflare-1111", "wan-google-8888" };
+
     private async Task SeedDefaultTargetsAsync(CancellationToken ct)
     {
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteDbAsync(ct);
         var existing = await db.MonitoringTargets.AsNoTracking()
             .Select(t => t.TargetId).ToListAsync(ct);
         var existingSet = new HashSet<string>(existing, StringComparer.OrdinalIgnoreCase);
@@ -1447,7 +1299,10 @@ public class MonitoringCollectionAgent : BackgroundService
                 VantagePoint = "server",
                 PollIntervalSeconds = 10,
                 PingCount = 5,
-                Enabled = true,
+                // External sites seed disabled until an agent is deployed (enabled inline on the
+                // default site and on external sites that already have an agent). See
+                // EnableSeededDefaultTargetsAsync for the enroll-time flip.
+                Enabled = _isDefault || _siteAgentEnrolled,
                 AutoDiscovered = true,
                 AutoLabel = "Cloudflare DNS",
                 CreatedAt = DateTime.UtcNow
@@ -1462,7 +1317,8 @@ public class MonitoringCollectionAgent : BackgroundService
                 VantagePoint = "server",
                 PollIntervalSeconds = 10,
                 PingCount = 5,
-                Enabled = true,
+                // See the Cloudflare row above: disabled on an external site until an agent exists.
+                Enabled = _isDefault || _siteAgentEnrolled,
                 AutoDiscovered = true,
                 AutoLabel = "Google DNS",
                 CreatedAt = DateTime.UtcNow
@@ -1481,10 +1337,48 @@ public class MonitoringCollectionAgent : BackgroundService
         if (added) await db.SaveChangesAsync(ct);
     }
 
+    /// <summary>
+    /// Activate the two seeded default internet targets once an agent is deployed for a
+    /// (non-default) external site. They are seeded disabled while the site has no agent so the
+    /// central server never probes anycast DNS from its own stack and mislabels it as the site's
+    /// ISP latency; once an agent can probe them from inside the network, baseline internet
+    /// monitoring should begin. Only ever touches a default that is still disabled AND has never
+    /// been probed (LastVerified == null): the enroll "transition" re-fires on every process
+    /// restart (the flag is in-memory), and that never-verified guard keeps it from re-enabling a
+    /// default the user has since paused. Default site never calls this (RefreshAgentCoverageAsync
+    /// returns early there).
+    /// </summary>
+    private async Task EnableSeededDefaultTargetsAsync(CancellationToken ct)
+    {
+        try
+        {
+            await using var db = await CreateSiteDbAsync(ct);
+            var rows = await db.MonitoringTargets
+                .Where(t => DefaultInternetTargetIds.Contains(t.TargetId) && !t.Enabled && t.LastVerified == null)
+                .ToListAsync(ct);
+            if (rows.Count == 0) return;
+            foreach (var t in rows) t.Enabled = true;
+            await db.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "Enabled {Count} seeded default internet target(s) for site {Slug} after agent enrollment",
+                rows.Count, _siteSlug);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Enabling seeded default targets on enrollment failed for site {Slug}", _siteSlug);
+        }
+    }
+
     private async Task ReconcileFabricTargetsAsync(CancellationToken ct)
     {
         var devices = await GetMonitorableDevicesAsync(ct);
-        if (devices.Count == 0) return;
+        if (devices.Count == 0)
+        {
+            _logger.LogDebug(
+                "Fabric reconcile for site {Slug}: no monitorable devices to seed targets from (console connected: {Connected})",
+                _siteSlug, _connectionService.IsConnected);
+            return;
+        }
 
         // Gateways need the LAN-side address here for the same reason SNMP does:
         // UniFi's "ip" field is the WAN public IP, which often doesn't answer ping
@@ -1492,7 +1386,7 @@ public class MonitoringCollectionAgent : BackgroundService
         // below also migrates existing targets seeded with the WAN IP.
         var gatewayLanIp = await ResolveGatewayLanIpAsync(ct);
 
-        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+        await using var db = await CreateSiteDbAsync(ct);
         var existingByTargetId = await db.MonitoringTargets
             .Where(t => t.TargetType == MonitoringTargetType.Fabric)
             .ToDictionaryAsync(t => t.TargetId, ct);
@@ -1583,7 +1477,7 @@ public class MonitoringCollectionAgent : BackgroundService
 
     private (double? RateInBps, double? RateOutBps) WriteInterfaceCounters(UniFiDeviceResponse device, InterfaceMetrics iface, DateTime now)
     {
-        var ifName = string.IsNullOrEmpty(iface.Name) ? iface.Description : iface.Name;
+        var ifName = iface.MonitoredName;
         if (string.IsNullOrEmpty(ifName)) return (null, null);
         var mac = NormalizeMac(device.Mac);
 
@@ -1592,8 +1486,8 @@ public class MonitoringCollectionAgent : BackgroundService
         // (which would otherwise inject impossible terabit/sec spikes or poison the
         // baseline - see InterfaceRateCalculator).
         var key = $"{mac}/{ifName}";
-        bool hcCounters = iface.HighSpeed >= 1000 || iface.Speed >= 1_000_000_000;
-        long speedBps = iface.HighSpeed > 0 ? iface.HighSpeed * 1_000_000L : iface.Speed;
+        bool hcCounters = iface.UsesHcCounters;
+        long speedBps = iface.ResolvedSpeedBps;
 
         InterfaceRateCalculator.State? prevState =
             _counterCache.TryGetValue(key, out var cached) ? cached : null;
@@ -1657,6 +1551,9 @@ public class MonitoringCollectionAgent : BackgroundService
         // down or disabled, mark the live port down - UNLESS the SNMP frame counters moved
         // this poll, which proves it is passing traffic and UniFi's state is stale. Scoped to
         // the in-memory live cache; the InfluxDB write above keeps the raw SNMP ifOperStatus.
+        // KEEP IN SYNC with the agent-relayed path in
+        // AgentProbeResultSink.RecordSnmpBatchAsync ("Live port-state resilience for
+        // gateways") - if you adjust one, adjust the other.
         int liveOperStatus = iface.OperStatus;
         if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway && !(rateInBps > 0) && !(rateOutBps > 0))
         {
@@ -1730,7 +1627,7 @@ public class MonitoringCollectionAgent : BackgroundService
                 portMatch = device.PortTable.FirstOrDefault(p => p.PortIdx == iface.Index);
             if (portMatch != null && portMatch.PortIdx > 0)
             {
-                _portRateLatest[(mac, portMatch.PortIdx)] = (rateInBps.Value, rateOutBps.Value);
+                _fabric.SetSnmpPortRate(mac, portMatch.PortIdx, rateInBps.Value, rateOutBps.Value);
             }
         }
 
@@ -1842,16 +1739,7 @@ public class MonitoringCollectionAgent : BackgroundService
 
             try
             {
-                var networks = await _connectionService.Client.GetNetworkConfigsAsync(ct);
-                var defaultLan = networks
-                    .Where(n => n.Purpose == "corporate" && n.Enabled)
-                    .OrderBy(n => n.Vlan ?? 0) // prefer no VLAN (0) first
-                    .FirstOrDefault();
-                string? ip = null;
-                if (!string.IsNullOrEmpty(defaultLan?.DhcpdGateway))
-                    ip = defaultLan!.DhcpdGateway;
-                else if (!string.IsNullOrEmpty(defaultLan?.IpSubnet))
-                    ip = defaultLan!.IpSubnet.Split('/')[0];
+                var ip = await Monitoring.SnmpDeviceRules.ResolveGatewayLanIpAsync(_connectionService.Client, ct);
 
                 _gatewayLanIp = ip;
                 _gatewayLanIpAt = DateTime.UtcNow;
@@ -1870,22 +1758,30 @@ public class MonitoringCollectionAgent : BackgroundService
     }
 
     /// <summary>
-    /// Poll address for a device (SNMP and fabric latency targets). For gateways,
-    /// swap UniFi's WAN public IP for the LAN-side gateway IP so the poll actually
-    /// reaches the device. All other device types use their raw IP from UniFi.
+    /// Poll address for a device (SNMP and fabric latency targets). Rule shared
+    /// with the agent-tunnel SNMP config push via SnmpDeviceRules.
     /// </summary>
-    private static string ResolveSnmpAddress(UniFiDeviceResponse device, string? gatewayLanIp)
-    {
-        if (device.DeviceType == NetworkOptimizer.Core.Enums.DeviceType.Gateway
-            && !string.IsNullOrEmpty(gatewayLanIp))
-        {
-            return gatewayLanIp;
-        }
-        return device.Ip;
-    }
+    private static string ResolveSnmpAddress(UniFiDeviceResponse device, string? gatewayLanIp) =>
+        Monitoring.SnmpDeviceRules.ResolvePollAddress(device, gatewayLanIp);
 
     private async Task<List<UniFiDeviceResponse>> GetMonitorableDevicesAsync(CancellationToken ct)
     {
+        // On an agent site the console reaches the controller through the tunnel and can
+        // read disconnected between operations; reconnect it (as the SNMP push does) so
+        // every tier that enumerates devices - fabric targets, interface name map, device
+        // stats - can. Throttled so a genuinely offline console isn't hammered every tick.
+        if (!_isDefault && !_connectionService.IsConnected
+            && DateTime.UtcNow - _lastConsoleEnsureAt > TimeSpan.FromSeconds(30)
+            && await _connectionService.IsConsoleViaAgentAsync())
+        {
+            _lastConsoleEnsureAt = DateTime.UtcNow;
+            try { await _connectionService.ReconnectAsync(); }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Console reconnect for device fetch failed for site {Slug}", _siteSlug);
+            }
+        }
+
         if (!_connectionService.IsConnected || _connectionService.Client == null)
             return new List<UniFiDeviceResponse>();
 
@@ -1900,9 +1796,8 @@ public class MonitoringCollectionAgent : BackgroundService
                 return _cachedDevices;
 
             var devices = await _connectionService.Client.GetDevicesAsync(ct);
-            var filtered = devices?.Where(d =>
-                d.Adopted && UniFiDeviceStateMap.IsOnline(d.State) && !string.IsNullOrEmpty(d.Ip) && !string.IsNullOrEmpty(d.Mac))
-                .ToList() ?? new List<UniFiDeviceResponse>();
+            var filtered = devices?.Where(Monitoring.SnmpDeviceRules.IsMonitorable).ToList()
+                ?? new List<UniFiDeviceResponse>();
             _cachedDevices = filtered;
             _cachedDevicesAt = DateTime.UtcNow;
 
@@ -1933,6 +1828,35 @@ public class MonitoringCollectionAgent : BackgroundService
         type == NetworkOptimizer.Core.Enums.DeviceType.Gateway
             ? settings.GatewayTempHighC
             : settings.SwitchTempHighC;
+
+    /// <summary>
+    /// Seeds the live SFP cache from the latest persisted <c>sfp</c> points (last 6 h)
+    /// so the Optical tables render immediately after a restart instead of waiting for
+    /// the slow tier. Skips any port the tier has already recorded this run.
+    /// </summary>
+    private async Task SeedSfpLiveCacheAsync(CancellationToken ct)
+    {
+        if (!_influx.IsConfigured) await _influx.ReconfigureAsync(ct);
+        if (!_influx.IsConfigured) return;
+
+        var seeded = 0;
+        foreach (var point in await _influx.QueryLatestSfpAsync(ct))
+        {
+            if (_liveStats.GetSfpStats(point.DeviceMac, point.PortName) != null) continue;
+            _liveStats.RecordSfp(
+                deviceMac: point.DeviceMac,
+                portName: point.PortName,
+                rxDbm: point.RxPowerDbm,
+                txDbm: point.TxPowerDbm,
+                biasMa: point.TxBiasMa,
+                tempC: point.TemperatureC,
+                voltageV: point.VoltageV,
+                timestamp: point.Time);
+            seeded++;
+        }
+        if (seeded > 0)
+            _logger.LogDebug("Seeded {Count} SFP live entries from InfluxDB (site {Site})", seeded, _siteSlug);
+    }
 
     private void CollectSfpForDevice(
         UniFiDeviceResponse device,
@@ -2059,45 +1983,24 @@ public class MonitoringCollectionAgent : BackgroundService
     /// </summary>
     private void NoteSnmpFailure(string normalizedMac)
     {
-        if (string.IsNullOrEmpty(normalizedMac)) return;
-        if (IsSnmpExcluded(normalizedMac)) return;
-
-        var count = _snmpFailures.AddOrUpdate(normalizedMac, 1, (_, prev) => prev + 1);
-        if (count < SnmpFailureThreshold) return;
-
-        if (_snmpExcluded.TryAdd(normalizedMac, DateTime.UtcNow))
+        if (_snmpFailures.NoteFailure(normalizedMac))
         {
             _logger.LogWarning(
-                "Excluding {Mac} from SNMP polling for {Duration} - {Count} consecutive failures. Will retry automatically.",
-                normalizedMac, SnmpExclusionDuration, count);
+                "Excluding {Mac} from SNMP polling for {Duration} - consecutive failures hit the threshold. Will retry automatically.",
+                normalizedMac, _snmpFailures.ExclusionDuration);
         }
     }
 
     private bool IsSnmpExcluded(string normalizedMac)
     {
-        if (!_snmpExcluded.TryGetValue(normalizedMac, out var excludedAt)) return false;
-        if (DateTime.UtcNow - excludedAt < SnmpExclusionDuration) return true;
-        _snmpExcluded.TryRemove(normalizedMac, out _);
-        _snmpFailures.TryRemove(normalizedMac, out _);
-        _logger.LogInformation("SNMP exclusion expired for {Mac}, resuming polling", normalizedMac);
-        return false;
+        var excluded = _snmpFailures.IsExcluded(normalizedMac, out var justExpired);
+        if (justExpired)
+            _logger.LogInformation("SNMP exclusion expired for {Mac}, resuming polling", normalizedMac);
+        return excluded;
     }
 
     /// <summary>Tells the dashboard which devices were dropped from SNMP polling.</summary>
-    public IReadOnlyCollection<string> GetSnmpExcludedDevices() => _snmpExcluded.Keys.ToList();
-
-    /// <summary>
-    /// Read-only check of whether a device is currently excluded, without the
-    /// expiry side effect <see cref="IsSnmpExcluded"/> performs. Safe to call from
-    /// the UI thread when assembling the Setup dashboard.
-    /// </summary>
-    private bool PeekSnmpExcluded(string normalizedMac, out DateTime excludedAt)
-    {
-        if (_snmpExcluded.TryGetValue(normalizedMac, out excludedAt))
-            return DateTime.UtcNow - excludedAt < SnmpExclusionDuration;
-        excludedAt = default;
-        return false;
-    }
+    public IReadOnlyCollection<string> GetSnmpExcludedDevices() => _snmpFailures.ExcludedKeys;
 
     /// <summary>
     /// Per-device SNMP polling status for the Monitoring → Setup dashboard. Uses the
@@ -2108,14 +2011,28 @@ public class MonitoringCollectionAgent : BackgroundService
     public async Task<IReadOnlyList<SnmpDeviceStatus>> GetSnmpDeviceStatusesAsync(CancellationToken ct = default)
     {
         var devices = await GetMonitorableDevicesAsync(ct);
+        // On an agent-covered site the server doesn't poll SNMP locally (the agent does),
+        // so _snmpLastPolled/_snmpFailures stay empty. Fall back to the last time the agent
+        // relayed SNMP data for each device so the status table reflects reality.
+        var agentCovers = AgentCoversCollection();
         var result = new List<SnmpDeviceStatus>(devices.Count);
         foreach (var device in devices)
         {
             var mac = NormalizeMac(device.Mac);
-            var snmpEnabled = !string.IsNullOrEmpty(device.SnmpLocation) || !string.IsNullOrEmpty(device.SnmpContact);
-            var excluded = PeekSnmpExcluded(mac, out var excludedAt);
+            var snmpEnabled = Monitoring.SnmpDeviceRules.HasSnmpEnabled(device);
+            var excluded = _snmpFailures.PeekExcluded(mac, out var excludedAt);
             var hasLastPolled = _snmpLastPolled.TryGetValue(mac, out var lastPolled);
-            _snmpFailures.TryGetValue(mac, out var failures);
+            var failures = _snmpFailures.GetFailureCount(mac);
+
+            if (!hasLastPolled && agentCovers)
+            {
+                var agentSeen = _liveStats.GetSnmpLastSeen(mac);
+                if (agentSeen.HasValue)
+                {
+                    hasLastPolled = true;
+                    lastPolled = agentSeen.Value;
+                }
+            }
 
             SnmpPollState state;
             if (!snmpEnabled) state = SnmpPollState.SnmpDisabled;
@@ -2146,7 +2063,7 @@ public class MonitoringCollectionAgent : BackgroundService
 
         try
         {
-            await using var db = await _dbFactory.CreateDbContextAsync(ct);
+            await using var db = await CreateSiteDbAsync(ct);
             var all = await db.CustomOidConfigurations
                 .Where(c => c.Enabled)
                 .ToListAsync(ct);
@@ -2190,7 +2107,7 @@ public class MonitoringCollectionAgent : BackgroundService
                 {
                     if (ifNameByIdx == null)
                     {
-                        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+                        await using var db = await CreateSiteDbAsync(ct);
                         var mac = NormalizeMac(deviceMac);
                         ifNameByIdx = await db.InterfaceNameMaps
                             .Where(m => m.DeviceMac == mac && m.IfIndex != null)
@@ -2235,12 +2152,7 @@ public class MonitoringCollectionAgent : BackgroundService
         }
     }
 
-    private static object ParseCustomValue(string raw, CustomOidValueType valueType) => valueType switch
-    {
-        CustomOidValueType.Integer => long.TryParse(raw, out var l) ? l : (object)raw,
-        CustomOidValueType.Float => double.TryParse(raw, out var d) ? d : (object)raw,
-        _ => raw
-    };
+    private static object ParseCustomValue(string raw, CustomOidValueType valueType) =>
+        CustomOidValueParser.Parse(raw, valueType);
 
-    private readonly record struct PortByteSnapshot(DateTime Timestamp, long TxBytes, long RxBytes);
 }

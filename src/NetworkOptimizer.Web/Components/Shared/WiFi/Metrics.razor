@@ -429,8 +429,18 @@
 
     private async void OnConnectionChanged()
     {
-        await LoadDataAsync();
-        await InvokeAsync(StateHasChanged);
+        // Fires from a background thread (console reconnect), so marshal the whole
+        // reload onto the dispatcher - LoadDataAsync calls StateHasChanged directly -
+        // and swallow exceptions so this async void handler can't crash the circuit.
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                await LoadDataAsync();
+                StateHasChanged();
+            });
+        }
+        catch { /* component may be disposed */ }
     }
 
     private async Task SelectTimeRange(string range)

@@ -1,0 +1,341 @@
+syntax = "proto3";
+
+option csharp_namespace = "NetworkOptimizer.AgentProtocol";
+
+package networkoptimizer.agent.v1;
+
+// Persistent bidirectional tunnel between an on-site agent and the central
+// Network Optimizer server. The agent dials out (no inbound ports at the
+// remote site), authenticates with its agent key in the first message, then
+// the stream stays open for heartbeats, probe configuration pushes, and probe
+// result batches.
+service AgentTunnel {
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+message AgentMessage {
+  oneof payload {
+    AgentHello hello = 1;
+    AgentHeartbeat heartbeat = 2;
+    ProbeResultBatch probe_results = 3;
+    ProxyOpenResult proxy_open_result = 4;
+    ProxyData proxy_data = 5;
+    ProxyClose proxy_close = 6;
+    SnmpResultBatch snmp_results = 7;
+    Iperf3ClientResult iperf3_result = 8;
+    UwnResult uwn_result = 9;
+    ProbeResponse probe_response = 10;
+    SnmpOidResult snmp_oid_result = 11;
+  }
+}
+
+message ServerMessage {
+  oneof payload {
+    ServerHello hello = 1;
+    ProbeConfig probe_config = 2;
+    ProxyOpen proxy_open = 3;
+    ProxyData proxy_data = 4;
+    ProxyClose proxy_close = 5;
+    SnmpConfig snmp_config = 6;
+    Iperf3ClientRequest iperf3_request = 7;
+    UwnRequest uwn_request = 8;
+    ProbeRequest probe_request = 9;
+    SnmpOidQuery snmp_oid_query = 10;
+    WanSpeedTestConfig wan_speedtest_config = 11;
+  }
+}
+
+// ---- WAN speed test routing (agent /wan/ router) ----
+// The agent serves /wan/ and /wan/<server-ID>/ on its speed-test listener as a
+// small interstitial page that navigates the browser to the mapped external
+// WAN test server (a client-side navigation, so the agent becomes the page's
+// referrer - an HTTP 302 would not). The result post-back then returns to the
+// agent (which sees the real client LAN IP) and site identity comes from the
+// agent relay - no ?site= in any user URL. Pushed after the hello exchange and
+// on the periodic config refresh.
+
+message WanSpeedTestConfig {
+  repeated WanSpeedTestServer servers = 1;
+  // server_id of the server /wan/ (no ID) redirects to; empty = first entry.
+  string default_server_id = 2;
+}
+
+message WanSpeedTestServer {
+  string server_id = 1;
+  string url = 2;
+}
+
+// ---- On-demand SNMP OID test (Monitoring "Test OID" button) ----
+// For agent-covered sites the server can't reach the device directly, so it asks
+// the agent to GET the OID once and return the raw value, correlated by request_id.
+
+message SnmpOidQuery {
+  int64 request_id = 1;
+  string device_ip = 2;
+  string oid = 3;
+}
+
+message SnmpOidResult {
+  int64 request_id = 1;
+  bool success = 2;
+  string value = 3;
+  string error = 4;
+}
+
+// ---- TCP proxying (SSH / UniFi Console reach into the site) ----
+// The server multiplexes raw TCP connections over the tunnel: ProxyOpen asks
+// the agent to dial a site-local host:port, then ProxyData frames flow both
+// ways under a server-assigned connection id until either side closes.
+
+message ProxyOpen {
+  int64 connection_id = 1;
+  string host = 2;
+  int32 port = 3;
+}
+
+message ProxyOpenResult {
+  int64 connection_id = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+message ProxyData {
+  int64 connection_id = 1;
+  bytes data = 2;
+}
+
+message ProxyClose {
+  int64 connection_id = 1;
+}
+
+// First message on every connection. The server closes the stream with
+// UNAUTHENTICATED if the key does not resolve to an enabled, enrolled agent.
+message AgentHello {
+  string agent_key = 1;
+  string version = 2;
+  string lan_ip = 3;
+}
+
+message ServerHello {
+  string site_slug = 1;
+  string agent_name = 2;
+  int32 heartbeat_interval_seconds = 3;
+}
+
+message AgentHeartbeat {
+  int64 timestamp_unix_ms = 1;
+}
+
+// Full replacement set of probe targets the agent should run. Sent right
+// after the hello exchange and again whenever the site's monitoring targets
+// change.
+message ProbeConfig {
+  repeated ProbeTargetSpec targets = 1;
+}
+
+message ProbeTargetSpec {
+  string target_id = 1;
+  string address = 2;
+  // icmp | tcp (matches ProbeMode on the server)
+  string probe_mode = 3;
+  // tcp probes only; 0 = unset
+  int32 port = 4;
+  int32 poll_interval_seconds = 5;
+  int32 ping_count = 6;
+  // Informational for agent logs; the server re-derives type at write time.
+  string target_type = 7;
+  // Optional source address to bind probes to (multi-WAN policy routing).
+  string source_ip = 8;
+}
+
+message ProbeResultBatch {
+  repeated ProbeResult results = 1;
+}
+
+// ---- SNMP monitoring at the site ----
+// The server builds the config from the site's monitoring settings and its
+// console's device list, and pushes it over the tunnel; the agent polls the
+// devices locally and streams raw counters back. Rate computation and storage
+// happen server-side. Credentials ride the tunnel, which is expected to run
+// over a VPN or otherwise trusted link.
+
+message SnmpConfig {
+  bool enabled = 1;
+  string version = 2;   // v2c | v3
+  string community = 3; // v2c
+  string username = 4;  // v3
+  string auth_password = 5;
+  int32 fast_interval_seconds = 6;
+  int32 medium_interval_seconds = 7;
+  repeated SnmpDeviceSpec devices = 8;
+  // User-defined OIDs to poll alongside the standard metrics, matching the
+  // directly-monitored medium tier's custom-OID collection.
+  repeated SnmpCustomOid custom_oids = 9;
+}
+
+message SnmpCustomOid {
+  string device_mac = 1;
+  string oid = 2;
+  string field_name = 3;
+  int32 value_type = 4; // CustomOidValueType: 0=Integer, 1=Float, 2=String
+  int32 scope = 5;      // CustomOidScope: 0=DeviceLevel (scalar), 1=InterfaceLevel (walked)
+}
+
+message SnmpDeviceSpec {
+  string mac = 1;
+  string ip = 2;
+  string name = 3;
+  string device_type = 4; // gateway | switch | ap
+}
+
+message SnmpResultBatch {
+  repeated SnmpInterfaceSample interfaces = 1;
+  repeated SnmpDeviceHealthSample health = 2;
+  repeated SnmpCustomOidResult custom_oids = 3;
+}
+
+// Raw custom-OID poll results. The agent SNMP-gets/walks the OID; the server parses
+// the value (per value_type), resolves interface indices to names, and writes to
+// Influx - keeping parsing and storage identical to the directly-monitored path.
+message SnmpCustomOidResult {
+  string device_mac = 1;
+  string field_name = 2;
+  int32 value_type = 3;
+  int32 scope = 4;
+  string value = 5;                          // DeviceLevel: the scalar value
+  map<string, string> interface_values = 6;  // InterfaceLevel: ifIndex -> raw value
+  int64 timestamp_unix_ms = 7;
+}
+
+message SnmpInterfaceSample {
+  string device_mac = 1;
+  string if_name = 2;
+  string port_id = 3;
+  int64 in_octets = 4;
+  int64 out_octets = 5;
+  int64 speed_bps = 6;
+  bool hc_counters = 7;
+  int32 oper_status = 8;
+  int64 errors_in = 9;
+  int64 errors_out = 10;
+  int64 discards_in = 11;
+  int64 discards_out = 12;
+  int64 ucast_pkts_in = 13;
+  int64 ucast_pkts_out = 14;
+  int64 mcast_pkts_in = 15;
+  int64 mcast_pkts_out = 16;
+  int64 bcast_pkts_in = 17;
+  int64 bcast_pkts_out = 18;
+  int64 timestamp_unix_ms = 19;
+  // Raw SNMP ifDescr - the server classifies fabric-sum membership (physical ethN
+  // only on gateways) and mesh backhaul (vwiresta*) off this, matching the
+  // directly-monitored path's iface.Description.
+  string if_descr = 20;
+  // Raw SNMP ifIndex - the server correlates switch ports by PortIdx == ifIndex,
+  // matching the directly-monitored path's iface.Index. 0 when unknown (older agents).
+  int32 if_index = 21;
+}
+
+message SnmpDeviceHealthSample {
+  string device_mac = 1;
+  string device_type = 2;
+  optional double cpu_percent = 3;
+  optional int64 memory_total_kb = 4;
+  optional int64 memory_used_kb = 5;
+  optional double memory_used_percent = 6;
+  optional double temperature_c = 7;
+  optional int64 uptime_seconds = 8;
+  int64 timestamp_unix_ms = 9;
+}
+
+message ProbeResult {
+  string target_id = 1;
+  int64 timestamp_unix_ms = 2;
+  bool success = 3;
+  int32 sent = 4;
+  int32 received = 5;
+  double loss_percent = 6;
+  optional double rtt_min_ms = 7;
+  optional double rtt_avg_ms = 8;
+  optional double rtt_max_ms = 9;
+  optional double jitter_ms = 10;
+}
+
+// ---- LAN iperf3 client tests run at the site ----
+// The central server can't reach a secondary site's LAN devices directly, so
+// it asks the agent to run the iperf3 client locally against a site-local
+// target and return the raw `iperf3 -J` output. The server still orchestrates
+// the test (starting/stopping the device's iperf3 server over the tunnelled
+// SSH path) and does all parsing, path analysis, and storage; only the client
+// run itself moves to the agent so throughput reflects the site LAN. Requests
+// are correlated by request_id, mirroring the proxy connection_id pattern.
+
+message Iperf3ClientRequest {
+  int64 request_id = 1;
+  string host = 2;
+  int32 port = 3;
+  int32 duration_seconds = 4;
+  int32 parallel_streams = 5;
+  // Reverse mode (-R): server sends to client, i.e. the "To Device" direction.
+  bool reverse = 6;
+}
+
+message Iperf3ClientResult {
+  int64 request_id = 1;
+  bool success = 2;
+  // The iperf3 -J JSON on success, or an error message otherwise. Matches the
+  // (success, output) contract the server's local iperf3 run already returns.
+  string output = 3;
+}
+
+// ---- UWN WAN speed test run at the site ----
+// The UWN WAN speed test measures the internet connection from the host running
+// the test binary. For a secondary site the central server's own WAN is the
+// wrong link, so it asks the agent to run the site's uwnspeedtest binary and
+// return the raw JSON the binary prints on stdout; the server parses it and
+// stores the result under that site, exactly as it does for a local run. Mirrors
+// the iperf3 client request/result correlation by request_id.
+
+message UwnRequest {
+  int64 request_id = 1;
+  int32 streams = 2;
+  int32 servers = 3;
+  int32 duration_seconds = 4;
+  int32 timeout_seconds = 5;
+}
+
+message UwnResult {
+  int64 request_id = 1;
+  bool success = 2;
+  // The uwnspeedtest JSON stdout on success, or an error message otherwise.
+  // Matches the (success, output) contract the server's local run returns.
+  string output = 3;
+}
+
+// ---- On-demand ping/traceroute run from the agent host ----
+// Network Tools and Upstream Discovery both need a probe vantage ON the site's
+// network. The central server can't reach a secondary site's LAN/WAN path, so it
+// asks the agent to run the ping/traceroute from its own host (the on-site
+// equivalent of running from the NO Server on the home site) and return the
+// result. The agent runs the SAME LocalProbeExecutor the server uses, serialized
+// to JSON; the server deserializes into PingProbeResult / TracerouteResult.
+// Correlated by request_id, mirroring the iperf3 pattern.
+
+message ProbeRequest {
+  int64 request_id = 1;
+  string address = 2;
+  string mode = 3;        // icmp | tcp | udp (ProbeMode)
+  int32 port = 4;         // TCP mode
+  string source_ip = 5;   // source/interface bind (WAN selection), optional
+  bool traceroute = 6;    // false = ping burst, true = traceroute
+  int32 count = 7;        // ping count (ping only)
+  int32 max_hops = 8;     // traceroute max hops
+}
+
+message ProbeResponse {
+  int64 request_id = 1;
+  bool success = 2;
+  string error = 3;
+  // Serialized PingProbeResult (ping) or TracerouteResult (traceroute) on success.
+  string result_json = 4;
+}

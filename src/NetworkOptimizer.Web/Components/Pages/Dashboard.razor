@@ -36,6 +36,8 @@
     <p class="page-description">Network overview and health status</p>
 </div>
 
+<SitesOverviewCard />
+
 @if (!string.IsNullOrEmpty(_editToast))
 {
     <div class="edit-toast">@_editToast</div>
@@ -57,24 +59,50 @@
 
 @if (!ConnectionService.IsConnected && ConnectionService.IsInitialized)
 {
-    <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
-        <div class="banner-content">
-            <span class="banner-icon">!</span>
-            <div class="banner-text">
-                @if (!string.IsNullOrEmpty(ConnectionService.LastError))
-                {
-                    <strong>Connection Error</strong>
+    @if (ConnectionService.IsAwaitingAgent)
+    {
+        <div class="connection-banner">
+            <div class="banner-content">
+                <span class="banner-icon">!</span>
+                <div class="banner-text">
+                    <strong>Waiting for the site's agent</strong>
                     <span>@ConnectionService.LastError</span>
-                }
-                else
-                {
-                    <strong>Not Connected</strong>
-                    <span>Connect to your UniFi Console (Controller) to view network data.</span>
-                }
+                </div>
+                <button class="btn btn-primary" @onclick="RefreshConnectionAsync" disabled="@_refreshingConnection">
+                    @if (_refreshingConnection)
+                    {
+                        <span class="spinner-sm"></span>
+                        <span>Refreshing...</span>
+                    }
+                    else
+                    {
+                        <span>Refresh</span>
+                    }
+                </button>
             </div>
-            <a href="/settings" class="btn btn-primary">@(!string.IsNullOrEmpty(ConnectionService.LastError) ? "Check Settings" : "Connect Now")</a>
         </div>
-    </div>
+    }
+    else
+    {
+        <div class="connection-banner @(!string.IsNullOrEmpty(ConnectionService.LastError) ? "connection-error" : "")">
+            <div class="banner-content">
+                <span class="banner-icon">!</span>
+                <div class="banner-text">
+                    @if (!string.IsNullOrEmpty(ConnectionService.LastError))
+                    {
+                        <strong>Connection Error</strong>
+                        <span>@ConnectionService.LastError</span>
+                    }
+                    else
+                    {
+                        <strong>Not Connected</strong>
+                        <span>Connect to your UniFi Console (Controller) to view network data.</span>
+                    }
+                </div>
+                <a href="/settings" class="btn btn-primary">@(!string.IsNullOrEmpty(ConnectionService.LastError) ? "Check Settings" : "Connect Now")</a>
+            </div>
+        </div>
+    }
 }
 
 <NetworkOptimizer.Web.Components.Shared.UpdateChecker />
@@ -984,15 +1012,43 @@
 
     private async void OnConnectionChanged()
     {
-        _sqmPanelKey++;
-        _alertsListKey++;
-        await Task.WhenAll(
-            LoadDashboardData(),
-            LoadSpeedTestData(),
-            LoadWanTestData(),
-            LoadThreatData()
-        );
-        await InvokeAsync(StateHasChanged);
+        // Fires from a background thread (console reconnect), so marshal the whole
+        // reload onto the dispatcher and swallow exceptions so this async void
+        // handler can't crash the circuit.
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                _sqmPanelKey++;
+                _alertsListKey++;
+                await Task.WhenAll(
+                    LoadDashboardData(),
+                    LoadSpeedTestData(),
+                    LoadWanTestData(),
+                    LoadThreatData()
+                );
+                StateHasChanged();
+            });
+        }
+        catch { /* component may be disposed */ }
+    }
+
+    private bool _refreshingConnection;
+
+    // "Refresh" on the agent-wait banner: re-attempt the console connection now (the
+    // agent may have just come online). On success, ReconnectAsync fires
+    // OnConnectionChanged, which reloads the dashboard; otherwise the banner stays.
+    private async Task RefreshConnectionAsync()
+    {
+        _refreshingConnection = true;
+        try
+        {
+            await ConnectionService.ReconnectAsync();
+        }
+        finally
+        {
+            _refreshingConnection = false;
+        }
     }
 
     private async Task LoadAllDataAsync()

@@ -254,6 +254,9 @@ For multi-site deployments, each remote site runs a lightweight on-site agent th
 
 Install it with Docker or as a bare-metal systemd service. Per-site one-liners are generated in the web UI under **Settings > Multi-Site > (site) > Agents > Set up agent**. See the [Agent Deployment Guide](../src/NetworkOptimizer.Agent/README.md) for the full walkthrough, all options, and reverse-proxy configuration.
 
+**Licensing:** Personal use on up to 3 sites is free and never contacts a license server - nothing phones home. Running more than 3 sites requires a license key (entered under **Settings > Application > Licensing**); activating or renewing a key makes an outbound HTTPS request from the central server to `licensing.ozarkconnect.net`. If activation reports the license server as unreachable, check that your egress firewall rules allow HTTPS (443) to that hostname. Entitlements are cached and verified locally, so a license server outage never disables your sites.
+
+**Networking:** The agent runs with host networking by default so its probes see the site's real network position and site clients can reach the LAN speed test on the agent host's address. It auto-detects that LAN IPv4; if it picks the wrong one (Docker bridge mode instead of host, or a multi-NIC host), set `NO_AGENT_LAN_IP=<ip>` in the agent's environment to override it.
 ## Pre-Deployment Checklist
 
 - [ ] Docker and Docker Compose installed
@@ -859,6 +862,35 @@ chmod 600 .env
 # Data directory contains the database with stored credentials
 chmod 700 data/
 ```
+
+### Credential encryption key
+
+Network Optimizer encrypts stored secrets (UniFi credentials, gateway SSH passwords, alert-channel secrets) at rest with a per-install key. By default that key lives in the data directory next to the database (`data/.credential_key`), so **a copy of the data volume - including any backup - can decrypt everything.** Treat the data volume accordingly: back it up encrypted, restrict access, and don't sync it to plain cloud storage.
+
+To keep the key off the data volume, point `NO_CREDENTIAL_KEY_FILE` at a path outside it - most cleanly a Docker secret:
+
+```yaml
+# docker-compose.yml
+services:
+  network-optimizer:
+    environment:
+      - NO_CREDENTIAL_KEY_FILE=/run/secrets/credential_key
+    secrets:
+      - credential_key
+secrets:
+  credential_key:
+    file: ./credential_key   # created once, kept out of the repo and out of data backups
+```
+
+Create the key once, out of band, before first start:
+
+```bash
+head -c 64 /dev/urandom > credential_key && chmod 600 credential_key
+```
+
+Now a leak of the data volume no longer includes the key. **Migration note:** to switch an *existing* install to `NO_CREDENTIAL_KEY_FILE`, copy the current `data/.credential_key` bytes into the new location first - a fresh key cannot decrypt already-stored secrets.
+
+**Config exports are secret too.** A `.nopt` config export bundles the credential key so the imported backup can decrypt its own secrets, and its file-level encryption is light obfuscation rather than a real barrier. So treat `.nopt` files exactly like the data volume - they effectively contain your stored credentials. Store and transfer them accordingly.
 
 ### Network Access
 

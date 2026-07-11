@@ -19,13 +19,15 @@ namespace NetworkOptimizer.Web.Services;
 
 public class AuditService
 {
-    // Cache keys for IMemoryCache
-    private const string CacheKeyLastAuditResult = "AuditService_LastAuditResult";
-    private const string CacheKeyLastAuditTime = "AuditService_LastAuditTime";
-    private const string CacheKeyLastAuditId = "AuditService_LastAuditId";
-    private const string CacheKeyDismissedIssues = "AuditService_DismissedIssues";
-    private const string CacheKeyDismissedIssuesLoaded = "AuditService_DismissedIssuesLoaded";
-    private const string CacheKeyIsRunning = "AuditService_IsRunning";
+    // Cache keys for IMemoryCache, scoped per site so the app-wide cache never
+    // leaks one site's audit state (score, findings, dismissals, running flag)
+    // into another when switching sites.
+    private string CacheKeyLastAuditResult => $"AuditService_LastAuditResult:{_siteContext.Slug}";
+    private string CacheKeyLastAuditTime => $"AuditService_LastAuditTime:{_siteContext.Slug}";
+    private string CacheKeyLastAuditId => $"AuditService_LastAuditId:{_siteContext.Slug}";
+    private string CacheKeyDismissedIssues => $"AuditService_DismissedIssues:{_siteContext.Slug}";
+    private string CacheKeyDismissedIssuesLoaded => $"AuditService_DismissedIssuesLoaded:{_siteContext.Slug}";
+    private string CacheKeyIsRunning => $"AuditService_IsRunning:{_siteContext.Slug}";
 
     /// <summary>
     /// Whether an audit is currently running. Uses IMemoryCache so it's visible
@@ -41,32 +43,43 @@ public class AuditService
     private readonly UniFiConnectionService _connectionService;
     private readonly ConfigAuditEngine _auditEngine;
     private readonly IAuditRepository _auditRepository;
-    private readonly SystemSettingsService _settingsService;
+    // Scoped settings repository (NOT the SystemSettingsService singleton): it shares
+    // this service's scope, so a schedule executor's OverrideSite pin carries through
+    // and a scheduled audit reads the audited site's own audit:* tuning. The singleton
+    // creates its own unpinned scope, which resolves to the default site in background
+    // contexts.
+    private readonly ISettingsRepository _settingsRepository;
     private readonly FingerprintDatabaseService _fingerprintService;
     private readonly PdfStorageService _pdfStorageService;
     private readonly IMemoryCache _cache;
     private readonly Audit.Analyzers.FirewallRuleParser _firewallParser;
     private readonly IAlertEventBus? _alertEventBus;
     private readonly IThreatRepository? _threatRepository;
+    private readonly SiteContextService _siteContext;
+    private readonly Licensing.LicenseStateService _licenseState;
 
     public AuditService(
         ILogger<AuditService> logger,
         UniFiConnectionService connectionService,
         ConfigAuditEngine auditEngine,
         IAuditRepository auditRepository,
-        SystemSettingsService settingsService,
+        ISettingsRepository settingsRepository,
         FingerprintDatabaseService fingerprintService,
         PdfStorageService pdfStorageService,
         IMemoryCache cache,
         Audit.Analyzers.FirewallRuleParser firewallParser,
+        SiteContextService siteContext,
+        Licensing.LicenseStateService licenseState,
         IAlertEventBus? alertEventBus = null,
         IThreatRepository? threatRepository = null)
     {
+        _siteContext = siteContext;
+        _licenseState = licenseState;
         _logger = logger;
         _connectionService = connectionService;
         _auditEngine = auditEngine;
         _auditRepository = auditRepository;
-        _settingsService = settingsService;
+        _settingsRepository = settingsRepository;
         _fingerprintService = fingerprintService;
         _pdfStorageService = pdfStorageService;
         _cache = cache;
@@ -172,17 +185,17 @@ public class AuditService
     {
         try
         {
-            var appleStreaming = await _settingsService.GetAsync("audit:allowAppleStreamingOnMainNetwork");
-            var allStreaming = await _settingsService.GetAsync("audit:allowAllStreamingOnMainNetwork");
-            var nameBrandTVs = await _settingsService.GetAsync("audit:allowNameBrandTVsOnMainNetwork");
-            var allTVs = await _settingsService.GetAsync("audit:allowAllTVsOnMainNetwork");
-            var mediaPlayers = await _settingsService.GetAsync("audit:allowMediaPlayersOnMainNetwork");
-            var printers = await _settingsService.GetAsync("audit:allowPrintersOnMainNetwork");
-            var dnatExcludedVlans = await _settingsService.GetAsync("audit:dnatExcludedVlans");
-            var piholeEndpoint = await _settingsService.GetAsync("audit:piholeManagementPort");
-            var trustedDnsTargets = await _settingsService.GetAsync("audit:trustedDnsRedirectTargets");
-            var unusedPortDays = await _settingsService.GetAsync("audit:unusedPortInactivityDays");
-            var namedPortDays = await _settingsService.GetAsync("audit:namedPortInactivityDays");
+            var appleStreaming = await _settingsRepository.GetSystemSettingAsync("audit:allowAppleStreamingOnMainNetwork");
+            var allStreaming = await _settingsRepository.GetSystemSettingAsync("audit:allowAllStreamingOnMainNetwork");
+            var nameBrandTVs = await _settingsRepository.GetSystemSettingAsync("audit:allowNameBrandTVsOnMainNetwork");
+            var allTVs = await _settingsRepository.GetSystemSettingAsync("audit:allowAllTVsOnMainNetwork");
+            var mediaPlayers = await _settingsRepository.GetSystemSettingAsync("audit:allowMediaPlayersOnMainNetwork");
+            var printers = await _settingsRepository.GetSystemSettingAsync("audit:allowPrintersOnMainNetwork");
+            var dnatExcludedVlans = await _settingsRepository.GetSystemSettingAsync("audit:dnatExcludedVlans");
+            var piholeEndpoint = await _settingsRepository.GetSystemSettingAsync("audit:piholeManagementPort");
+            var trustedDnsTargets = await _settingsRepository.GetSystemSettingAsync("audit:trustedDnsRedirectTargets");
+            var unusedPortDays = await _settingsRepository.GetSystemSettingAsync("audit:unusedPortInactivityDays");
+            var namedPortDays = await _settingsRepository.GetSystemSettingAsync("audit:namedPortInactivityDays");
 
             options.AllowAppleStreamingOnMainNetwork = appleStreaming?.ToLower() == "true";
             options.AllowAllStreamingOnMainNetwork = allStreaming?.ToLower() == "true";
@@ -209,7 +222,7 @@ public class AuditService
             options.NamedPortInactivityDays = int.TryParse(namedPortDays, out var namedDays) && namedDays > 0 ? namedDays : 45;
 
             // Network purpose overrides
-            var purposeOverridesJson = await _settingsService.GetAsync("audit:networkPurposeOverrides");
+            var purposeOverridesJson = await _settingsRepository.GetSystemSettingAsync("audit:networkPurposeOverrides");
             if (!string.IsNullOrEmpty(purposeOverridesJson))
             {
                 try
@@ -356,7 +369,7 @@ public class AuditService
     {
         try
         {
-            var json = await _settingsService.GetAsync("audit:networkPurposeOverrides");
+            var json = await _settingsRepository.GetSystemSettingAsync("audit:networkPurposeOverrides");
             if (!string.IsNullOrEmpty(json))
             {
                 return JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
@@ -385,7 +398,7 @@ public class AuditService
             ? JsonSerializer.Serialize(overrides)
             : null;
 
-        await _settingsService.SetAsync("audit:networkPurposeOverrides", json);
+        await _settingsRepository.SaveSystemSettingAsync("audit:networkPurposeOverrides", json);
         _logger.LogInformation("Saved network purpose override: {NetworkId} = {Purpose}", networkId, purpose ?? "(removed)");
     }
 
@@ -610,6 +623,7 @@ public class AuditService
             await _alertEventBus.PublishAsync(new AlertEvent
             {
                 EventType = "audit.completed",
+                SiteSlug = _siteContext.IsDefault ? null : _siteContext.Slug,
                 Severity = activeCritical > 0 ? AlertSeverity.Error : AlertSeverity.Info,
                 Source = "audit",
                 Title = $"Security audit completed - Score: {result.Score}",
@@ -637,6 +651,7 @@ public class AuditService
                     await _alertEventBus.PublishAsync(new AlertEvent
                     {
                         EventType = "audit.score_dropped",
+                        SiteSlug = _siteContext.IsDefault ? null : _siteContext.Slug,
                         Severity = dropPercent >= 25 ? AlertSeverity.Critical : AlertSeverity.Warning,
                         Source = "audit",
                         Title = $"Audit score dropped {drop} points ({previousScore.Value} → {result.Score})",
@@ -665,6 +680,7 @@ public class AuditService
                 await _alertEventBus.PublishAsync(new AlertEvent
                 {
                     EventType = "audit.critical_findings",
+                    SiteSlug = _siteContext.IsDefault ? null : _siteContext.Slug,
                     Severity = AlertSeverity.Critical,
                     Source = "audit",
                     Title = $"{activeCritical} critical security findings detected",
@@ -1115,6 +1131,7 @@ public class AuditService
 
     public async Task<AuditResult> RunAuditAsync(AuditOptions options)
     {
+        Licensing.LicenseGuard.EnsureOperational(_licenseState, _siteContext.Slug);
         IsRunning = true;
         try
         {

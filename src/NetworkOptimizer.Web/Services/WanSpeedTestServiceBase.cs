@@ -16,6 +16,10 @@ public record WanTestMetadata(string ServerInfo, string Location, string? WanIp)
 /// <summary>
 /// Base class for server-side WAN speed test services (Cloudflare, UWN).
 /// Provides thread-safe state management, result CRUD, and background path analysis.
+/// Instances can be site-bound: result CRUD reads and writes that site's database.
+/// Running a test stays default-site-only - the test binary executes on THIS host,
+/// so it can only ever measure this server's own WAN; remote sites' WANs are
+/// measured by the gateway test running on their own gateway.
 /// </summary>
 public abstract class WanSpeedTestServiceBase
 {
@@ -24,6 +28,13 @@ public abstract class WanSpeedTestServiceBase
     protected readonly ILogger Logger;
     protected readonly Iperf3ServerService Iperf3Server;
     private readonly IAlertEventBus? _alertEventBus;
+    private readonly NetworkOptimizer.Storage.Services.SiteDbContextFactory? _siteDbFactory;
+
+    /// <summary>Site this instance serves; results are stored in and read from its database.</summary>
+    protected string SiteSlug { get; }
+
+    /// <summary>Whether this instance serves the default site.</summary>
+    protected bool IsDefaultSite { get; }
 
     // Observable test state (polled by UI components)
     private readonly object _lock = new();
@@ -75,13 +86,33 @@ public abstract class WanSpeedTestServiceBase
         INetworkPathAnalyzer pathAnalyzer,
         ILogger logger,
         Iperf3ServerService iperf3Server,
-        IAlertEventBus? alertEventBus = null)
+        IAlertEventBus? alertEventBus = null,
+        NetworkOptimizer.Storage.Services.SiteDbContextFactory? siteDbFactory = null,
+        string siteSlug = SiteManagementService.DefaultSiteSlug,
+        Licensing.LicenseStateService? licenseState = null)
     {
         DbFactory = dbFactory;
         PathAnalyzer = pathAnalyzer;
         Logger = logger;
         Iperf3Server = iperf3Server;
         _alertEventBus = alertEventBus;
+        _siteDbFactory = siteDbFactory;
+        _licenseState = licenseState;
+        SiteSlug = string.IsNullOrEmpty(siteSlug) ? SiteManagementService.DefaultSiteSlug : siteSlug;
+        IsDefaultSite = SiteSlug == SiteManagementService.DefaultSiteSlug;
+    }
+
+    private readonly Licensing.LicenseStateService? _licenseState;
+
+    /// <summary>False when license enforcement blocks operations for this instance's site.</summary>
+    protected bool IsSiteLicenseOperational => _licenseState?.IsSiteOperational(SiteSlug) ?? true;
+
+    /// <summary>Context for the database holding this instance's site data.</summary>
+    protected async Task<NetworkOptimizerDbContext> CreateSiteDbAsync(CancellationToken ct = default)
+    {
+        if (!IsDefaultSite && _siteDbFactory != null)
+            return _siteDbFactory.CreateForSite(SiteSlug, isDefault: false);
+        return await DbFactory.CreateDbContextAsync(ct);
     }
 
     /// <summary>
@@ -94,6 +125,27 @@ public abstract class WanSpeedTestServiceBase
         bool maxMode = false,
         CancellationToken cancellationToken = default)
     {
+        if (!IsSiteLicenseOperational)
+        {
+            Logger.LogWarning("WAN speed test refused: site {Site} is license-restricted", SiteSlug);
+            lock (_lock) { _currentPhase = "Error"; _currentPercent = 0; _currentStatus = Licensing.LicenseGuard.RestrictedMessage; }
+            onProgress?.Invoke(("Error", 0, Licensing.LicenseGuard.RestrictedMessage));
+            return null;
+        }
+
+        if (!await CanRunForSiteAsync())
+        {
+            // The test binary runs on this host, so it measures this server's own
+            // WAN - storing that as another site's result would be wrong data.
+            // Subclasses that can run the test at the site's agent override
+            // CanRunForSiteAsync to allow it (see UwnSpeedTestService).
+            const string message = "Server-side WAN speed tests measure this server's own WAN and are not available for other sites. Use a gateway test instead.";
+            Logger.LogWarning("Server-side WAN speed test refused for site {Site}", SiteSlug);
+            lock (_lock) { _currentPhase = "Error"; _currentPercent = 0; _currentStatus = message; }
+            onProgress?.Invoke(("Error", 0, message));
+            return null;
+        }
+
         lock (_lock)
         {
             if (_isRunning)
@@ -127,7 +179,7 @@ public abstract class WanSpeedTestServiceBase
             if (result == null) return null;
 
             // Save to DB
-            await using var db = await DbFactory.CreateDbContextAsync(cancellationToken);
+            await using var db = await CreateSiteDbAsync(cancellationToken);
             db.Iperf3Results.Add(result);
             await db.SaveChangesAsync(cancellationToken);
             var resultId = result.Id;
@@ -135,7 +187,7 @@ public abstract class WanSpeedTestServiceBase
             lock (_lock) _lastCompletedResult = result;
 
             // Publish alert event
-            await PublishWanAlertAsync(result);
+            await WanSpeedAlertPublisher.PublishAsync(_alertEventBus, result, () => CreateSiteDbAsync(), Logger);
 
             // Trigger background path analysis
             var wanIp = LastMetadata?.WanIp;
@@ -161,7 +213,7 @@ public abstract class WanSpeedTestServiceBase
             try
             {
                 var failedResult = CreateFailedResult(ex.Message);
-                await using var db = await DbFactory.CreateDbContextAsync();
+                await using var db = await CreateSiteDbAsync();
                 db.Iperf3Results.Add(failedResult);
                 await db.SaveChangesAsync();
                 return failedResult;
@@ -178,6 +230,15 @@ public abstract class WanSpeedTestServiceBase
             lock (_lock) _isRunning = false;
         }
     }
+
+    /// <summary>
+    /// Whether this service may run a test for its site. The base allows only the
+    /// default site, because the test binary runs on this host and can only
+    /// measure this server's own WAN. Subclasses that can dispatch the run to the
+    /// site's agent (which measures the site's WAN) override this to also allow
+    /// their agent-backed sites.
+    /// </summary>
+    protected virtual Task<bool> CanRunForSiteAsync() => Task.FromResult(IsDefaultSite);
 
     /// <summary>
     /// Subclass implements the actual test phases (metadata, latency, throughput).
@@ -199,7 +260,7 @@ public abstract class WanSpeedTestServiceBase
     /// <summary>Get recent WAN speed test results for this service's directions.</summary>
     public async Task<List<Iperf3Result>> GetResultsAsync(int count = 50, int hours = 0)
     {
-        await using var db = await DbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var directions = OwnedDirections;
         var query = db.Iperf3Results
             .Where(r => directions.Contains(r.Direction));
@@ -243,7 +304,7 @@ public abstract class WanSpeedTestServiceBase
     /// <summary>Delete a WAN speed test result by ID.</summary>
     public async Task<bool> DeleteResultAsync(int id)
     {
-        await using var db = await DbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null || !OwnedDirections.Contains(result.Direction))
             return false;
@@ -257,7 +318,7 @@ public abstract class WanSpeedTestServiceBase
     /// <summary>Reassigns the WAN interface for a speed test result and re-runs path analysis.</summary>
     public async Task<bool> UpdateWanAssignmentAsync(int id, string wanNetworkGroup, string? wanName)
     {
-        await using var db = await DbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null || !OwnedDirections.Contains(result.Direction))
             return false;
@@ -276,7 +337,7 @@ public abstract class WanSpeedTestServiceBase
     /// <summary>Updates the notes for a WAN speed test result.</summary>
     public async Task<bool> UpdateNotesAsync(int id, string? notes)
     {
-        await using var db = await DbFactory.CreateDbContextAsync();
+        await using var db = await CreateSiteDbAsync();
         var result = await db.Iperf3Results.FindAsync(id);
         if (result == null || !OwnedDirections.Contains(result.Direction))
             return false;
@@ -293,7 +354,7 @@ public abstract class WanSpeedTestServiceBase
         {
             await Task.Delay(TimeSpan.FromSeconds(1));
 
-            await using var db = await DbFactory.CreateDbContextAsync();
+            await using var db = await CreateSiteDbAsync();
             var result = await db.Iperf3Results.FindAsync(resultId);
             if (result == null) return;
 
@@ -319,85 +380,6 @@ public abstract class WanSpeedTestServiceBase
         catch (Exception ex)
         {
             Logger.LogWarning(ex, "Failed to analyze path for WAN speed test result {Id}", resultId);
-        }
-    }
-
-    private async Task PublishWanAlertAsync(Iperf3Result result)
-    {
-        if (_alertEventBus == null) return;
-
-        try
-        {
-            var downloadMbps = result.DownloadMbps;
-            var uploadMbps = result.UploadMbps;
-            var wanName = result.WanName ?? "Unknown";
-
-            await _alertEventBus.PublishAsync(new AlertEvent
-            {
-                EventType = "wan.speed_completed",
-                Severity = AlertSeverity.Info,
-                Source = "wan",
-                Title = $"WAN Speed Test: {downloadMbps:F1} / {uploadMbps:F1} Mbps",
-                Message = $"Download: {downloadMbps:F1} Mbps, Upload: {uploadMbps:F1} Mbps ({Direction})",
-                SourceUrl = $"/wan-speedtest#result-{result.Id}",
-                Context = new Dictionary<string, string>
-                {
-                    ["download_mbps"] = downloadMbps.ToString("F1"),
-                    ["upload_mbps"] = uploadMbps.ToString("F1"),
-                    ["direction"] = Direction.ToString(),
-                    ["wan_name"] = wanName
-                }
-            });
-
-            // Check for degradation vs recent average (same WAN, same direction)
-            try
-            {
-                await using var db = DbFactory.CreateDbContext();
-                var recent = await db.Iperf3Results
-                    .AsNoTracking()
-                    .Where(r => r.Direction == Direction && r.WanName == result.WanName && r.Id != result.Id && r.Success)
-                    .OrderByDescending(r => r.TestTime)
-                    .Take(5)
-                    .ToListAsync();
-
-                if (recent.Count >= 3)
-                {
-                    var avgDownload = recent.Average(r => r.DownloadMbps);
-                    var dropPercent = avgDownload > 0 ? (avgDownload - downloadMbps) / avgDownload * 100 : 0;
-
-                    if (dropPercent > 0)
-                    {
-                        await _alertEventBus.PublishAsync(new AlertEvent
-                        {
-                            EventType = "wan.speed_degradation",
-                            Severity = dropPercent >= 50 ? AlertSeverity.Error
-                                : dropPercent >= 25 ? AlertSeverity.Warning : AlertSeverity.Info,
-                            Source = "wan",
-                            Title = $"WAN degradation: {downloadMbps:F0} Mbps ({dropPercent:F0}% below average)",
-                            Message = $"{wanName} download is {dropPercent:F0}% below the recent average of {avgDownload:F0} Mbps",
-                            MetricValue = downloadMbps,
-                            ThresholdValue = avgDownload,
-                            SourceUrl = $"/wan-speedtest#result-{result.Id}",
-                            Context = new Dictionary<string, string>
-                            {
-                                ["wan_name"] = wanName,
-                                ["current_mbps"] = downloadMbps.ToString("F1"),
-                                ["average_mbps"] = avgDownload.ToString("F1"),
-                                ["drop_percent"] = dropPercent.ToString("F0"),
-                                ["sample_count"] = recent.Count.ToString()
-                            }
-                        });
-                    }
-                }
-            }
-            catch (Exception degradeEx)
-            {
-                Logger.LogDebug(degradeEx, "Failed to check WAN speed degradation");
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogDebug(ex, "Failed to publish WAN speed test alert event");
         }
     }
 

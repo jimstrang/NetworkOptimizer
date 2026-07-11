@@ -14,11 +14,14 @@
 @inject ClientSpeedTestService SpeedTestService
 @inject UniFiConnectionService ConnectionService
 @inject IConfiguration Configuration
+@inject SiteContextService SiteContext
+@inject SiteSpeedTestTargetResolver SiteTarget
 @inject NavigationManager NavigationManager
 @inject IJSRuntime JS
 @inject IHttpContextAccessor HttpContextAccessor
 @inject ApMapService ApMapService
 @inject PullToRefreshState PtrState
+@inject ILogger<ClientDashboard> Logger
 
 <PageTitle>Client Performance - Network Optimizer</PageTitle>
 
@@ -95,7 +98,7 @@
         </div>
     }
 
-    @if (_loading)
+    @if (_loading || _awaitingSiteIdentity)
     {
         <div class="skeleton-hero card">
             <div class="skeleton-row">
@@ -116,6 +119,23 @@
         </div>
         <div class="skeleton-chart card">
             <div class="skeleton-block skeleton-chart-area"></div>
+        </div>
+    }
+    else if (_showClientPicker)
+    {
+        <div class="card empty-state">
+            <h3>Select Your Device</h3>
+            <p>This site is monitored remotely, so your device can't be identified automatically from here. Choose a device to view its performance.</p>
+            <div class="client-picker-row">
+                <select class="form-control" @bind="_pickerSelection">
+                    <option value="">Choose a device...</option>
+                    @foreach (var c in _pickerClients)
+                    {
+                        <option value="@c.Ip">@c.Name (@c.Ip)@(c.IsWired ? " - wired" : "")</option>
+                    }
+                </select>
+                <button class="btn btn-primary" @onclick="ViewPickedClientAsync" disabled="@string.IsNullOrEmpty(_pickerSelection)">View</button>
+            </div>
         </div>
     }
     else if (_client == null)
@@ -280,12 +300,12 @@
                             <div class="speed-hero-results">
                                 <div class="speed-metric download">
                                     <span class="speed-label">From Device</span>
-                                    <span class="speed-value speed-down">@_latestSpeedResult.DownloadMbps.ToString("F1")</span>
+                                    <span class="speed-value speed-down">@FormatSpeed(_latestSpeedResult.DownloadMbps, "F1")</span>
                                     <span class="speed-unit">Mbps</span>
                                 </div>
                                 <div class="speed-metric upload">
                                     <span class="speed-label">To Device</span>
-                                    <span class="speed-value speed-up">@_latestSpeedResult.UploadMbps.ToString("F1")</span>
+                                    <span class="speed-value speed-up">@FormatSpeed(_latestSpeedResult.UploadMbps, "F1")</span>
                                     <span class="speed-unit">Mbps</span>
                                 </div>
                                 @if (_latestSpeedResult.PingMs.HasValue)
@@ -427,9 +447,9 @@
                                             <tr class="result-row @(_expandedResultId == r.Id ? "expanded" : "")"
                                                 @onclick="() => ToggleResultExpand(r.Id)">
                                                 <td>@FormatTimeShort(r.TestTime)</td>
-                                                <td class="hide-mobile"><span class="speed-down">@r.DownloadMbps.ToString("F1")</span> Mbps</td>
-                                                <td class="hide-mobile"><span class="speed-up">@r.UploadMbps.ToString("F1")</span> Mbps</td>
-                                                <td class="show-mobile"><span class="speed-down">@r.DownloadMbps.ToString("F0")</span> / <span class="speed-up">@r.UploadMbps.ToString("F0")</span></td>
+                                                <td class="hide-mobile"><span class="speed-down">@FormatSpeed(r.DownloadMbps, "F1")</span> Mbps</td>
+                                                <td class="hide-mobile"><span class="speed-up">@FormatSpeed(r.UploadMbps, "F1")</span> Mbps</td>
+                                                <td class="show-mobile"><span class="speed-down">@FormatSpeed(r.DownloadMbps, "F0")</span> / <span class="speed-up">@FormatSpeed(r.UploadMbps, "F0")</span></td>
                                                 @if (!(_client?.IsWired == true))
                                                 {
                                                     <td class="hide-mobile">@RenderRate(r.WifiRxRateKbps, "wifi-speed-rx")</td>
@@ -953,7 +973,7 @@
         _isLogging = _isOwnDevice; // own device always logs; backend skips wired
 
         // Build OpenSpeedTest URL
-        BuildOpenSpeedTestUrl();
+        await BuildOpenSpeedTestUrl();
 
         // Configure charts
         ConfigureSpeedChart();
@@ -1034,6 +1054,11 @@
         _isMobile = await JS.InvokeAsync<bool>("eval", "window.innerWidth <= 768");
         _showGpsWarning = _isInsecureContext && _isOwnDevice;
 
+        // Managed-site own-device identity needs JS (agent whoami probe / localStorage),
+        // so it runs here rather than in OnInitializedAsync.
+        if (_awaitingSiteIdentity)
+            await ResolveSiteIdentityAsync();
+
         if (_showGpsWarning)
             StateHasChanged();
 
@@ -1067,6 +1092,10 @@
     }
 
     private string? _clientIp;
+    private bool _awaitingSiteIdentity;
+    private bool _showClientPicker;
+    private List<ClientDashboardService.SelectableClient> _pickerClients = new();
+    private string? _pickerSelection;
 
     private async Task<ClientIdentity?> GetClientIdentityAsync()
     {
@@ -1074,6 +1103,16 @@
         if (string.IsNullOrEmpty(_clientIp) && !_isOwnDevice)
         {
             _clientIp = IpParam;
+        }
+
+        // On a managed (non-default) site this circuit arrives over the WAN, so the
+        // connection address is the site's public IP - never the viewer's LAN address.
+        // Identity comes from the on-site agent's whoami probe (or the device picker)
+        // after first render, when JS interop is available.
+        if (string.IsNullOrEmpty(_clientIp) && !SiteContext.IsDefault)
+        {
+            _awaitingSiteIdentity = true;
+            return null;
         }
 
         // In Blazor Server, HttpContext is only available during the initial HTTP request.
@@ -1097,6 +1136,88 @@
             return null;
 
         return await DashboardService.IdentifyClientAsync(_clientIp);
+    }
+
+    /// <summary>
+    /// Own-device identity on a managed site: ask the on-site agent's speed-test listener
+    /// who we are - it sees the viewer's LAN source address, where this central server only
+    /// ever sees the site's WAN IP. The browser relays the agent's answer back over this
+    /// circuit, so concurrent viewers can never cross (each round trip lives inside its own
+    /// session). Falls back to the manual device picker when the probe fails (no online
+    /// agent, or the agent's certificate isn't trusted by this browser).
+    /// </summary>
+    private async Task ResolveSiteIdentityAsync()
+    {
+        string? ip = null;
+        var probed = false;
+        try
+        {
+            var target = await SiteTarget.ResolveAsync();
+            if (target.UsesAgent && !string.IsNullOrEmpty(target.BaseUrl))
+            {
+                probed = true;
+                ip = await JS.InvokeAsync<string?>("eval",
+                    $"fetch('{target.BaseUrl}/netopt/whoami', {{signal: AbortSignal.timeout(4000)}})" +
+                    ".then(r => r.json()).then(j => j.ip).catch(() => null)");
+            }
+        }
+        catch { /* probe is best-effort; the picker below always works */ }
+
+        _awaitingSiteIdentity = false;
+
+        if (!string.IsNullOrEmpty(ip) && System.Net.IPAddress.TryParse(ip, out _))
+        {
+            Logger.LogDebug("Client identity (site {Site}): agent whoami resolved {Ip}", SiteContext.Slug, ip);
+            _clientIp = ip;
+            await IdentifyAndLoadAsync();
+            if (_client != null)
+            {
+                StateHasChanged();
+                return;
+            }
+            // The agent answered but the address isn't a known client - pick manually.
+            Logger.LogDebug("Client identity (site {Site}): whoami address {Ip} not in the client list - showing picker", SiteContext.Slug, ip);
+            _clientIp = null;
+        }
+        else
+        {
+            Logger.LogDebug("Client identity (site {Site}): {Reason} - showing picker",
+                SiteContext.Slug, probed ? "agent whoami probe failed (offline or certificate untrusted)" : "no agent target to probe");
+        }
+
+        await ShowClientPickerAsync();
+    }
+
+    private async Task ShowClientPickerAsync()
+    {
+        _pickerClients = await DashboardService.GetSelectableClientsAsync();
+        try
+        {
+            var remembered = await JS.InvokeAsync<string?>("eval",
+                $"localStorage.getItem('netopt-client-dashboard-ip-{SiteContext.Slug}')");
+            if (!string.IsNullOrEmpty(remembered) && _pickerClients.Any(c => c.Ip == remembered))
+                _pickerSelection = remembered;
+        }
+        catch { /* no preselect without localStorage */ }
+        _showClientPicker = true;
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task ViewPickedClientAsync()
+    {
+        // The bound value comes from our own option list, but it is about to be embedded
+        // in a JS string and a URL - accept nothing but a literal IP address.
+        if (string.IsNullOrEmpty(_pickerSelection) || !System.Net.IPAddress.TryParse(_pickerSelection, out _))
+            return;
+        try
+        {
+            await JS.InvokeVoidAsync("eval",
+                $"localStorage.setItem('netopt-client-dashboard-ip-{SiteContext.Slug}', '{_pickerSelection}')");
+        }
+        catch { /* remembering is best-effort */ }
+        Logger.LogDebug("Client identity (site {Site}): device picked manually ({Ip})", SiteContext.Slug, _pickerSelection);
+        NavigationManager.NavigateTo($"/client-dashboard?ip={Uri.EscapeDataString(_pickerSelection)}", forceLoad: true);
     }
 
     /// <summary>
@@ -1993,8 +2114,21 @@
 
     // --- URL Construction ---
 
-    private void BuildOpenSpeedTestUrl()
+    private async Task BuildOpenSpeedTestUrl()
     {
+        // Per-site: this dashboard button is a shortcut to the same Client LAN Speed Test,
+        // so on an agent-backed site it must target the site's on-site agent (its own LAN IP,
+        // self-signed https), not the central server. Shared resolution (per-site URL
+        // override wins over the online agent's LAN IP) lives in SiteSpeedTestTargetResolver.
+        // Falls through to the central-server config below only for the default site or
+        // when no agent is online.
+        var siteTarget = await SiteTarget.ResolveAsync();
+        if (siteTarget.UsesAgent)
+        {
+            _openSpeedTestUrl = siteTarget.BaseUrl;
+            return;
+        }
+
         var hostName = Configuration["HOST_NAME"];
         var hostIp = Configuration["HOST_IP"];
         var openSpeedTestHost = Configuration["OPENSPEEDTEST_HOST"];
@@ -2239,6 +2373,13 @@
             ? local.ToString("HH:mm")
             : local.ToString("MMM dd HH:mm");
     }
+
+    /// <summary>
+    /// Formats a speed value, showing a dash for a missing direction (a
+    /// one-directional test leaves the other direction at zero) rather than "0".
+    /// </summary>
+    private static string FormatSpeed(double mbps, string format) =>
+        mbps > 0 ? mbps.ToString(format) : "-";
 
     private static MarkupString RenderRate(long? rateKbps, string colorClass)
     {
