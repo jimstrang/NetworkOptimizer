@@ -944,6 +944,11 @@
         PtrState.RefreshCallback = async () => { if (hasResults) await RunAudit(); };
         PtrState.NotifyStateChanged = StateHasChanged;
 
+        // Dismiss the console-connection banner (and enable Run Audit) once the
+        // connection comes up, like the other pages. Running an audit is a manual
+        // action, so this handler only re-renders - it never triggers an audit.
+        ConnectionService.OnConnectionChanged += HandleConnectionChanged;
+
         // Wait for auto-connect to complete (if credentials are saved)
         // This prevents the "Not Connected" banner from flashing after page reload
         await ConnectionService.WaitForConnectionAsync();
@@ -1543,8 +1548,17 @@
         timer.Start();
     }
 
+    // Re-render only, so the banner clears and Run Audit enables when the console
+    // connection comes up. Deliberately does not start an audit (manual action).
+    private void HandleConnectionChanged() => _ = InvokeAsync(() =>
+    {
+        try { StateHasChanged(); }
+        catch { /* circuit may be tearing down */ }
+    });
+
     public void Dispose()
     {
+        ConnectionService.OnConnectionChanged -= HandleConnectionChanged;
         foreach (var timer in _purposeSavedTimers.Values)
         {
             timer.Stop();
