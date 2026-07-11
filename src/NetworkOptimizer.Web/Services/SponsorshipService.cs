@@ -83,13 +83,13 @@ public class SponsorshipService : ISponsorshipService
             await using var scope = _serviceProvider.CreateAsyncScope();
 
             // A licensed install has already paid for the product - never nag it for
-            // sponsorship. Also stay silent until the license snapshot has been computed
-            // at least once: until then AnyKeysActive fails closed (false), and briefly
-            // nagging a licensed install during startup is worse than a brief silence.
-            // alwaysShow (the Settings preview) bypasses both so the operator can see
-            // what the prompts look like.
+            // sponsorship, not even the Settings preview (alwaysShow bypasses the daily
+            // limit and progressive gating, but NOT the license check). Also stay silent
+            // until the license snapshot has been computed at least once: until then
+            // AnyKeysActive fails closed (false), and briefly nagging a licensed install
+            // during startup is worse than a brief silence.
             var licenseState = scope.ServiceProvider.GetRequiredService<Licensing.LicenseStateService>();
-            if (!alwaysShow && (licenseState.Snapshot == null || licenseState.AnyKeysActive))
+            if (licenseState.Snapshot == null || licenseState.AnyKeysActive)
             {
                 return null;
             }
