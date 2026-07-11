@@ -86,7 +86,12 @@ public class LicenseStateService : BackgroundService
     /// Reloads licensing data from the main database and swaps in a fresh
     /// snapshot. Safe to call from any thread; errors keep the previous snapshot.
     /// </summary>
-    public async Task RecomputeAsync()
+    /// <param name="alwaysNotify">
+    /// When true, raise <see cref="OnStateChanged"/> even if the recomputed snapshot
+    /// is equivalent to the previous one. Used by callers (e.g. toggling multi-site)
+    /// whose change affects dependent UI without altering the license snapshot itself.
+    /// </param>
+    public async Task RecomputeAsync(bool alwaysNotify = false)
     {
         try
         {
@@ -119,6 +124,10 @@ public class LicenseStateService : BackgroundService
             if (previous == null || !SnapshotsEquivalent(previous, fresh))
             {
                 LogTransitions(previous, fresh);
+                OnStateChanged?.Invoke();
+            }
+            else if (alwaysNotify)
+            {
                 OnStateChanged?.Invoke();
             }
         }

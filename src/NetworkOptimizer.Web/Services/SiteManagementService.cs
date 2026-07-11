@@ -78,8 +78,12 @@ public class SiteManagementService
             // other existing sites) to active keys so the consumed/available seat
             // counts carry over seamlessly from the single-site view.
             await _activation.AutoAssignAsync();
-            await _licenseState.RecomputeAsync();
         }
+
+        // Always notify: toggling multi-site changes what the Licensing card shows even
+        // when the license snapshot is unchanged (e.g. the main site was already covered),
+        // so force subscribers to reload rather than relying on a snapshot diff.
+        await _licenseState.RecomputeAsync(alwaysNotify: true);
         _logger.LogInformation("Multi-site management {State}", enabled ? "enabled" : "disabled");
     }
 
