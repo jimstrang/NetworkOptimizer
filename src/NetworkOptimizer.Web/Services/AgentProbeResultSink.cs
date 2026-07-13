@@ -53,6 +53,16 @@ public class AgentProbeResultSink
     // caches (replay is chronological, so the caches end on the newest sample).
     private static readonly TimeSpan AlertFreshness = TimeSpan.FromMinutes(10);
 
+    // Stale samples right after a reconnect are the buffered backlog replaying -
+    // expected, and what AlertFreshness exists for. Stale samples on a tunnel
+    // that has been up far longer than any backlog takes to drain mean the agent
+    // host's clock is behind server time, and every sample is skipping alert
+    // evaluation - silently and indefinitely. Warn (rate-limited per site) so
+    // the operator knows alerts are not firing and can fix the host's clock/NTP.
+    private static readonly TimeSpan ReplayGraceAfterConnect = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan SkewWarnInterval = TimeSpan.FromHours(1);
+    private readonly ConcurrentDictionary<string, DateTime> _skewWarnedAt = new();
+
     // Per-site topology-boundary aggregator (fabric sums, AP backhaul, gateway WAN),
     // the same LanFabricAggregator the directly-monitored fast tier uses. Keyed by slug
     // because this sink is a singleton serving every agent site.
@@ -786,7 +796,10 @@ public class AgentProbeResultSink
             // config push gives the alert a device label instead of a bare MAC.
             // Replayed backlog samples skip evaluation (see AlertFreshness).
             if (DateTime.UtcNow - timestamp > AlertFreshness)
+            {
+                NoteAlertEvaluationSkipped(connection, timestamp);
                 continue;
+            }
             try
             {
                 string? deviceName = null;
@@ -999,12 +1012,35 @@ public class AgentProbeResultSink
                         target.TargetId, connection.SiteSlug);
                 }
             }
+            else
+            {
+                NoteAlertEvaluationSkipped(connection, timestamp);
+            }
 
             if (result.Success)
                 target.LastVerified = timestamp;
         }
 
         await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>
+    /// Called when a relayed sample is too old for alert evaluation (see
+    /// <see cref="AlertFreshness"/>). Right after a reconnect that's the buffered
+    /// backlog replaying and stays quiet. On a long-connected tunnel it means the
+    /// agent host's clock is behind server time (or samples are arriving badly
+    /// delayed), so the site's alerts are silently not firing - surface that with
+    /// a rate-limited warning instead of letting it go unnoticed.
+    /// </summary>
+    private void NoteAlertEvaluationSkipped(AgentTunnelConnection connection, DateTime sampleTimestamp)
+    {
+        var now = DateTime.UtcNow;
+        if (now - connection.ConnectedAt < ReplayGraceAfterConnect) return;
+        if (_skewWarnedAt.TryGetValue(connection.SiteSlug, out var warned) && now - warned < SkewWarnInterval) return;
+        _skewWarnedAt[connection.SiteSlug] = now;
+        _logger.LogWarning(
+            "Site {Slug}: samples from agent {AgentId} arrive stamped {BehindMinutes:0} min behind server time and skip alert evaluation - monitoring data still records, but this site's alerts will not fire. Check the agent host's clock/NTP.",
+            connection.SiteSlug, connection.AgentId, (now - sampleTimestamp).TotalMinutes);
     }
 
     private static string NormalizeMac(string mac) =>
