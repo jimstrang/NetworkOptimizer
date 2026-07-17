@@ -368,7 +368,7 @@ public static class DefaultAlertRules
         },
         new AlertRule
         {
-            // Only ONTs that report a DDM temperature (typically SFP-module ONTs) can trip this.
+            // Only ONTs whose provider reports a temperature can trip this; the rest never fire it.
             Name = "ONT: Temperature High",
             IsEnabled = false,
             EventTypePattern = "ont.high_temperature",

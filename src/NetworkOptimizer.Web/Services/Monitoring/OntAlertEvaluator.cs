@@ -104,10 +104,9 @@ public class OntAlertEvaluator
     }
 
     /// <summary>
-    /// Flags a sustained high transceiver temperature. Only ONTs that expose a DDM
-    /// temperature reading (typically SFP-module ONTs) reach here; the poll passes a
-    /// null reading otherwise and no alert is possible. Clears with hysteresis so a
-    /// reading hovering at the threshold doesn't flap.
+    /// Flags a sustained high transceiver temperature. Only ONTs whose provider reports a
+    /// temperature reach here; the poll passes a null reading otherwise and no alert is
+    /// possible. Clears with hysteresis so a reading hovering at the threshold doesn't flap.
     /// </summary>
     private async ValueTask CheckTemperature(
         OntAlertState state, int ontId, string ontName, double tempC, double tempHighC, CancellationToken ct)
