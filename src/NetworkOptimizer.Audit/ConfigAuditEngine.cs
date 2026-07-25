@@ -59,6 +59,7 @@ public class ConfigAuditEngine
         // Populated by phases
         public List<NetworkInfo> Networks { get; set; } = [];
         public List<SwitchInfo> Switches { get; set; } = [];
+        public List<WiredClientInfo> WiredClients { get; set; } = [];
         public List<WirelessClientInfo> WirelessClients { get; set; } = [];
         public List<OfflineClientInfo> OfflineClients { get; set; } = [];
         public Dictionary<string, string?> ApNameToModel { get; set; } = new(StringComparer.OrdinalIgnoreCase);
@@ -309,6 +310,7 @@ public class ConfigAuditEngine
         // Execute audit phases
         ExecutePhase1_ExtractNetworks(ctx);
         ExecutePhase2_ExtractSwitches(ctx);
+        ExecutePhase2b_ExtractWiredClients(ctx);
         ExecutePhase3_AnalyzePortSecurity(ctx);
         ExecutePhase3b_AnalyzeWirelessClients(ctx);
         ExecutePhase3a_ProtectCameraFallback(ctx);
@@ -361,6 +363,8 @@ public class ConfigAuditEngine
         {
             detectionService.SetClientHistory(request.ClientHistory);
         }
+
+        detectionService.SetClassificationOverrides(request.DeviceClassificationOverrides);
 
         var securityEngine = new PortSecurityAnalyzer(
             _loggerFactory.CreateLogger<PortSecurityAnalyzer>(),
@@ -534,6 +538,45 @@ public class ConfigAuditEngine
         ctx.Switches = ctx.SecurityEngine.ExtractSwitches(ctx.DeviceData, ctx.Networks, ctx.Clients, ctx.ClientHistory, ctx.PortProfiles);
         _logger.LogInformation("Found {SwitchCount} switches with {PortCount} total ports",
             ctx.Switches.Count, ctx.Switches.Sum(s => s.Ports.Count));
+    }
+
+    private void ExecutePhase2b_ExtractWiredClients(AuditContext ctx)
+    {
+        var detectionService = ctx.SecurityEngine.DetectionService;
+        if (detectionService == null)
+            return;
+
+        var networksById = new Dictionary<string, NetworkInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var network in ctx.Networks)
+            networksById.TryAdd(network.Id, network);
+
+        foreach (var networkSwitch in ctx.Switches)
+        {
+            foreach (var port in networkSwitch.Ports)
+            {
+                var client = port.ConnectedClient;
+                if (client == null || string.IsNullOrWhiteSpace(client.Mac))
+                    continue;
+
+                networksById.TryGetValue(client.EffectiveNetworkId, out var network);
+                if (network == null && !string.IsNullOrEmpty(port.NativeNetworkId))
+                    networksById.TryGetValue(port.NativeNetworkId, out network);
+                var detection = detectionService.DetectDeviceType(client, port.Name);
+
+                ctx.WiredClients.Add(new WiredClientInfo
+                {
+                    Client = client,
+                    Network = network,
+                    Detection = detection,
+                    SwitchName = networkSwitch.Name,
+                    SwitchMac = networkSwitch.MacAddress,
+                    PortIndex = port.PortIndex,
+                    PortName = port.Name
+                });
+            }
+        }
+
+        _logger.LogInformation("Found {ClientCount} wired clients", ctx.WiredClients.Count);
     }
 
     private void ExecutePhase3_AnalyzePortSecurity(AuditContext ctx)
@@ -774,7 +817,7 @@ public class ConfigAuditEngine
         ctx.AllIssues.Add(CreateOfflineVlanIssue(
             "OFFLINE-IOT-VLAN",
             message,
-            displayName, lastNetwork, placement, detection, historyClient.LastSeen, isRecent,
+            displayName, historyClient, lastNetwork, placement, detection, historyClient.LastSeen, isRecent,
             recommendedAction,
             isRecent ? placement.Severity : Models.AuditSeverity.Informational,
             isRecent ? placement.ScoreImpact : 0,
@@ -811,7 +854,7 @@ public class ConfigAuditEngine
         ctx.AllIssues.Add(CreateOfflineVlanIssue(
             ruleId,
             message,
-            displayName, lastNetwork, placement, detection, historyClient.LastSeen, isRecent,
+            displayName, historyClient, lastNetwork, placement, detection, historyClient.LastSeen, isRecent,
             Rules.VlanPlacementChecker.GetMoveRecommendation(placement, fallbackAction),
             isRecent ? (isCloudCamera ? placement.Severity : Models.AuditSeverity.Critical) : Models.AuditSeverity.Informational,
             isRecent ? placement.ScoreImpact : 0,
@@ -851,7 +894,7 @@ public class ConfigAuditEngine
         ctx.AllIssues.Add(CreateOfflineVlanIssue(
             "OFFLINE-PRINTER-VLAN",
             message,
-            displayName, lastNetwork, placement, detection, historyClient.LastSeen, isRecent,
+            displayName, historyClient, lastNetwork, placement, detection, historyClient.LastSeen, isRecent,
             recommendedAction,
             isRecent ? placement.Severity : Models.AuditSeverity.Informational,
             isRecent ? placement.ScoreImpact : 0,
@@ -863,6 +906,7 @@ public class ConfigAuditEngine
         string type,
         string message,
         string? displayName,
+        UniFiClientDetailResponse historyClient,
         NetworkInfo lastNetwork,
         Rules.VlanPlacementChecker.PlacementResult placement,
         DeviceDetectionResult detection,
@@ -902,6 +946,10 @@ public class ConfigAuditEngine
             RecommendedAction = recommendedAction,
             RuleId = type,
             ScoreImpact = scoreImpact,
+            ClientMac = historyClient.Mac,
+            ClientName = displayName,
+            AccessPoint = historyClient.LastUplinkName,
+            IsWireless = !historyClient.IsWired,
             Metadata = metadata
         };
     }
@@ -1204,6 +1252,7 @@ public class ConfigAuditEngine
             ClientName = ctx.ClientName,
             Networks = ctx.Networks,
             Switches = ctx.Switches,
+            WiredClients = ctx.WiredClients,
             WirelessClients = ctx.WirelessClients,
             OfflineClients = ctx.OfflineClients,
             Issues = ctx.AllIssues,

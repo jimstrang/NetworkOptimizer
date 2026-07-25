@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using NetworkOptimizer.Audit.Models;
 using NetworkOptimizer.Audit.Services.Detectors;
 using NetworkOptimizer.Core.Enums;
+using NetworkOptimizer.Core.Helpers;
 using NetworkOptimizer.Core.Models;
 using NetworkOptimizer.UniFi.Models;
 
@@ -25,6 +26,9 @@ public class DeviceTypeDetectionService
 
     // UniFi Protect cameras (highest priority detection)
     private ProtectCameraCollection? _protectCameras;
+
+    // User-selected categories keyed by normalized MAC address.
+    private Dictionary<string, ClientDeviceCategory> _classificationOverrides = new(StringComparer.OrdinalIgnoreCase);
 
     public DeviceTypeDetectionService(
         ILogger<DeviceTypeDetectionService>? logger = null,
@@ -74,6 +78,34 @@ public class DeviceTypeDetectionService
     }
 
     /// <summary>
+    /// Set user-selected device category overrides keyed by MAC address.
+    /// Invalid categories and MAC addresses are ignored so stale settings cannot interrupt an audit.
+    /// </summary>
+    public void SetClassificationOverrides(IReadOnlyDictionary<string, string>? overrides)
+    {
+        _classificationOverrides = new Dictionary<string, ClientDeviceCategory>(StringComparer.OrdinalIgnoreCase);
+
+        if (overrides == null)
+            return;
+
+        foreach (var (mac, categoryName) in overrides)
+        {
+            var normalizedMac = NetworkUtilities.NormalizeMacAddress(mac);
+            if (normalizedMac == null ||
+                !Enum.TryParse<ClientDeviceCategory>(categoryName, ignoreCase: true, out var category) ||
+                !Enum.IsDefined(category))
+            {
+                _logger?.LogWarning("Ignoring invalid device classification override for MAC {Mac}", mac);
+                continue;
+            }
+
+            _classificationOverrides[normalizedMac] = category;
+        }
+
+        _logger?.LogInformation("Loaded {Count} device classification overrides", _classificationOverrides.Count);
+    }
+
+    /// <summary>
     /// Get the Protect camera name for a MAC address, if known
     /// </summary>
     public string? GetProtectCameraName(string? mac) => _protectCameras?.GetName(mac);
@@ -90,7 +122,7 @@ public class DeviceTypeDetectionService
         string? portName = null,
         string? deviceName = null)
     {
-        return DetectDeviceTypeCore(client, portName, deviceName);
+        return ApplyClassificationOverride(client?.Mac, DetectDeviceTypeCore(client, portName, deviceName));
     }
 
     /// <summary>
@@ -121,7 +153,7 @@ public class DeviceTypeDetectionService
             DevIdOverride = client.Fingerprint?.DevIdOverride
         };
 
-        return DetectDeviceTypeCore(clientResponse, portName, deviceName);
+        return ApplyClassificationOverride(client.Mac, DetectDeviceTypeCore(clientResponse, portName, deviceName));
     }
 
     /// <summary>
@@ -1385,7 +1417,7 @@ public class DeviceTypeDetectionService
         if (_protectCameras != null && _protectCameras.IsDriveDevice(macAddress))
         {
             _logger?.LogDebug("[Detection] MAC {Mac}: Known UNAS/Drive device (confirmed by controller API)", macAddress);
-            return new DeviceDetectionResult
+            return ApplyClassificationOverride(macAddress, new DeviceDetectionResult
             {
                 Category = ClientDeviceCategory.NAS,
                 Source = DetectionSource.UniFiFingerprint,
@@ -1397,7 +1429,7 @@ public class DeviceTypeDetectionService
                     ["detection_method"] = "unifi_network_api",
                     ["mac"] = macAddress
                 }
-            };
+            });
         }
 
         // First, check if we have this MAC in client history (for fingerprint data)
@@ -1420,7 +1452,7 @@ public class DeviceTypeDetectionService
             {
                 _logger?.LogDebug("[Detection] Client history name override: {Category} (name clearly indicates device type)",
                     nameOverride.Category);
-                return nameOverride;
+                return ApplyClassificationOverride(macAddress, nameOverride);
             }
 
             // Try fingerprint detection
@@ -1446,7 +1478,7 @@ public class DeviceTypeDetectionService
                     fpResult = ApplyCloudSecurityOverride(fpResult, pseudoClient);
                     _logger?.LogDebug("[Detection] Client history fingerprint detected: {Category} ({Confidence}%)",
                         fpResult.CategoryName, fpResult.ConfidenceScore);
-                    return fpResult;
+                    return ApplyClassificationOverride(macAddress, fpResult);
                 }
             }
 
@@ -1458,13 +1490,43 @@ public class DeviceTypeDetectionService
                 {
                     _logger?.LogDebug("[Detection] Client history name detected: {Category} ({Confidence}%)",
                         nameResult.CategoryName, nameResult.ConfidenceScore);
-                    return nameResult;
+                    return ApplyClassificationOverride(macAddress, nameResult);
                 }
             }
         }
 
         // Fall back to MAC OUI detection (IEEE database + built-in patterns)
-        return _macOuiDetector.Detect(macAddress);
+        return ApplyClassificationOverride(macAddress, _macOuiDetector.Detect(macAddress));
+    }
+
+    private DeviceDetectionResult ApplyClassificationOverride(string? mac, DeviceDetectionResult detectedResult)
+    {
+        var normalizedMac = NetworkUtilities.NormalizeMacAddress(mac);
+        if (normalizedMac == null || !_classificationOverrides.TryGetValue(normalizedMac, out var overrideCategory))
+            return detectedResult;
+
+        _logger?.LogDebug("Applying user classification override for MAC {Mac}: {DetectedCategory} -> {OverrideCategory}",
+            mac, detectedResult.Category, overrideCategory);
+
+        var metadata = new Dictionary<string, object>(detectedResult.Metadata)
+        {
+            ["auto_detected_category"] = detectedResult.Category.ToString(),
+            ["classification_override"] = overrideCategory.ToString()
+        };
+
+        return new DeviceDetectionResult
+        {
+            Category = overrideCategory,
+            Source = DetectionSource.UserOverride,
+            ConfidenceScore = 100,
+            AutoDetectedCategory = detectedResult.AutoDetectedCategory ?? detectedResult.Category,
+            AutoDetectionSource = detectedResult.AutoDetectionSource ?? detectedResult.Source,
+            AutoDetectionConfidenceScore = detectedResult.AutoDetectionConfidenceScore ?? detectedResult.ConfidenceScore,
+            VendorName = detectedResult.VendorName,
+            ProductName = detectedResult.ProductName,
+            RecommendedNetwork = FingerprintDetector.GetRecommendedNetwork(overrideCategory),
+            Metadata = metadata
+        };
     }
 
     /// <summary>

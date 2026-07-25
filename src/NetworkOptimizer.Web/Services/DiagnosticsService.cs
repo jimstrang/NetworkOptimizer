@@ -1,7 +1,9 @@
+using System.Text.Json;
 using Microsoft.Extensions.Caching.Memory;
 using NetworkOptimizer.Audit.Services;
 using NetworkOptimizer.Diagnostics;
 using NetworkOptimizer.Diagnostics.Models;
+using NetworkOptimizer.Storage.Interfaces;
 
 namespace NetworkOptimizer.Web.Services;
 
@@ -22,6 +24,7 @@ public class DiagnosticsService
     private readonly IeeeOuiDatabase _ieeeOuiDb;
     private readonly IMemoryCache _cache;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly ISettingsRepository _settingsRepository;
     private readonly SiteContextService _siteContext;
     private readonly Licensing.LicenseStateService _licenseState;
 
@@ -32,6 +35,7 @@ public class DiagnosticsService
         IeeeOuiDatabase ieeeOuiDb,
         IMemoryCache cache,
         ILoggerFactory loggerFactory,
+        ISettingsRepository settingsRepository,
         SiteContextService siteContext,
         Licensing.LicenseStateService licenseState)
     {
@@ -43,6 +47,7 @@ public class DiagnosticsService
         _ieeeOuiDb = ieeeOuiDb;
         _cache = cache;
         _loggerFactory = loggerFactory;
+        _settingsRepository = settingsRepository;
     }
 
     /// <summary>
@@ -99,11 +104,12 @@ public class DiagnosticsService
             }
 
             // Fetch all required data in parallel
+            var offlineHistoryDays = await GetOfflineClientHistoryDaysAsync();
             var devicesTask = _connectionService.Client.GetDevicesAsync(useCache: false);
             var clientsTask = _connectionService.Client.GetClientsAsync();
             var networksTask = _connectionService.Client.GetNetworkConfigsAsync();
             var portProfilesTask = _connectionService.Client.GetPortProfilesAsync();
-            var clientHistoryTask = _connectionService.Client.GetClientHistoryAsync(withinHours: 720); // 30 days
+            var clientHistoryTask = _connectionService.Client.GetClientHistoryAsync(withinHours: offlineHistoryDays * 24);
             var settingsTask = _connectionService.Client.GetSettingsRawAsync();
             var qosRulesTask = _connectionService.Client.GetQosRulesRawAsync();
             var wanEnrichedTask = _connectionService.Client.GetWanEnrichedConfigRawAsync();
@@ -134,6 +140,7 @@ public class DiagnosticsService
                 fingerprintDb,
                 _ieeeOuiDb,
                 _loggerFactory);
+            deviceDetection.SetClassificationOverrides(await GetDeviceClassificationOverridesAsync());
 
             // Create and run the diagnostics engine
             var engine = new DiagnosticsEngine(
@@ -165,6 +172,29 @@ public class DiagnosticsService
         finally
         {
             _cache.Set(CacheKeyIsRunning, false);
+        }
+    }
+
+    private async Task<int> GetOfflineClientHistoryDaysAsync()
+    {
+        var value = await _settingsRepository.GetSystemSettingAsync("audit:offlineClientHistoryDays");
+        return int.TryParse(value, out var days) && days is >= 1 and <= 365 ? days : 30;
+    }
+
+    private async Task<Dictionary<string, string>> GetDeviceClassificationOverridesAsync()
+    {
+        var json = await _settingsRepository.GetSystemSettingAsync("audit:deviceClassificationOverrides");
+        if (string.IsNullOrEmpty(json))
+            return new();
+
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? new();
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "Failed to parse device classification overrides for diagnostics");
+            return new();
         }
     }
 

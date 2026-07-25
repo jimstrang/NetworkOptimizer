@@ -383,6 +383,19 @@ public static class NetworkUtilities
     }
 
     /// <summary>
+    /// Converts a MAC address to its canonical 12-character uppercase hexadecimal form.
+    /// Returns null when the input is missing or does not contain exactly 12 hexadecimal characters.
+    /// </summary>
+    public static string? NormalizeMacAddress(string? macAddress)
+    {
+        if (string.IsNullOrWhiteSpace(macAddress))
+            return null;
+
+        var normalizedMac = new string(macAddress.Where(char.IsAsciiHexDigit).ToArray()).ToUpperInvariant();
+        return normalizedMac.Length == 12 ? normalizedMac : null;
+    }
+
+    /// <summary>
     /// Check if an IP address is in one of the three RFC1918 private IPv4 blocks
     /// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). Stricter than
     /// <see cref="IsPrivateIpAddress(IPAddress)"/>: loopback, link-local, CGNAT, and

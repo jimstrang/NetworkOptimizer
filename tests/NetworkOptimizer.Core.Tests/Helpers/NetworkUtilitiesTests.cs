@@ -7,6 +7,31 @@ namespace NetworkOptimizer.Core.Tests.Helpers;
 
 public class NetworkUtilitiesTests
 {
+    #region NormalizeMacAddress Tests
+
+    [Theory]
+    [InlineData("aa:bb:cc:dd:ee:ff")]
+    [InlineData("aa-bb-cc-dd-ee-ff")]
+    [InlineData("aabb.ccdd.eeff")]
+    [InlineData("AABBCCDDEEFF")]
+    public void NormalizeMacAddress_ValidMacFormats_ReturnsCanonicalUppercaseValue(string macAddress)
+    {
+        NetworkUtilities.NormalizeMacAddress(macAddress).Should().Be("AABBCCDDEEFF");
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("aa:bb:cc:dd:ee")]
+    [InlineData("not-a-mac")]
+    public void NormalizeMacAddress_InvalidValue_ReturnsNull(string? macAddress)
+    {
+        NetworkUtilities.NormalizeMacAddress(macAddress).Should().BeNull();
+    }
+
+    #endregion
+
     #region IsIpInSubnet(string, string?) Tests
 
     [Theory]

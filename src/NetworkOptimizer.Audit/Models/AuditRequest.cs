@@ -128,6 +128,12 @@ public class AuditRequest
     public Dictionary<string, string>? NetworkPurposeOverrides { get; init; }
 
     /// <summary>
+    /// Optional: User overrides for device classification.
+    /// Keys are client MAC addresses, values are ClientDeviceCategory enum names.
+    /// </summary>
+    public Dictionary<string, string>? DeviceClassificationOverrides { get; init; }
+
+    /// <summary>
     /// Optional: Threat intelligence context for threat-informed scoring.
     /// When present, port forward issues targeting actively attacked ports get severity bumps.
     /// </summary>

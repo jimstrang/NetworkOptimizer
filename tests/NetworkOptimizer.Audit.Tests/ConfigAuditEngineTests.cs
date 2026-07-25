@@ -435,6 +435,80 @@ public class ConfigAuditEngineTests
 
     #endregion
 
+    #region Wired Client Extraction Tests
+
+    [Fact]
+    public async Task RunAudit_WiredClientWithOverride_SurfacesConnectionAndEffectiveDetection()
+    {
+        var deviceJson = """
+        [
+            {
+                "type": "udm",
+                "name": "Gateway",
+                "network_table": [
+                    {
+                        "_id": "net-corp",
+                        "name": "Corporate",
+                        "vlan": 1,
+                        "purpose": "corporate",
+                        "dhcpd_enabled": true,
+                        "ip_subnet": "192.0.2.1/24"
+                    }
+                ]
+            },
+            {
+                "type": "usw",
+                "name": "Office Switch",
+                "mac": "00:11:22:33:44:55",
+                "port_table": [
+                    {
+                        "port_idx": 7,
+                        "name": "Raspberry Pi",
+                        "up": true,
+                        "native_networkconf_id": "net-corp",
+                        "is_uplink": false
+                    }
+                ]
+            }
+        ]
+        """;
+        var clients = new List<UniFiClientResponse>
+        {
+            new()
+            {
+                Mac = "AA:BB:CC:DD:EE:FF",
+                Name = "Raspberry Pi",
+                IsWired = true,
+                SwMac = "00:11:22:33:44:55",
+                SwPort = 7,
+                NetworkId = "net-corp"
+            }
+        };
+
+        var result = await _engine.RunAuditAsync(new AuditRequest
+        {
+            DeviceDataJson = deviceJson,
+            Clients = clients,
+            DeviceClassificationOverrides = new Dictionary<string, string>
+            {
+                ["aa-bb-cc-dd-ee-ff"] = nameof(Core.Enums.ClientDeviceCategory.Server)
+            }
+        });
+
+        var wiredClient = result.WiredClients.Should().ContainSingle().Subject;
+        wiredClient.DisplayName.Should().Be("Raspberry Pi");
+        wiredClient.Mac.Should().Be("AA:BB:CC:DD:EE:FF");
+        wiredClient.SwitchName.Should().Be("Office Switch");
+        wiredClient.PortIndex.Should().Be(7);
+        wiredClient.Network.Should().NotBeNull();
+        wiredClient.Network!.Id.Should().Be("net-corp");
+        wiredClient.Detection.Category.Should().Be(Core.Enums.ClientDeviceCategory.Server);
+        wiredClient.Detection.Source.Should().Be(DetectionSource.UserOverride);
+        wiredClient.Detection.AutoDetectedCategory.Should().NotBeNull();
+    }
+
+    #endregion
+
     #region Offline Client Analysis Tests
 
     private static string CreateDeviceJsonWithNetworks()
@@ -546,6 +620,9 @@ public class ConfigAuditEngineTests
         var issue = result.Issues.First(i => i.Type == "OFFLINE-IOT-VLAN");
         issue.DeviceName.Should().Contain("(offline)");
         issue.CurrentNetwork.Should().Be("Corporate");
+        issue.ClientMac.Should().Be("D8:31:34:11:22:33");
+        issue.ClientName.Should().Be("Living Room Roku");
+        issue.IsWireless.Should().BeTrue();
     }
 
     [Fact]

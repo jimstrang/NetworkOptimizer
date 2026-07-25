@@ -2216,6 +2216,12 @@
                 <small class="form-help">Days to wait for ports with custom names (like "Printer" or "Camera"). Longer grace period since these devices may be intentionally offline. Default: 45 days.</small>
             </div>
 
+            <div class="form-group">
+                <label class="form-label">Offline client history (days)</label>
+                <input type="number" class="form-control" @bind="offlineClientHistoryDays" min="1" max="365" style="width: 120px;" />
+                <small class="form-help">How many days of client history to include in Security Audit device classification. Default: 30 days.</small>
+            </div>
+
             <div class="form-group" style="margin-top: 1.5rem;">
                 <label class="form-label">DNAT DNS Coverage: Excluded VLANs (optional)</label>
                 <input type="text" class="form-control" @bind="dnatExcludedVlans" placeholder="e.g., 100, 200" style="width: 240px;" />
@@ -4184,6 +4190,7 @@
     private string trustedDnsRedirectTargets = "";
     private int unusedPortInactivityDays = 15;
     private int namedPortInactivityDays = 45;
+    private int offlineClientHistoryDays = 30;
     private bool savingAuditSettings = false;
     private string auditSettingsMessage = "";
     private string auditSettingsMessageClass = "";
@@ -6556,6 +6563,7 @@
             var trustedTargets = await SystemSettings.GetAsync("audit:trustedDnsRedirectTargets");
             var unusedPortDays = await SystemSettings.GetAsync("audit:unusedPortInactivityDays");
             var namedPortDays = await SystemSettings.GetAsync("audit:namedPortInactivityDays");
+            var offlineHistoryDays = await SystemSettings.GetAsync("audit:offlineClientHistoryDays");
 
             allowAppleStreamingOnMainNetwork = appleStreaming?.ToLower() == "true";
             allowAllStreamingOnMainNetwork = allStreaming?.ToLower() == "true";
@@ -6573,6 +6581,7 @@
             // Unused port thresholds (defaults: 15 days unnamed, 45 days named)
             unusedPortInactivityDays = int.TryParse(unusedPortDays, out var unusedDays) && unusedDays > 0 ? unusedDays : 15;
             namedPortInactivityDays = int.TryParse(namedPortDays, out var namedDays) && namedDays > 0 ? namedDays : 45;
+            offlineClientHistoryDays = int.TryParse(offlineHistoryDays, out var historyDays) && historyDays is >= 1 and <= 365 ? historyDays : 30;
         }
         catch (Exception ex)
         {
@@ -6611,6 +6620,7 @@
             await SystemSettings.SetAsync("audit:trustedDnsRedirectTargets", trustedDnsRedirectTargets ?? "");
             await SystemSettings.SetAsync("audit:unusedPortInactivityDays", unusedPortInactivityDays.ToString());
             await SystemSettings.SetAsync("audit:namedPortInactivityDays", namedPortInactivityDays.ToString());
+            await SystemSettings.SetAsync("audit:offlineClientHistoryDays", offlineClientHistoryDays.ToString());
 
             auditSettingsMessage = "Audit settings saved successfully";
             auditSettingsMessageClass = "success";

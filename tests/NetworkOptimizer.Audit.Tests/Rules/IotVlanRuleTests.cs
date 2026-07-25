@@ -95,6 +95,34 @@ public class IotVlanRuleTests
     }
 
     [Fact]
+    public void Evaluate_IoTDeviceOverriddenToServer_ReturnsNull()
+    {
+        // Arrange
+        var serverNetwork = new NetworkInfo
+        {
+            Id = "server-net",
+            Name = "Infrastructure",
+            VlanId = 20,
+            Purpose = NetworkPurpose.Server
+        };
+        var port = CreatePort(
+            portName: "Raspberry Pi DNS",
+            deviceCategory: ClientDeviceCategory.SmartPlug,
+            networkId: serverNetwork.Id,
+            connectedClientName: "Raspberry Pi");
+        _detectionService.SetClassificationOverrides(new Dictionary<string, string>
+        {
+            ["00:11:22:33:44:55"] = nameof(ClientDeviceCategory.Server)
+        });
+
+        // Act
+        var result = _rule.Evaluate(port, CreateNetworkList(serverNetwork));
+
+        // Assert
+        result.Should().BeNull();
+    }
+
+    [Fact]
     public void Evaluate_UnknownDevice_ReturnsNull()
     {
         // Arrange
@@ -424,6 +452,8 @@ public class IotVlanRuleTests
         result!.RecommendedNetwork.Should().Be("IoT Devices");
         result.RecommendedVlan.Should().Be(40);
         result.RecommendedAction.Should().Contain("IoT Devices");
+        result.RecommendedAction.Should().Contain("override its Classification in Network & Device Reference");
+        result.RecommendedAction.Should().NotContain("Device Icon / Fingerprint");
     }
 
     [Fact]

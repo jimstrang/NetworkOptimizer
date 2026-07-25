@@ -424,6 +424,21 @@ h1:focus {
     margin-bottom: 1.5rem;
 }
 
+.audit-container {
+    display: flex;
+    flex-direction: column;
+}
+
+.audit-reference-card { order: 4; }
+.audit-order-dns { order: 5; }
+.audit-order-hardening { order: 6; }
+.audit-order-switch-details { order: 7; }
+.audit-order-port-summary { order: 8; }
+
+.device-reference-group-row {
+    scroll-margin-top: 1rem;
+}
+
 .settings-tabbed > .card {
     display: none;
 }
@@ -3830,6 +3845,181 @@ select.form-control {
 
 .purpose-rerun-banner span:nth-child(2) {
     flex: 1;
+}
+
+/* Device classification overrides */
+.device-reference-controls {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.device-reference-controls .form-control {
+    width: min(300px, 100%);
+}
+
+.device-group-mode {
+    display: inline-flex;
+    gap: 0.25rem;
+}
+
+.device-filter-group {
+    align-items: center;
+    display: inline-flex;
+    gap: 0.375rem;
+}
+
+.device-filter-select {
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    min-width: 96px;
+    padding: 0.25rem 0.5rem;
+}
+
+.device-filter-select:focus {
+    border-color: var(--primary-color);
+    outline: none;
+}
+
+.device-filter-select option {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+.device-reference-controls .filter-label {
+    font-size: 0.8125rem;
+}
+
+.device-reference-groups-table {
+    min-width: 640px;
+}
+
+.device-reference-groups-table th:nth-child(1) { width: 70%; }
+.device-reference-groups-table th:nth-child(2),
+.device-reference-groups-table th:nth-child(3),
+.device-reference-groups-table th:nth-child(4) { width: 10%; }
+
+.device-reference-groups-table.vlan-mode th:nth-child(1) { width: 29%; }
+.device-reference-groups-table.vlan-mode th:nth-child(2) { width: 10%; }
+.device-reference-groups-table.vlan-mode th:nth-child(3) { width: 18%; }
+.device-reference-groups-table.vlan-mode th:nth-child(4) { width: 14%; }
+.device-reference-groups-table.vlan-mode th:nth-child(5),
+.device-reference-groups-table.vlan-mode th:nth-child(6),
+.device-reference-groups-table.vlan-mode th:nth-child(7) { width: 9.66%; }
+
+.device-reference-group-row td {
+    vertical-align: middle;
+}
+
+.device-reference-group-row.expanded td {
+    border-bottom-color: transparent;
+}
+
+.device-reference-group-toggle {
+    align-items: center;
+    background: transparent;
+    border: 0;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.75rem 0;
+    text-align: left;
+    width: 100%;
+}
+
+.device-reference-group-toggle:hover {
+    color: var(--primary-color);
+}
+
+.device-group-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.device-group-chevron {
+    color: var(--text-muted);
+    font-family: monospace;
+    width: 0.75rem;
+}
+
+.device-reference-details-row:hover {
+    background: transparent !important;
+}
+
+.device-reference-details-row td {
+    background: var(--bg-primary);
+    padding: 0.75rem 1rem;
+}
+
+.device-reference-table {
+    min-width: 900px;
+    table-layout: fixed;
+}
+
+.device-reference-table th,
+.device-reference-table td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+}
+
+.device-reference-table th:nth-child(1),
+.device-reference-table td:nth-child(1) { width: 17%; }
+.device-reference-table th:nth-child(2),
+.device-reference-table td:nth-child(2) { width: 11%; }
+.device-reference-table th:nth-child(3),
+.device-reference-table td:nth-child(3) { width: 20%; }
+.device-reference-table th:nth-child(4),
+.device-reference-table td:nth-child(4) { width: 18%; }
+.device-reference-table th:nth-child(5),
+.device-reference-table td:nth-child(5) { width: 12%; }
+.device-reference-table th:nth-child(6),
+.device-reference-table td:nth-child(6) { width: 22%; }
+
+.device-reference-table .purpose-select {
+    box-sizing: border-box;
+    min-width: 0;
+    width: 100%;
+}
+
+.device-detection-source {
+    color: var(--text-muted);
+    display: block;
+    font-size: 0.75rem;
+    margin-top: 0.125rem;
+}
+
+.device-reference-unmatched {
+    border-top: 1px solid var(--border-color);
+    margin-top: 1rem;
+    padding-top: 1rem;
+}
+
+.device-reference-unmatched h3 {
+    font-size: 0.9rem;
+    margin: 0 0 0.5rem;
+}
+
+.device-reference-unmatched-row {
+    align-items: center;
+    color: var(--text-secondary);
+    display: flex;
+    font-family: monospace;
+    font-size: 0.8125rem;
+    justify-content: space-between;
+    padding: 0.35rem 0;
+}
+
+.empty-device-reference {
+    color: var(--text-muted);
+    font-size: 0.875rem;
+    margin: 0.5rem 0;
 }
 
 /* Utility Classes */
@@ -7243,8 +7433,17 @@ a.path-hop.hop-clickable:hover {
     }
 
     .wireless-client-table,
-    .offline-client-table {
+    .offline-client-table,
+    .device-reference-table {
         min-width: 700px;
+    }
+
+    .device-reference-controls .form-control {
+        width: 100%;
+    }
+
+    .device-reference-unmatched-row {
+        gap: 0.5rem;
     }
 }
 

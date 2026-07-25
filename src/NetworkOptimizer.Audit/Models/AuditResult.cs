@@ -26,6 +26,11 @@ public class AuditResult
     public List<SwitchInfo> Switches { get; init; } = new();
 
     /// <summary>
+    /// Wired clients with detection results.
+    /// </summary>
+    public List<WiredClientInfo> WiredClients { get; init; } = new();
+
+    /// <summary>
     /// Wireless clients with detection results
     /// </summary>
     public List<WirelessClientInfo> WirelessClients { get; init; } = new();

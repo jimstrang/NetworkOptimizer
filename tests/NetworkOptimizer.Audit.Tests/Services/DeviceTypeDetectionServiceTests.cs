@@ -20,6 +20,76 @@ public class DeviceTypeDetectionServiceTests
         _service = new DeviceTypeDetectionService();
     }
 
+    #region Classification Override Tests
+
+    [Fact]
+    public void DetectDeviceType_WithClassificationOverride_ReturnsOverriddenCategory()
+    {
+        // Arrange
+        _service.SetClassificationOverrides(new Dictionary<string, string>
+        {
+            ["AA:BB:CC:DD:EE:FF"] = nameof(ClientDeviceCategory.Server)
+        });
+        var client = new UniFiClientResponse
+        {
+            Mac = "aa-bb-cc-dd-ee-ff",
+            Name = "Raspberry Pi",
+            DevCat = 19
+        };
+
+        // Act
+        var result = _service.DetectDeviceType(client);
+
+        // Assert
+        result.Category.Should().Be(ClientDeviceCategory.Server);
+        result.Source.Should().Be(DetectionSource.UserOverride);
+        result.ConfidenceScore.Should().Be(100);
+        result.AutoDetectedCategory.Should().NotBeNull();
+        result.AutoDetectedCategory.Should().NotBe(ClientDeviceCategory.Server);
+        result.AutoDetectionSource.Should().NotBeNull();
+        result.AutoDetectionSource.Should().NotBe(DetectionSource.UserOverride);
+        result.AutoDetectionConfidenceScore.Should().NotBeNull();
+        result.RecommendedNetwork.Should().Be(NetworkPurpose.Corporate);
+        result.Metadata["auto_detected_category"].Should().NotBe(ClientDeviceCategory.Server.ToString());
+        result.Metadata["classification_override"].Should().Be(ClientDeviceCategory.Server.ToString());
+    }
+
+    [Fact]
+    public void DetectFromMac_WithClassificationOverride_ReturnsOverriddenCategory()
+    {
+        // Arrange
+        _service.SetClassificationOverrides(new Dictionary<string, string>
+        {
+            ["AA:BB:CC:DD:EE:FF"] = nameof(ClientDeviceCategory.Server)
+        });
+
+        // Act
+        var result = _service.DetectFromMac("aabb.ccdd.eeff");
+
+        // Assert
+        result.Category.Should().Be(ClientDeviceCategory.Server);
+        result.Source.Should().Be(DetectionSource.UserOverride);
+        result.ConfidenceScore.Should().Be(100);
+    }
+
+    [Fact]
+    public void SetClassificationOverrides_WithInvalidCategory_IgnoresOverride()
+    {
+        // Arrange
+        _service.SetClassificationOverrides(new Dictionary<string, string>
+        {
+            ["AA:BB:CC:DD:EE:FF"] = "NotADeviceCategory"
+        });
+
+        // Act
+        var result = _service.DetectFromMac("AA:BB:CC:DD:EE:FF");
+
+        // Assert
+        result.Source.Should().NotBe(DetectionSource.UserOverride);
+    }
+
+    #endregion
+
     #region Name Override Tests - Plugs and WYZE
 
     [Theory]

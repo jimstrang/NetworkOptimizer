@@ -196,6 +196,7 @@ public class AuditService
             var trustedDnsTargets = await _settingsRepository.GetSystemSettingAsync("audit:trustedDnsRedirectTargets");
             var unusedPortDays = await _settingsRepository.GetSystemSettingAsync("audit:unusedPortInactivityDays");
             var namedPortDays = await _settingsRepository.GetSystemSettingAsync("audit:namedPortInactivityDays");
+            var offlineHistoryDays = await _settingsRepository.GetSystemSettingAsync("audit:offlineClientHistoryDays");
 
             options.AllowAppleStreamingOnMainNetwork = appleStreaming?.ToLower() == "true";
             options.AllowAllStreamingOnMainNetwork = allStreaming?.ToLower() == "true";
@@ -220,6 +221,7 @@ public class AuditService
             // Unused port thresholds (defaults: 15 days unnamed, 45 days named)
             options.UnusedPortInactivityDays = int.TryParse(unusedPortDays, out var unusedDays) && unusedDays > 0 ? unusedDays : 15;
             options.NamedPortInactivityDays = int.TryParse(namedPortDays, out var namedDays) && namedDays > 0 ? namedDays : 45;
+            options.OfflineClientHistoryDays = int.TryParse(offlineHistoryDays, out var historyDays) && historyDays is >= 1 and <= 365 ? historyDays : 30;
 
             // Network purpose overrides
             var purposeOverridesJson = await _settingsRepository.GetSystemSettingAsync("audit:networkPurposeOverrides");
@@ -232,6 +234,19 @@ public class AuditService
                 catch (JsonException ex)
                 {
                     _logger.LogWarning(ex, "Failed to parse network purpose overrides JSON");
+                }
+            }
+
+            var deviceOverridesJson = await _settingsRepository.GetSystemSettingAsync("audit:deviceClassificationOverrides");
+            if (!string.IsNullOrEmpty(deviceOverridesJson))
+            {
+                try
+                {
+                    options.DeviceClassificationOverrides = JsonSerializer.Deserialize<Dictionary<string, string>>(deviceOverridesJson);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex, "Failed to parse device classification overrides JSON");
                 }
             }
 
@@ -403,6 +418,85 @@ public class AuditService
     }
 
     /// <summary>
+    /// Get current device classification overrides from settings.
+    /// Keys are returned in canonical normalized MAC form; entries with unparseable MACs are dropped.
+    /// </summary>
+    public async Task<Dictionary<string, string>> GetDeviceClassificationOverridesAsync()
+    {
+        var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var json = await _settingsRepository.GetSystemSettingAsync("audit:deviceClassificationOverrides");
+            if (string.IsNullOrEmpty(json))
+                return normalized;
+
+            var stored = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+            if (stored == null)
+                return normalized;
+
+            foreach (var (mac, category) in stored)
+            {
+                var normalizedMac = NetworkUtilities.NormalizeMacAddress(mac);
+                if (normalizedMac == null)
+                {
+                    _logger.LogWarning("Dropping device classification override with invalid MAC {Mac}", mac);
+                    continue;
+                }
+
+                if (!Enum.TryParse<ClientDeviceCategory>(category, ignoreCase: true, out var parsedCategory) ||
+                    !Enum.IsDefined(parsedCategory))
+                {
+                    _logger.LogWarning("Dropping invalid device classification override {Category} for MAC {Mac}", category, mac);
+                    continue;
+                }
+
+                normalized[normalizedMac] = parsedCategory.ToString();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load device classification overrides");
+        }
+        return normalized;
+    }
+
+    /// <summary>
+    /// Save a device classification override. If category is null or empty, removes the override for that MAC.
+    /// </summary>
+    public async Task SaveDeviceClassificationOverrideAsync(string mac, string? category)
+    {
+        var normalizedMac = NetworkUtilities.NormalizeMacAddress(mac);
+        if (normalizedMac == null)
+            throw new ArgumentException("A valid MAC address is required.", nameof(mac));
+
+        string? canonicalCategory = null;
+        if (!string.IsNullOrEmpty(category))
+        {
+            if (!Enum.TryParse<ClientDeviceCategory>(category, ignoreCase: true, out var parsedCategory) ||
+                !Enum.IsDefined(parsedCategory))
+            {
+                throw new ArgumentException($"'{category}' is not a valid device category.", nameof(category));
+            }
+
+            canonicalCategory = parsedCategory.ToString();
+        }
+
+        var overrides = await GetDeviceClassificationOverridesAsync();
+
+        if (canonicalCategory == null)
+            overrides.Remove(normalizedMac);
+        else
+            overrides[normalizedMac] = canonicalCategory;
+
+        var json = overrides.Count > 0
+            ? JsonSerializer.Serialize(overrides)
+            : null;
+
+        await _settingsRepository.SaveSystemSettingAsync("audit:deviceClassificationOverrides", json);
+        _logger.LogInformation("Saved device classification override: {Mac} = {Category}", normalizedMac, canonicalCategory ?? "(removed)");
+    }
+
+    /// <summary>
     /// Load the most recent audit result from the database
     /// </summary>
     public async Task<AuditResult?> LoadLastAuditFromDatabaseAsync()
@@ -464,6 +558,10 @@ public class AuditService
                     if (root.TryGetProperty("Switches", out var switchesEl) || root.TryGetProperty("switches", out switchesEl))
                     {
                         result.Switches = JsonSerializer.Deserialize<List<SwitchReference>>(switchesEl.GetRawText(), options) ?? new();
+                    }
+                    if (root.TryGetProperty("WiredClients", out var wiredEl) || root.TryGetProperty("wiredClients", out wiredEl))
+                    {
+                        result.WiredClients = JsonSerializer.Deserialize<List<WiredClientReference>>(wiredEl.GetRawText(), options) ?? new();
                     }
                     if (root.TryGetProperty("WirelessClients", out var wirelessEl) || root.TryGetProperty("wirelessClients", out wirelessEl))
                     {
@@ -557,6 +655,7 @@ public class AuditService
                 HardeningMeasures = result.HardeningMeasures,
                 Networks = result.Networks,
                 Switches = result.Switches,
+                WiredClients = result.WiredClients,
                 WirelessClients = result.WirelessClients,
                 OfflineClients = result.OfflineClients,
                 DnsSecurity = result.DnsSecurity
@@ -1079,6 +1178,11 @@ public class AuditService
                 result.Switches = JsonSerializer.Deserialize<List<SwitchReference>>(switchesEl.GetRawText(), options) ?? new();
             }
 
+            if (root.TryGetProperty("WiredClients", out var wiredEl) || root.TryGetProperty("wiredClients", out wiredEl))
+            {
+                result.WiredClients = JsonSerializer.Deserialize<List<WiredClientReference>>(wiredEl.GetRawText(), options) ?? new();
+            }
+
             if (root.TryGetProperty("WirelessClients", out var wirelessEl) || root.TryGetProperty("wirelessClients", out wirelessEl))
             {
                 result.WirelessClients = JsonSerializer.Deserialize<List<WirelessClientReference>>(wirelessEl.GetRawText(), options) ?? new();
@@ -1193,11 +1297,11 @@ public class AuditService
             var clients = await _connectionService.Client.GetClientsAsync();
             _logger.LogInformation("Fetched {ClientCount} connected clients for device detection", clients?.Count ?? 0);
 
-            // Fetch client history for offline device detection (30 days)
+            // Fetch client history for offline device detection.
             List<NetworkOptimizer.UniFi.Models.UniFiClientDetailResponse>? clientHistory = null;
             try
             {
-                clientHistory = await _connectionService.Client.GetClientHistoryAsync(withinHours: 720);
+                clientHistory = await _connectionService.Client.GetClientHistoryAsync(withinHours: options.OfflineClientHistoryDays * 24);
                 _logger.LogInformation("Fetched {HistoryCount} historical clients for offline device detection", clientHistory?.Count ?? 0);
             }
             catch (Exception ex)
@@ -1472,6 +1576,7 @@ public class AuditService
                 NetworkConfigs = networkConfigs,
                 FirewallZones = firewallZones,
                 NetworkPurposeOverrides = options.NetworkPurposeOverrides,
+                DeviceClassificationOverrides = options.DeviceClassificationOverrides,
                 ThreatContext = threatContext
             });
 
@@ -1632,6 +1737,27 @@ public class AuditService
             })
             .ToList();
 
+        // Convert wired clients
+        var wiredClients = engineResult.WiredClients
+            .Select(wc => new WiredClientReference
+            {
+                DisplayName = wc.DisplayName,
+                Mac = wc.Mac ?? "",
+                SwitchName = wc.SwitchName,
+                SwitchMac = wc.SwitchMac,
+                PortIndex = wc.PortIndex,
+                PortName = wc.PortName,
+                NetworkName = wc.Network?.Name,
+                VlanId = wc.Network?.VlanId,
+                DeviceCategory = wc.Detection.CategoryName,
+                VendorName = wc.Detection.VendorName,
+                DetectionConfidence = wc.Detection.ConfidenceScore,
+                IsIoT = wc.Detection.Category.IsIoT(),
+                IsCamera = wc.Detection.Category.IsSurveillance(),
+                Detection = wc.Detection
+            })
+            .ToList();
+
         // Convert wireless clients
         var wirelessClients = engineResult.WirelessClients
             .Select(wc => new WirelessClientReference
@@ -1648,7 +1774,8 @@ public class AuditService
                 VendorName = wc.Detection.VendorName,
                 DetectionConfidence = wc.Detection.ConfidenceScore,
                 IsIoT = wc.Detection.Category.IsIoT(),
-                IsCamera = wc.Detection.Category.IsSurveillance()
+                IsCamera = wc.Detection.Category.IsSurveillance(),
+                Detection = wc.Detection
             })
             .ToList();
 
@@ -1663,6 +1790,7 @@ public class AuditService
                 LastNetwork = oc.LastNetwork,
                 DeviceCategory = oc.Detection.CategoryName,
                 LastSeenDisplay = oc.LastSeenDisplay,
+                IsWired = oc.IsWired,
                 IsRecentlyActive = oc.IsRecentlyActive,
                 IsIoT = oc.Detection.Category.IsIoT(),
                 IsCamera = oc.Detection.Category.IsSurveillance(),
@@ -1750,6 +1878,7 @@ public class AuditService
             HardeningMeasures = engineResult.HardeningMeasures.ToList(),
             Networks = networks,
             Switches = switches,
+            WiredClients = wiredClients,
             WirelessClients = wirelessClients,
             OfflineClients = offlineClients,
             DnsSecurity = dnsSecurity
@@ -2112,9 +2241,13 @@ public class AuditOptions
     // Unused port detection thresholds
     public int UnusedPortInactivityDays { get; set; } = 15;
     public int NamedPortInactivityDays { get; set; } = 45;
+    public int OfflineClientHistoryDays { get; set; } = 30;
 
     // Network purpose overrides (network ID -> NetworkPurpose enum name)
     public Dictionary<string, string>? NetworkPurposeOverrides { get; set; }
+
+    // Device classification overrides (MAC address -> ClientDeviceCategory enum name)
+    public Dictionary<string, string>? DeviceClassificationOverrides { get; set; }
 }
 
 public class AuditResult
@@ -2131,6 +2264,7 @@ public class AuditResult
     public List<string> HardeningMeasures { get; set; } = new();
     public List<NetworkReference> Networks { get; set; } = new();
     public List<SwitchReference> Switches { get; set; } = new();
+    public List<WiredClientReference> WiredClients { get; set; } = new();
     public List<WirelessClientReference> WirelessClients { get; set; } = new();
     public List<OfflineClientReference> OfflineClients { get; set; } = new();
     public DnsSecurityReference? DnsSecurity { get; set; }
@@ -2292,6 +2426,24 @@ public class PortReference
     public string? Dot1xCtrl { get; set; }
 }
 
+public class WiredClientReference
+{
+    public string DisplayName { get; set; } = "";
+    public string Mac { get; set; } = "";
+    public string SwitchName { get; set; } = "";
+    public string? SwitchMac { get; set; }
+    public int PortIndex { get; set; }
+    public string? PortName { get; set; }
+    public string? NetworkName { get; set; }
+    public int? VlanId { get; set; }
+    public string DeviceCategory { get; set; } = "";
+    public string? VendorName { get; set; }
+    public int DetectionConfidence { get; set; }
+    public bool IsIoT { get; set; }
+    public bool IsCamera { get; set; }
+    public AuditModels.DeviceDetectionResult Detection { get; set; } = null!;
+}
+
 public class WirelessClientReference
 {
     public string DisplayName { get; set; } = "";
@@ -2307,6 +2459,7 @@ public class WirelessClientReference
     public int DetectionConfidence { get; set; }
     public bool IsIoT { get; set; }
     public bool IsCamera { get; set; }
+    public AuditModels.DeviceDetectionResult Detection { get; set; } = null!;
 }
 
 public class OfflineClientReference
@@ -2318,6 +2471,7 @@ public class OfflineClientReference
     public NetworkOptimizer.Audit.Models.NetworkInfo? LastNetwork { get; set; }
     public string DeviceCategory { get; set; } = "";
     public string LastSeenDisplay { get; set; } = "";
+    public bool IsWired { get; set; }
     public bool IsRecentlyActive { get; set; }
     public bool IsIoT { get; set; }
     public bool IsCamera { get; set; }

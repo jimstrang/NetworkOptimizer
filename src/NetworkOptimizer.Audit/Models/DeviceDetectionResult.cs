@@ -35,7 +35,12 @@ public enum DetectionSource
     /// <summary>
     /// Multiple sources agreed
     /// </summary>
-    Combined = 5
+    Combined = 5,
+
+    /// <summary>
+    /// From a user-configured per-device classification override
+    /// </summary>
+    UserOverride = 6
 }
 
 /// <summary>
@@ -62,6 +67,21 @@ public class DeviceDetectionResult
     /// Confidence score (0-100)
     /// </summary>
     public int ConfidenceScore { get; init; }
+
+    /// <summary>
+    /// Automatically detected category before a user override was applied.
+    /// </summary>
+    public ClientDeviceCategory? AutoDetectedCategory { get; init; }
+
+    /// <summary>
+    /// Automatic detection source before a user override was applied.
+    /// </summary>
+    public DetectionSource? AutoDetectionSource { get; init; }
+
+    /// <summary>
+    /// Automatic detection confidence before a user override was applied.
+    /// </summary>
+    public int? AutoDetectionConfidenceScore { get; init; }
 
     /// <summary>
     /// Vendor name if detected

@@ -51,6 +51,15 @@
                 if (window.__setScrollState) window.__setScrollState(false);
                 container.scrollTop = 0;
             }
+        },
+
+        // Called after an expandable Audit Device Reference group has rendered.
+        // The same function works for VLAN and Uplink group rows.
+        scrollElementToTop: function(elementId) {
+            var element = document.getElementById(elementId);
+            if (element) {
+                element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
         }
     };
 })();

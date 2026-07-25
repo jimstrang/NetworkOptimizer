@@ -473,72 +473,10 @@
             </div>
         </div>
 
-        <!-- Network Reference -->
-        @if (lastResult?.Networks.Any() == true)
-        {
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">Network Reference</h2>
-                </div>
-                <div class="card-body">
-                    @if (_purposeOverridesPending)
-                    {
-                        <div class="purpose-rerun-banner">
-                            <span class="purpose-rerun-icon">
-                                <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" /></svg>
-                            </span>
-                            <span>Purpose changes will take effect on the next audit run.</span>
-                            <button class="btn btn-sm btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected)">
-                                Re-run Audit
-                            </button>
-                        </div>
-                    }
-                    <div class="table-responsive">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Network</th>
-                                <th>VLAN</th>
-                                <th>Subnet</th>
-                                <th>Purpose</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            @foreach (var network in lastResult.Networks.OrderBy(n => n.VlanId))
-                            {
-                                <tr>
-                                    <td>@network.Name</td>
-                                    <td>@(network.VlanId == 1 ? $"{network.VlanId} (native)" : network.VlanId.ToString())</td>
-                                    <td>@(network.Subnet ?? "N/A")</td>
-                                    <td>
-                                        <div class="purpose-cell-inner">
-                                            <select class="purpose-select"
-                                                    value="@GetEffectivePurpose(network.Id, network.Purpose)"
-                                                    @onchange="e => OnPurposeChanged(network.Id, e.Value?.ToString())">
-                                                @foreach (var purpose in _purposeOptions)
-                                                {
-                                                    <option value="@purpose.Value">@purpose.Display</option>
-                                                }
-                                            </select>
-                                            @if (_purposeSaved.TryGetValue(network.Id, out var saved) && saved)
-                                            {
-                                                <span class="purpose-saved">Saved</span>
-                                            }
-                                        </div>
-                                    </td>
-                                </tr>
-                            }
-                        </tbody>
-                    </table>
-                    </div>
-                </div>
-            </div>
-        }
-
         <!-- DNS Security -->
         @if (includeDnsSecurity && lastResult?.DnsSecurity != null)
         {
-            <div class="card">
+            <div class="card audit-order-dns">
                 <div class="card-header">
                     <h2 class="card-title">DNS Security</h2>
                 </div>
@@ -630,7 +568,7 @@
         <!-- Hardening Measures -->
         @if (GetFilteredHardeningMeasures().Any())
         {
-            <div class="card">
+            <div class="card audit-order-hardening">
                 <div class="card-header">
                     <h2 class="card-title">Hardening Measures in Place</h2>
                 </div>
@@ -648,7 +586,7 @@
         <!-- Switch/Port Details -->
         @if (includePortSecurity && lastResult?.Switches.Any() == true)
         {
-            <div class="card">
+            <div class="card audit-order-switch-details">
                 <div class="card-header">
                     <h2 class="card-title">Switch & Port Details</h2>
                 </div>
@@ -708,112 +646,257 @@
             </div>
         }
 
-        <!-- Wireless Clients -->
-        @if (includeVlanSecurity && lastResult?.WirelessClients.Any() == true)
+        <!-- Device Reference -->
+        @if (lastResult != null)
         {
-            var apGroups = lastResult.WirelessClients.GroupBy(wc => wc.AccessPointName ?? "Unknown AP").OrderBy(g => g.Key);
-            <div class="card">
+            var deviceGroups = GetDeviceReferenceGroups().ToList();
+            <div id="network-device-reference" class="card device-reference-card audit-reference-card">
                 <div class="card-header">
-                    <h2 class="card-title">Wireless Clients by Access Point</h2>
+                    <h2 class="card-title">Network &amp; Device Reference</h2>
                 </div>
                 <div class="card-body">
-                    @foreach (var ap in apGroups)
+                    @if (_purposeOverridesPending)
                     {
-                        var apModel = ap.FirstOrDefault()?.AccessPointModelName;
-                        <div class="ap-section">
-                            <h3 class="ap-title">
-                                <DeviceIcon Model="@apModel" Size="lg" />
-                                @ap.Key <span class="client-count">(@ap.Count() clients)</span>
-                            </h3>
-                            <div class="table-responsive">
-                            <table class="data-table wireless-client-table">
-                                <thead>
-                                    <tr>
-                                        <th>Client</th>
-                                        <th>Type</th>
-                                        <th>Network</th>
-                                        <th>Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    @foreach (var client in ap.OrderBy(c => c.DisplayName))
-                                    {
-                                        var clientIssue = issues.FirstOrDefault(i => i.IsWireless && i.ClientMac == client.Mac);
-                                        var hasIssue = clientIssue != null;
-                                        var statusClass = hasIssue ? (clientIssue!.Severity == AuditSeverity.Critical ? "row-critical" : "row-warning") : "";
-                                        var statusText = hasIssue ? clientIssue!.Title : "OK";
-                                        var networkDisplay = DisplayFormatters.FormatNetworkWithVlan(client.NetworkName, client.VlanId);
-                                        <tr class="@statusClass">
-                                            <td><a href="./wifi-optimizer?tab=client&client=@Uri.EscapeDataString(client.Mac)" class="client-link">@client.DisplayName</a></td>
-                                            <td>@client.DeviceCategory</td>
-                                            <td>@networkDisplay</td>
-                                            <td>@statusText</td>
-                                        </tr>
-                                    }
-                                </tbody>
-                            </table>
-                            </div>
+                        <div class="purpose-rerun-banner">
+                            <span class="purpose-rerun-icon">
+                                <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" /></svg>
+                            </span>
+                            <span>Purpose changes will take effect on the next audit run.</span>
+                            <button class="btn btn-sm btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected)">
+                                Re-run Audit
+                            </button>
                         </div>
                     }
-                </div>
-            </div>
-        }
-
-        <!-- Offline Clients (from history) -->
-        @if (includeVlanSecurity && lastResult?.OfflineClients.Any() == true)
-        {
-            var offlineGroups = lastResult.OfflineClients
-                .GroupBy(c => c.LastUplinkName ?? "Unknown")
-                .OrderBy(g => g.Key);
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">Offline Wireless Clients (Last 30 Days)</h2>
-                </div>
-                <div class="card-body">
-                    @foreach (var group in offlineGroups)
+                    @if (_deviceOverridesPending)
                     {
-                        var apModel = group.FirstOrDefault()?.LastUplinkModelName;
-                        <div class="ap-section">
-                            <h3 class="ap-title">
-                                <DeviceIcon Model="@apModel" Size="lg" />
-                                @group.Key <span class="client-count">(@group.Count() clients)</span>
-                            </h3>
-                            <div class="table-responsive">
-                            <table class="data-table offline-client-table">
+                        <div class="purpose-rerun-banner">
+                            <span class="purpose-rerun-icon">
+                                <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 11-2 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" /></svg>
+                            </span>
+                            <span>Classification changes will take effect on the next audit run.</span>
+                            <button class="btn btn-sm btn-primary" @onclick="RunAudit" disabled="@(isRunning || !ConnectionService.IsConnected)">
+                                Re-run Audit
+                            </button>
+                        </div>
+                    }
+                    <div class="device-reference-controls">
+                        <input class="form-control" @bind="_deviceSearch" @bind:event="oninput" placeholder="Search devices or MAC addresses" />
+                        <div class="device-filter-group">
+                            <span class="filter-label">Group:</span>
+                            <div class="device-group-mode" role="group" aria-label="Device grouping">
+                                <button class="btn btn-sm @(!_groupDevicesByUplink ? "btn-primary" : "btn-secondary")" @onclick="() => _groupDevicesByUplink = false">VLAN</button>
+                                <button class="btn btn-sm @(_groupDevicesByUplink ? "btn-primary" : "btn-secondary")" @onclick="() => _groupDevicesByUplink = true">Uplink</button>
+                            </div>
+                        </div>
+                        <div class="device-filter-group">
+                            <label class="filter-label" for="device-connection-filter">Connection:</label>
+                            <select id="device-connection-filter" class="device-filter-select" @bind="_deviceConnectionFilter">
+                                <option value="@DeviceConnectionFilter.All">All</option>
+                                <option value="@DeviceConnectionFilter.Wireless">Wireless</option>
+                                <option value="@DeviceConnectionFilter.Wired">Wired</option>
+                            </select>
+                        </div>
+                        <div class="device-filter-group">
+                            <label class="filter-label" for="device-status-filter">Status:</label>
+                            <select id="device-status-filter" class="device-filter-select" @bind="_deviceOnlineFilter">
+                                <option value="@DeviceOnlineFilter.All">All</option>
+                                <option value="@DeviceOnlineFilter.Online">Online</option>
+                                <option value="@DeviceOnlineFilter.Offline">Offline</option>
+                            </select>
+                        </div>
+                        <div class="device-filter-group">
+                            <label class="filter-label" for="device-show-filter">Show:</label>
+                            <select id="device-show-filter" class="device-filter-select" @bind="_deviceFindingFilter">
+                                <option value="@DeviceFindingFilter.All">All devices</option>
+                                <option value="@DeviceFindingFilter.Overrides">Overrides</option>
+                                <option value="@DeviceFindingFilter.Findings">With findings</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    @if (!deviceGroups.Any())
+                    {
+                        <p class="empty-device-reference">No devices match the current filters.</p>
+                    }
+
+                    @if (deviceGroups.Any())
+                    {
+                        <div class="table-responsive">
+                            <table class="data-table device-reference-groups-table @(!_groupDevicesByUplink ? "vlan-mode" : "")">
                                 <thead>
                                     <tr>
-                                        <th>Client</th>
-                                        <th>Type</th>
-                                        <th>Network</th>
-                                        <th>Last Seen</th>
-                                        <th>Status</th>
+                                        @if (_groupDevicesByUplink)
+                                        {
+                                            <th>Uplink</th>
+                                            <th>Devices</th>
+                                            <th>Overrides</th>
+                                            <th>Findings</th>
+                                        }
+                                        else
+                                        {
+                                            <th>Network</th>
+                                            <th>VLAN</th>
+                                            <th>Subnet</th>
+                                            <th>Purpose</th>
+                                            <th>Devices</th>
+                                            <th>Overrides</th>
+                                            <th>Findings</th>
+                                        }
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    @foreach (var client in group.OrderBy(c => c.DisplayName))
+                                @foreach (var group in deviceGroups)
+                                {
+                                    var groupKey = group.Key;
+                                    var isExpanded = _expandedDeviceGroups.Contains(groupKey) || !string.IsNullOrWhiteSpace(_deviceSearch);
+                                    var overrideCount = group.Count(device => HasDeviceOverride(device.Mac));
+                                    var findingCount = group.Count(device => device.Issue != null);
+                                    var uplinkModel = _groupDevicesByUplink
+                                        ? group.Select(device => device.UplinkModel).FirstOrDefault(model => !string.IsNullOrWhiteSpace(model))
+                                        : null;
+                                    var groupDisplayName = GetDeviceGroupDisplayName(groupKey, group, uplinkModel);
+                                    var networkReference = !_groupDevicesByUplink ? GetNetworkReference(group) : null;
+                                    var summaryColumnCount = _groupDevicesByUplink ? 4 : 7;
+                                    var groupElementId = GetDeviceGroupElementId(groupKey);
+                                    <tr id="@groupElementId" class="device-reference-group-row @(isExpanded ? "expanded" : "")">
+                                        <td>
+                                            <button class="device-reference-group-toggle" @onclick="() => ToggleDeviceGroup(groupKey, groupElementId)" aria-expanded="@isExpanded">
+                                                <span class="device-group-chevron">@(isExpanded ? "▲" : "▼")</span>
+                                                @if (!string.IsNullOrEmpty(uplinkModel))
+                                                {
+                                                    <DeviceIcon Model="@uplinkModel" Size="md" />
+                                                }
+                                                <span class="device-group-title">@groupDisplayName</span>
+                                            </button>
+                                        </td>
+                                        @if (_groupDevicesByUplink)
+                                        {
+                                            <td>@group.Count()</td>
+                                            <td>@(overrideCount == 0 ? "-" : overrideCount)</td>
+                                            <td>@(findingCount == 0 ? "-" : findingCount)</td>
+                                        }
+                                        else
+                                        {
+                                            <td>@(networkReference?.VlanId == 1 ? "1 (native)" : networkReference?.VlanId.ToString() ?? "N/A")</td>
+                                            <td>@(networkReference?.Subnet ?? "N/A")</td>
+                                            <td>
+                                                @if (networkReference != null)
+                                                {
+                                                    <div class="purpose-cell-inner">
+                                                        <select class="purpose-select"
+                                                                value="@GetEffectivePurpose(networkReference.Id, networkReference.Purpose)"
+                                                                @onclick:stopPropagation="true"
+                                                                @onchange="eventArgs => OnPurposeChanged(networkReference.Id, eventArgs.Value?.ToString())">
+                                                            @foreach (var purpose in _purposeOptions)
+                                                            {
+                                                                <option value="@purpose.Value">@purpose.Display</option>
+                                                            }
+                                                        </select>
+                                                        @if (_purposeSaved.TryGetValue(networkReference.Id, out var saved) && saved)
+                                                        {
+                                                            <span class="purpose-saved">Saved</span>
+                                                        }
+                                                    </div>
+                                                }
+                                                else
+                                                {
+                                                    <span>Unclassified</span>
+                                                }
+                                            </td>
+                                            <td>@group.Count()</td>
+                                            <td>@(overrideCount == 0 ? "-" : overrideCount)</td>
+                                            <td>@(findingCount == 0 ? "-" : findingCount)</td>
+                                        }
+                                    </tr>
+                                    @if (isExpanded)
                                     {
-                                        var clientIssue = issues.FirstOrDefault(i => i.IsWireless && i.ClientMac == client.Mac);
-                                        var hasIssue = clientIssue != null;
-                                        var statusClass = hasIssue
-                                            ? (clientIssue!.Severity == AuditSeverity.Critical ? "row-critical" :
-                                               clientIssue.Severity == AuditSeverity.Informational ? "" : "row-warning")
-                                            : "";
-                                        var statusText = hasIssue ? clientIssue!.Title : "OK";
-                                        var networkDisplay = DisplayFormatters.FormatNetworkWithVlan(
-                                            client.LastNetwork?.Name, client.LastNetwork?.VlanId);
-                                        var recentBadge = client.IsRecentlyActive ? "" : " (stale)";
-                                        <tr class="@statusClass">
-                                            <td><a href="./wifi-optimizer?tab=client&client=@Uri.EscapeDataString(client.Mac ?? "")" class="client-link">@client.DisplayName</a></td>
-                                            <td>@client.Detection.CategoryName</td>
-                                            <td>@networkDisplay</td>
-                                            <td>@client.LastSeenDisplay@recentBadge</td>
-                                            <td>@statusText</td>
+                                        <tr class="device-reference-details-row">
+                                            <td colspan="@summaryColumnCount">
+                                                <div class="table-responsive">
+                                                    <table class="data-table device-reference-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Device</th>
+                                                <th>MAC</th>
+                                                <th>Connection</th>
+                                                <th>Detected As</th>
+                                                <th>Status</th>
+                                                <th>Classification</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            @foreach (var device in group.OrderBy(device => device.DisplayName))
+                                            {
+                                                var statusClass = device.Issue?.Severity == AuditSeverity.Critical ? "row-critical" :
+                                                    device.Issue?.Severity == AuditSeverity.Recommended ? "row-warning" : "";
+                                                var deviceOverride = GetDeviceOverride(device.Mac);
+                                                <tr class="@statusClass">
+                                                    <td>
+                                                        @if (device.IsWireless)
+                                                        {
+                                                            <a href="./wifi-optimizer?tab=client&client=@Uri.EscapeDataString(device.Mac)" class="client-link">@device.DisplayName</a>
+                                                        }
+                                                        else
+                                                        {
+                                                            @device.DisplayName
+                                                        }
+                                                    </td>
+                                                    <td>@device.Mac</td>
+                                                    <td>@device.Connection</td>
+                                                    <td>
+                                                        @GetAutoDetectedCategory(device.Detection).GetDisplayName()
+                                                        <span class="device-detection-source">@GetAutoDetectionSource(device.Detection) · @GetAutoDetectionConfidence(device.Detection)%</span>
+                                                    </td>
+                                                    <td>@(device.Issue?.Title ?? "OK")</td>
+                                                    <td>
+                                                        <div class="purpose-cell-inner">
+                                                            <select class="purpose-select" value="@deviceOverride" @onchange="eventArgs => OnDeviceClassificationChanged(device.Mac, eventArgs.Value?.ToString())" disabled="@device.IsInfrastructure" title="@(device.IsInfrastructure ? "Adopted infrastructure classifications cannot be overridden." : null)">
+                                                                <option value="">Auto-detect</option>
+                                                                @foreach (var categoryGroup in _deviceCategoryOptions)
+                                                                {
+                                                                    <optgroup label="@categoryGroup.Label">
+                                                                        @foreach (var category in categoryGroup.Categories)
+                                                                        {
+                                                                            <option value="@category">@category.GetDisplayName()</option>
+                                                                        }
+                                                                    </optgroup>
+                                                                }
+                                                            </select>
+                                                            @if (_deviceOverrideSaved.TryGetValue(device.Mac, out var saved) && saved)
+                                                            {
+                                                                <span class="purpose-saved">Saved</span>
+                                                            }
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            }
+                                        </tbody>
+                                    </table>
+                                                </div>
+                                            </td>
                                         </tr>
                                     }
+                                }
                                 </tbody>
                             </table>
-                            </div>
                         </div>
+                            }
+
+                    @{
+                        var unmatchedOverrides = GetUnmatchedDeviceOverrides().ToList();
+                    }
+                    @if (unmatchedOverrides.Count > 0)
+                    {
+                        <section class="device-reference-unmatched">
+                            <h3>Overrides for devices not seen</h3>
+                            @foreach (var overrideEntry in unmatchedOverrides)
+                            {
+                                <div class="device-reference-unmatched-row">
+                                    <span>@overrideEntry.Key: @overrideEntry.Value</span>
+                                    <button class="btn btn-sm btn-secondary" @onclick="() => OnDeviceClassificationChanged(overrideEntry.Key, null)">Remove</button>
+                                </div>
+                            }
+                        </section>
                     }
                 </div>
             </div>
@@ -822,7 +905,7 @@
         <!-- Port Security Summary -->
         @if (includePortSecurity && lastResult?.Switches.Any() == true)
         {
-            <div class="card">
+            <div class="card audit-order-port-summary">
                 <div class="card-header">
                     <h2 class="card-title">Port Security Coverage Summary</h2>
                 </div>
@@ -920,7 +1003,26 @@
     private Dictionary<string, string> _purposeOverrides = new();
     private Dictionary<string, bool> _purposeSaved = new();
     private Dictionary<string, System.Timers.Timer> _purposeSavedTimers = new();
+    private Dictionary<string, string> _deviceClassificationOverrides = new();
+    private Dictionary<string, bool> _deviceOverrideSaved = new();
+    private Dictionary<string, System.Timers.Timer> _deviceOverrideSavedTimers = new();
+    private HashSet<string> _expandedDeviceGroups = new();
     private bool _purposeOverridesPending;
+    private bool _deviceOverridesPending;
+    private bool _groupDevicesByUplink;
+    private DeviceConnectionFilter _deviceConnectionFilter = DeviceConnectionFilter.All;
+    private DeviceOnlineFilter _deviceOnlineFilter = DeviceOnlineFilter.All;
+    private DeviceFindingFilter _deviceFindingFilter = DeviceFindingFilter.All;
+    private string _deviceSearch = "";
+
+    // Device Reference is rebuilt on every render (search binds to oninput), so the
+    // item list and its lookups are cached until the audit result or issue list changes.
+    private List<DeviceReferenceItem>? _deviceReferenceItems;
+    private Services.AuditResult? _deviceReferenceSource;
+    private Dictionary<string, Services.AuditIssue>? _issuesByMac;
+    private Dictionary<string, Services.SwitchReference>? _switchesByMac;
+    private Dictionary<string, Services.SwitchReference>? _switchesByName;
+    private string? _deviceGroupToScroll;
     private bool _isStandalone;
 
     private static readonly List<(string Value, string Display)> _purposeOptions =
@@ -937,6 +1039,18 @@
         ("Media", "Media"),
         ("Gaming", "Gaming"),
         ("Unknown", "Unclassified")
+    ];
+
+    private static readonly List<DeviceCategoryGroup> _deviceCategoryOptions =
+    [
+        new("Surveillance", [ClientDeviceCategory.Camera, ClientDeviceCategory.SecuritySystem, ClientDeviceCategory.CloudCamera, ClientDeviceCategory.CloudSecuritySystem]),
+        new("IoT & Smart Home", [ClientDeviceCategory.SmartLighting, ClientDeviceCategory.SmartPlug, ClientDeviceCategory.SmartThermostat, ClientDeviceCategory.SmartLock, ClientDeviceCategory.SmartSensor, ClientDeviceCategory.SmartAppliance, ClientDeviceCategory.SmartHub, ClientDeviceCategory.RoboticVacuum, ClientDeviceCategory.IoTGeneric]),
+        new("Media & Gaming", [ClientDeviceCategory.SmartTV, ClientDeviceCategory.StreamingDevice, ClientDeviceCategory.SmartSpeaker, ClientDeviceCategory.MediaPlayer, ClientDeviceCategory.GameConsole]),
+        new("Computing", [ClientDeviceCategory.Desktop, ClientDeviceCategory.Laptop, ClientDeviceCategory.Server, ClientDeviceCategory.NAS]),
+        new("Mobile & Communication", [ClientDeviceCategory.Smartphone, ClientDeviceCategory.Tablet, ClientDeviceCategory.VoIP]),
+        new("Infrastructure", [ClientDeviceCategory.AccessPoint, ClientDeviceCategory.Switch, ClientDeviceCategory.Router, ClientDeviceCategory.Gateway]),
+        new("Peripherals", [ClientDeviceCategory.Printer, ClientDeviceCategory.Scanner]),
+        new("Other", [ClientDeviceCategory.Unknown])
     ];
 
     protected override async Task OnInitializedAsync()
@@ -968,6 +1082,7 @@
             warningCount = activeIssues.Count(i => i.Severity == AuditSeverity.Recommended);
             infoCount = activeIssues.Count(i => i.Severity == AuditSeverity.Informational);
             issues = activeIssues;
+            InvalidateDeviceReferenceCache();
 
             // Load dismissed issues
             dismissedIssues = await AuditService.GetDismissedIssuesAsync();
@@ -978,6 +1093,7 @@
 
         // Load network purpose overrides
         _purposeOverrides = await AuditService.GetNetworkPurposeOverridesAsync();
+        _deviceClassificationOverrides = await AuditService.GetDeviceClassificationOverridesAsync();
     }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
@@ -992,6 +1108,12 @@
                     StateHasChanged();
             }
             catch { }
+        }
+
+        if (_deviceGroupToScroll is { } groupElementId)
+        {
+            _deviceGroupToScroll = null;
+            await JSRuntime.InvokeVoidAsync("scrollRestoration.scrollElementToTop", groupElementId);
         }
     }
 
@@ -1048,6 +1170,7 @@
             warningCount = activeIssues.Count(i => i.Severity == AuditSeverity.Recommended);
             infoCount = activeIssues.Count(i => i.Severity == AuditSeverity.Informational);
             issues = activeIssues;
+            InvalidateDeviceReferenceCache();
 
             // Load dismissed issues
             dismissedIssues = await AuditService.GetDismissedIssuesAsync();
@@ -1055,6 +1178,7 @@
             lastAuditTime = DateTime.Now.ToString("MMM dd, yyyy HH:mm");
             hasResults = true;
             _purposeOverridesPending = false;
+            _deviceOverridesPending = false;
         }
         finally
         {
@@ -1416,6 +1540,10 @@
             "per Settings",
             "per <a href=\"/settings#security-audit\">Settings</a>");
 
+        formatted = formatted.Replace(
+            "Device Reference",
+            "<a href=\"/audit#network-device-reference\">Device Reference</a>");
+
         // Convert "{Threat Intelligence|port=X}" to a drilldown link
         formatted = ThreatIntelLinkRegex.Replace(formatted,
             m => $"<a href=\"./threats?tab=drilldown&port={m.Groups[1].Value}\">Threat Intelligence</a>");
@@ -1480,6 +1608,7 @@
         // Move from active to dismissed
         issues.Remove(issue);
         dismissedIssues.Add(issue);
+        InvalidateDeviceReferenceCache();
 
         // Update counts
         criticalCount = issues.Count(i => i.Severity == AuditSeverity.Critical);
@@ -1496,6 +1625,7 @@
         // Move from dismissed to active
         dismissedIssues.Remove(issue);
         issues.Add(issue);
+        InvalidateDeviceReferenceCache();
 
         // Update counts
         criticalCount = issues.Count(i => i.Severity == AuditSeverity.Critical);
@@ -1567,6 +1697,337 @@
             timer.Dispose();
         }
         _purposeSavedTimers.Clear();
+        foreach (var timer in _deviceOverrideSavedTimers.Values)
+        {
+            timer.Stop();
+            timer.Dispose();
+        }
+        _deviceOverrideSavedTimers.Clear();
+    }
+
+    private IEnumerable<IGrouping<string, DeviceReferenceItem>> GetDeviceReferenceGroups()
+    {
+        var devices = GetDeviceReferenceItems();
+        if (_deviceConnectionFilter == DeviceConnectionFilter.Wireless)
+            devices = devices.Where(device => device.IsWireless);
+        else if (_deviceConnectionFilter == DeviceConnectionFilter.Wired)
+            devices = devices.Where(device => !device.IsWireless);
+        if (_deviceOnlineFilter == DeviceOnlineFilter.Online)
+            devices = devices.Where(device => !device.IsOffline);
+        else if (_deviceOnlineFilter == DeviceOnlineFilter.Offline)
+            devices = devices.Where(device => device.IsOffline);
+        if (_deviceFindingFilter == DeviceFindingFilter.Overrides)
+            devices = devices.Where(device => HasDeviceOverride(device.Mac));
+        else if (_deviceFindingFilter == DeviceFindingFilter.Findings)
+            devices = devices.Where(device => device.Issue != null);
+        if (!string.IsNullOrWhiteSpace(_deviceSearch))
+        {
+            devices = devices.Where(device =>
+                device.DisplayName.Contains(_deviceSearch, StringComparison.OrdinalIgnoreCase) ||
+                device.Mac.Contains(_deviceSearch, StringComparison.OrdinalIgnoreCase) ||
+                device.Detection.CategoryName.Contains(_deviceSearch, StringComparison.OrdinalIgnoreCase) ||
+                device.Connection.Contains(_deviceSearch, StringComparison.OrdinalIgnoreCase));
+        }
+
+        var groups = devices.GroupBy(device => _groupDevicesByUplink ? device.UplinkGroup : device.VlanGroup);
+
+        return _groupDevicesByUplink
+            ? groups.OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            : groups.OrderBy(group => group.First().VlanId ?? int.MaxValue)
+                .ThenBy(group => group.Key, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private IEnumerable<DeviceReferenceItem> GetDeviceReferenceItems()
+    {
+        if (lastResult == null)
+            return [];
+
+        if (_deviceReferenceItems != null && ReferenceEquals(_deviceReferenceSource, lastResult))
+            return _deviceReferenceItems;
+
+        _issuesByMac = BuildIssueLookup();
+        _switchesByMac = new Dictionary<string, Services.SwitchReference>(StringComparer.OrdinalIgnoreCase);
+        _switchesByName = new Dictionary<string, Services.SwitchReference>(StringComparer.OrdinalIgnoreCase);
+        foreach (var networkSwitch in lastResult.Switches)
+        {
+            if (!string.IsNullOrEmpty(networkSwitch.Mac))
+                _switchesByMac.TryAdd(networkSwitch.Mac, networkSwitch);
+            if (!string.IsNullOrEmpty(networkSwitch.Name))
+                _switchesByName.TryAdd(networkSwitch.Name, networkSwitch);
+        }
+
+        var devices = new List<DeviceReferenceItem>();
+        devices.AddRange(lastResult.WiredClients.Select(client => CreateDeviceReferenceItem(
+            client.DisplayName,
+            client.Mac,
+            client.NetworkName,
+            client.VlanId,
+            $"Wired - {client.SwitchName} port {client.PortIndex}",
+            client.SwitchName,
+            GetSwitchModel(client.SwitchMac, client.SwitchName),
+            client.Detection,
+            isWireless: false,
+            isOffline: false)));
+        devices.AddRange(lastResult.WirelessClients.Select(client => CreateDeviceReferenceItem(
+            client.DisplayName,
+            client.Mac,
+            client.NetworkName,
+            client.VlanId,
+            $"Wireless - {client.AccessPointName ?? "Unknown AP"}",
+            client.AccessPointName ?? "Unknown AP",
+            client.AccessPointModelName ?? client.AccessPointModel,
+            client.Detection,
+            isWireless: true,
+            isOffline: false)));
+        devices.AddRange(lastResult.OfflineClients.Select(client => CreateDeviceReferenceItem(
+            client.DisplayName,
+            client.Mac ?? "",
+            client.LastNetwork?.Name,
+            client.LastNetwork?.VlanId,
+            $"Offline - {client.LastUplinkName ?? "Unknown uplink"} ({client.LastSeenDisplay})",
+            client.LastUplinkName ?? "Unknown uplink",
+            client.LastUplinkModelName,
+            client.Detection,
+            isWireless: !client.IsWired,
+            isOffline: true)));
+
+        _deviceReferenceItems = devices.Where(device => !string.IsNullOrWhiteSpace(device.Mac)).ToList();
+        _deviceReferenceSource = lastResult;
+        return _deviceReferenceItems;
+    }
+
+    // The cached item list embeds the matching issue for each device, so it must be rebuilt
+    // whenever the issue list changes (dismiss/restore) as well as when a new audit lands.
+    private void InvalidateDeviceReferenceCache()
+    {
+        _deviceReferenceItems = null;
+        _deviceReferenceSource = null;
+        _issuesByMac = null;
+        _switchesByMac = null;
+        _switchesByName = null;
+    }
+
+    private Dictionary<string, Services.AuditIssue> BuildIssueLookup()
+    {
+        var lookup = new Dictionary<string, Services.AuditIssue>(StringComparer.OrdinalIgnoreCase);
+        foreach (var issue in issues)
+        {
+            if (!string.IsNullOrEmpty(issue.ClientMac))
+                lookup.TryAdd(issue.ClientMac, issue);
+            if (!string.IsNullOrEmpty(issue.DeviceMac))
+                lookup.TryAdd(issue.DeviceMac, issue);
+        }
+        return lookup;
+    }
+
+    private DeviceReferenceItem CreateDeviceReferenceItem(
+        string displayName,
+        string mac,
+        string? networkName,
+        int? vlanId,
+        string connection,
+        string uplinkGroup,
+        string? uplinkModel,
+        DeviceDetectionResult? detection,
+        bool isWireless,
+        bool isOffline)
+    {
+        var effectiveDetection = detection ?? DeviceDetectionResult.Unknown;
+        var isInfrastructure = IsInfrastructureDevice(mac, effectiveDetection);
+        return new DeviceReferenceItem(
+            displayName,
+            mac,
+            networkName,
+            vlanId,
+            connection,
+            uplinkGroup,
+            uplinkModel,
+            effectiveDetection,
+            FindDeviceIssue(mac),
+            isWireless,
+            isOffline,
+            isInfrastructure);
+    }
+
+    private string? GetSwitchModel(string? switchMac, string switchName)
+    {
+        Services.SwitchReference? networkSwitch = null;
+        if (!string.IsNullOrEmpty(switchMac))
+            _switchesByMac?.TryGetValue(switchMac, out networkSwitch);
+        if (networkSwitch == null && !string.IsNullOrEmpty(switchName))
+            _switchesByName?.TryGetValue(switchName, out networkSwitch);
+
+        return networkSwitch?.ModelName ?? networkSwitch?.Model;
+    }
+
+    private Services.NetworkReference? GetNetworkReference(IGrouping<string, DeviceReferenceItem> group)
+    {
+        var firstDevice = group.FirstOrDefault();
+        if (firstDevice == null)
+            return null;
+
+        return lastResult?.Networks.FirstOrDefault(network =>
+            string.Equals(network.Name, firstDevice.NetworkName, StringComparison.OrdinalIgnoreCase) &&
+            network.VlanId == firstDevice.VlanId);
+    }
+
+    private string GetDeviceGroupDisplayName(
+        string groupName,
+        IGrouping<string, DeviceReferenceItem> group,
+        string? uplinkModel)
+    {
+        if (!_groupDevicesByUplink)
+            return groupName;
+
+        Services.SwitchReference? networkSwitch = null;
+        _switchesByName?.TryGetValue(groupName, out networkSwitch);
+        var isAccessPoint = networkSwitch?.IsAccessPoint == true ||
+            (networkSwitch == null && group.Any(device => device.IsWireless));
+        var formattedName = FormatDeviceName(
+            groupName,
+            networkSwitch?.IsGateway == true,
+            isAccessPoint);
+
+        return string.IsNullOrEmpty(uplinkModel)
+            ? formattedName
+            : $"{formattedName} ({uplinkModel})";
+    }
+
+    private Services.AuditIssue? FindDeviceIssue(string mac) =>
+        _issuesByMac != null && _issuesByMac.TryGetValue(mac, out var issue) ? issue : null;
+
+    private static ClientDeviceCategory GetAutoDetectedCategory(DeviceDetectionResult detection) =>
+        detection.AutoDetectedCategory ?? detection.Category;
+
+    private static DetectionSource GetAutoDetectionSource(DeviceDetectionResult detection) =>
+        detection.AutoDetectionSource ?? detection.Source;
+
+    private static int GetAutoDetectionConfidence(DeviceDetectionResult detection) =>
+        detection.AutoDetectionConfidenceScore ?? detection.ConfidenceScore;
+
+    private bool IsInfrastructureDevice(string mac, DeviceDetectionResult detection)
+    {
+        if (_switchesByMac?.ContainsKey(mac) == true)
+            return true;
+
+        if (detection.Category is ClientDeviceCategory.AccessPoint or ClientDeviceCategory.Switch or
+            ClientDeviceCategory.Router or ClientDeviceCategory.Gateway)
+            return true;
+
+        return detection.Metadata.TryGetValue("detection_method", out var method) &&
+            string.Equals(method?.ToString(), "unifi_protect_api", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string GetDeviceOverride(string mac)
+    {
+        var normalizedMac = NetworkUtilities.NormalizeMacAddress(mac);
+        if (normalizedMac == null)
+            return "";
+
+        return _deviceClassificationOverrides.TryGetValue(normalizedMac, out var category) ? category : "";
+    }
+
+    private bool HasDeviceOverride(string mac) => !string.IsNullOrEmpty(GetDeviceOverride(mac));
+
+    private async Task OnDeviceClassificationChanged(string mac, string? category)
+    {
+        var normalizedMac = NetworkUtilities.NormalizeMacAddress(mac);
+        if (normalizedMac == null)
+            return;
+
+        await AuditService.SaveDeviceClassificationOverrideAsync(normalizedMac, category);
+        _deviceClassificationOverrides = await AuditService.GetDeviceClassificationOverridesAsync();
+        _deviceOverrideSaved[mac] = true;
+        _deviceOverridesPending = true;
+        StateHasChanged();
+
+        if (_deviceOverrideSavedTimers.TryGetValue(mac, out var existingTimer))
+        {
+            existingTimer.Stop();
+            existingTimer.Dispose();
+        }
+
+        var timer = new System.Timers.Timer(2000) { AutoReset = false };
+        timer.Elapsed += async (_, _) =>
+        {
+            try
+            {
+                await InvokeAsync(() =>
+                {
+                    _deviceOverrideSaved[mac] = false;
+                    StateHasChanged();
+                });
+            }
+            catch { }
+        };
+        _deviceOverrideSavedTimers[mac] = timer;
+        timer.Start();
+    }
+
+    private IEnumerable<KeyValuePair<string, string>> GetUnmatchedDeviceOverrides()
+    {
+        var visibleMacs = GetDeviceReferenceItems()
+            .Select(device => NetworkUtilities.NormalizeMacAddress(device.Mac))
+            .Where(mac => mac != null)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        // Keys are already normalized by GetDeviceClassificationOverridesAsync.
+        return _deviceClassificationOverrides.Where(entry => !visibleMacs.Contains(entry.Key));
+    }
+
+    private void ToggleDeviceGroup(string groupKey, string groupElementId)
+    {
+        if (!_expandedDeviceGroups.Add(groupKey))
+            _expandedDeviceGroups.Remove(groupKey);
+        else
+            _deviceGroupToScroll = groupElementId;
+    }
+
+    private string GetDeviceGroupElementId(string groupKey)
+    {
+        var mode = _groupDevicesByUplink ? "uplink" : "vlan";
+        var encodedKey = Convert.ToHexString(System.Text.Encoding.UTF8.GetBytes(groupKey));
+        return $"device-reference-{mode}-{encodedKey}";
+    }
+
+    private sealed record DeviceCategoryGroup(string Label, IReadOnlyList<ClientDeviceCategory> Categories);
+
+    private enum DeviceConnectionFilter
+    {
+        All,
+        Wireless,
+        Wired
+    }
+
+    private enum DeviceOnlineFilter
+    {
+        All,
+        Online,
+        Offline
+    }
+
+    private enum DeviceFindingFilter
+    {
+        All,
+        Overrides,
+        Findings
+    }
+
+    private sealed record DeviceReferenceItem(
+        string DisplayName,
+        string Mac,
+        string? NetworkName,
+        int? VlanId,
+        string Connection,
+        string UplinkGroup,
+        string? UplinkModel,
+        DeviceDetectionResult Detection,
+        Services.AuditIssue? Issue,
+        bool IsWireless,
+        bool IsOffline,
+        bool IsInfrastructure)
+    {
+        public string VlanGroup => DisplayFormatters.FormatNetworkWithVlan(NetworkName, VlanId);
     }
 
     // Device name formatting uses shared DisplayFormatters class
